@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>15-Min BTC Bot</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:          #0d1117;
+  --surface:     #161b22;
+  --surface2:    #1c2128;
+  --border:      #30363d;
+  --border-dim:  #21262d;
+  --text:        #e6edf3;
+  --dim:         #7d8590;
+  --green:       #3fb950;
+  --green-bg:    rgba(63,185,80,0.12);
+  --red:         #f85149;
+  --red-bg:      rgba(248,81,73,0.12);
+  --yellow:      #e3b341;
+  --yellow-bg:   rgba(227,179,65,0.12);
+  --blue:        #58a6ff;
+  --blue-bg:     rgba(88,166,255,0.12);
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', ui-monospace, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  min-height: 100vh;
+}
+
+/* ── Header ───────────────────────────────────────────────────────────── */
+#header {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 10px 20px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+.btc-price {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--blue);
+  letter-spacing: -0.5px;
+  transition: color 0.5s ease-out;
+  min-width: 180px;
+}
+.btc-price.up   { color: var(--green); }
+.btc-price.down { color: var(--red); }
+
+.feed-pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--surface2);
+  border: 1px solid var(--border-dim);
+  border-radius: 20px;
+  padding: 3px 10px;
+  font-size: 11px;
+  color: var(--dim);
+}
+.feed-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--green);
+  flex-shrink: 0;
+}
+.feed-dot.stale { background: var(--yellow); }
+.feed-dot.dead  { background: var(--red); animation: blink 1s infinite; }
+
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+
+.badge {
+  padding: 3px 9px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  white-space: nowrap;
+}
+.b-paper   { background: var(--yellow-bg); color: var(--yellow); border: 1px solid rgba(227,179,65,0.3); }
+.b-live    { background: var(--red-bg);    color: var(--red);    border: 1px solid rgba(248,81,73,0.3); }
+.b-auto    { background: var(--green-bg);  color: var(--green);  border: 1px solid rgba(63,185,80,0.3); }
+.b-sig     { background: var(--surface2);  color: var(--dim);    border: 1px solid var(--border-dim); }
+.b-running { background: var(--blue-bg);   color: var(--blue);   border: 1px solid rgba(88,166,255,0.3); }
+.b-idle    { background: var(--surface2);  color: var(--dim);    border: 1px solid var(--border-dim); }
+
+#scan-time { font-size: 11px; color: var(--dim); margin-left: 2px; }
+
+.header-controls { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+
+button {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 5px 13px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  font-family: inherit;
+  transition: border-color .15s, color .15s, background .15s;
+  white-space: nowrap;
+}
+button:hover       { border-color: var(--blue); color: var(--blue); }
+button.btn-on      { background: var(--green-bg); border-color: rgba(63,185,80,0.5); color: var(--green); }
+button.btn-danger  { border-color: rgba(248,81,73,0.5); color: var(--red); }
+button:disabled    { opacity: 0.4; cursor: not-allowed; }
+
+/* ── Layout ───────────────────────────────────────────────────────────── */
+.wrap { padding: 14px 20px; display: flex; flex-direction: column; gap: 12px; }
+
+.row-top    { display: grid; grid-template-columns: 1fr 1fr 230px 200px; gap: 12px; }
+.row-bottom { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+/* ── Cards ────────────────────────────────────────────────────────────── */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.card.halted { border-color: rgba(248,81,73,0.5); }
+
+.card-head {
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--border-dim);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  color: var(--dim);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.card-head .cnt {
+  background: var(--surface2);
+  border: 1px solid var(--border-dim);
+  padding: 1px 7px;
+  border-radius: 10px;
+  font-size: 11px;
+  color: var(--dim);
+}
+
+/* ── Tables ───────────────────────────────────────────────────────────── */
+.tbl-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th {
+  padding: 7px 12px;
+  font-size: 11px;
+  color: var(--dim);
+  font-weight: 500;
+  text-align: left;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--border-dim);
+}
+th.r { text-align: right; }
+td {
+  padding: 7px 12px;
+  border-bottom: 1px solid rgba(48,54,61,0.4);
+  white-space: nowrap;
+  vertical-align: middle;
+}
+td.r { text-align: right; }
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: var(--surface2); }
+tr.dimrow td { opacity: 0.45; }
+
+.empty {
+  padding: 22px 14px;
+  text-align: center;
+  color: var(--dim);
+  font-size: 12px;
+}
+
+/* ── Signal badges ────────────────────────────────────────────────────── */
+.sig {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+.s-syes { background: var(--green-bg); color: var(--green); }
+.s-wyes { background: rgba(63,185,80,0.06); color: #2ea043; }
+.s-sno  { background: var(--red-bg);   color: var(--red); }
+.s-wno  { background: rgba(248,81,73,0.06); color: #da3633; }
+.s-neu  { background: rgba(125,133,144,0.1); color: var(--dim); }
+
+/* ── Colors ───────────────────────────────────────────────────────────── */
+.g  { color: var(--green); }
+.r  { color: var(--red); }
+.y  { color: var(--yellow); }
+.b  { color: var(--blue); }
+.d  { color: var(--dim); }
+.ticker { color: var(--blue); font-size: 11px; }
+
+/* ── Risk panel ───────────────────────────────────────────────────────── */
+.risk-rows { padding: 12px 14px; display: flex; flex-direction: column; gap: 9px; }
+.risk-row  { display: flex; justify-content: space-between; align-items: center; }
+.rl { color: var(--dim); font-size: 12px; }
+.rv { font-weight: 600; font-size: 13px; }
+.risk-div { border: none; border-top: 1px solid var(--border-dim); margin: 2px 0; }
+.halt-banner {
+  margin: 0 14px 12px;
+  background: var(--red-bg);
+  border: 1px solid rgba(248,81,73,0.35);
+  color: var(--red);
+  padding: 7px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: center;
+}
+
+/* ── Trade log ────────────────────────────────────────────────────────── */
+.trade-scroll { max-height: 220px; overflow-y: auto; }
+.trade-row {
+  padding: 6px 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  border-bottom: 1px solid rgba(48,54,61,0.3);
+}
+.trade-row:last-child { border-bottom: none; }
+.trade-row:hover { background: var(--surface2); }
+.t-time { color: var(--dim); width: 65px; flex-shrink: 0; }
+.t-qty  { color: var(--dim); }
+.t-paper { font-size: 10px; color: var(--dim); background: var(--surface2); padding: 1px 5px; border-radius: 3px; }
+.t-tid { font-size: 10px; font-family: monospace; color: var(--dim); margin-left: 4px; }
+
+/* ── Persona badges ──────────────────────────────────────────────────── */
+.p-row { display: flex; justify-content: space-between; align-items: center; padding: 6px 14px; border-bottom: 1px solid rgba(48,54,61,0.3); }
+.p-row:last-child { border-bottom: none; }
+.p-tag { font-weight: 700; font-size: 11px; letter-spacing: 0.5px; }
+.p-snp  { color: #bc8cff; }
+.p-sca  { color: var(--blue); }
+.p-arb  { color: var(--yellow); }
+.p-stat { font-size: 12px; display: flex; gap: 8px; align-items: center; }
+.t-persona { font-size: 10px; font-weight: 700; letter-spacing: 0.3px; padding: 1px 5px; border-radius: 3px; }
+.t-p-sniper  { background: rgba(188,140,255,0.15); color: #bc8cff; }
+.t-p-scalper { background: var(--blue-bg); color: var(--blue); }
+.t-p-arb     { background: var(--yellow-bg); color: var(--yellow); }
+
+/* ── Connection banner ────────────────────────────────────────────────── */
+#conn-banner {
+  display: none;
+  position: fixed;
+  bottom: 16px; right: 16px;
+  background: var(--red-bg);
+  border: 1px solid rgba(248,81,73,0.4);
+  color: var(--red);
+  padding: 7px 14px;
+  border-radius: 6px;
+  font-size: 12px;
+  z-index: 999;
+}
+#conn-banner.show { display: block; }
+
+/* ── Scrollbar ────────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+@media (max-width: 1200px) {
+  .row-top    { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 800px) {
+  .row-top    { grid-template-columns: 1fr; }
+  .row-bottom { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<!-- ── Header ───────────────────────────────────────────────────────── -->
+<header id="header">
+  <div class="btc-price" id="btc-price">BTC —</div>
+
+  <div class="feed-pill">
+    <div class="feed-dot" id="feed-dot"></div>
+    <span id="feed-age">—</span>
+  </div>
+
+  <div id="mode-badges" style="display:flex;gap:6px;"></div>
+  <span class="badge b-idle" id="bot-status">IDLE</span>
+  <span id="scan-time"></span>
+
+  <div class="header-controls">
+    <button id="btn-auto" onclick="toggleAutoTrade()">Auto-Trade: OFF</button>
+    <button id="btn-paper" onclick="togglePaper()">Paper: ON</button>
+  </div>
+</header>
+
+<!-- ── Main content ──────────────────────────────────────────────────── -->
+<div class="wrap">
+
+  <div class="row-top">
+
+    <!-- Signals -->
+    <div class="card" id="card-signals">
+      <div class="card-head">
+        SIGNALS
+        <span class="cnt" id="sig-cnt">0</span>
+      </div>
+      <div class="tbl-wrap" id="signals-body">
+        <div class="empty">Waiting for markets…</div>
+      </div>
+    </div>
+
+    <!-- Open Markets -->
+    <div class="card">
+      <div class="card-head">
+        OPEN MARKETS
+        <span class="cnt" id="mkt-cnt">0</span>
+      </div>
+      <div class="tbl-wrap" id="markets-body">
+        <div class="empty">No open markets</div>
+      </div>
+    </div>
+
+    <!-- Risk / Balance -->
+    <div class="card" id="card-risk">
+      <div class="card-head">RISK / BALANCE</div>
+      <div class="risk-rows">
+        <div class="risk-row"><span class="rl">Available</span><span class="rv b" id="r-avail">—</span></div>
+        <div class="risk-row"><span class="rl">Portfolio</span><span class="rv" id="r-port">—</span></div>
+        <hr class="risk-div">
+        <div class="risk-row"><span class="rl">Day P&amp;L</span><span class="rv" id="r-pnl">$0.00</span></div>
+        <div class="risk-row"><span class="rl">Trades today</span><span class="rv" id="r-trades">0</span></div>
+        <div class="risk-row"><span class="rl">Open positions</span><span class="rv" id="r-open">0</span></div>
+        <div class="risk-row"><span class="rl">Win rate</span><span class="rv d" id="r-wr">—</span></div>
+      </div>
+      <div class="halt-banner" id="halt-banner" style="display:none;"></div>
+    </div>
+
+    <!-- Personas -->
+    <div class="card">
+      <div class="card-head">PERSONAS</div>
+      <div id="personas-body">
+        <div class="empty">Personas inactive</div>
+      </div>
+    </div>
+
+  </div><!-- row-top -->
+
+  <div class="row-bottom">
+
+    <!-- Positions -->
+    <div class="card">
+      <div class="card-head">
+        POSITIONS
+        <span class="cnt" id="pos-cnt">0</span>
+      </div>
+      <div class="tbl-wrap" id="positions-body">
+        <div class="empty">No open positions</div>
+      </div>
+    </div>
+
+    <!-- Trade Log -->
+    <div class="card">
+      <div class="card-head">
+        TRADE LOG
+        <span class="cnt" id="trd-cnt">0</span>
+      </div>
+      <div id="trades-body">
+        <div class="empty">No trades yet</div>
+      </div>
+    </div>
+
+  </div><!-- row-bottom -->
+
+</div><!-- wrap -->
+
+<div id="conn-banner">⚡ Reconnecting…</div>
+
+<!-- ── Script ────────────────────────────────────────────────────────── -->
+<script>
+'use strict';
+
+const WS = `ws://${location.host}/ws`;
+let ws, lastPrice = 0, lastState = null, reconnTimer = null;
+
+/* ── Connection ──────────────────────────────────────────────────────── */
+function connect() {
+  ws = new WebSocket(WS);
+  ws.onopen    = () => { $('conn-banner').classList.remove('show'); clearTimeout(reconnTimer); };
+  ws.onmessage = e => { try { render(JSON.parse(e.data)); } catch(_){} };
+  ws.onclose   = () => { $('conn-banner').classList.add('show'); reconnTimer = setTimeout(connect, 2500); };
+  ws.onerror   = () => ws.close();
+
+  // Send keepalive pings every 20s
+  setInterval(() => { if (ws.readyState === 1) ws.send('ping'); }, 20000);
+}
+
+function $(id) { return document.getElementById(id); }
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+/* ── Main render ─────────────────────────────────────────────────────── */
+function render(s) {
+  lastState = s;
+  renderHeader(s);
+  renderSignals(s.signals || {});
+  renderMarkets(s.open_markets || []);
+  renderRisk(s.risk || {}, s.balance);
+  renderPositions(s.open_positions || []);
+  renderTrades(s.recent_trades || []);
+  renderPersonas(s.personas || {});
+  updateButtons(s);
+}
+
+/* ── Header ──────────────────────────────────────────────────────────── */
+function renderHeader(s) {
+  const el = $('btc-price');
+  const p  = s.current_price || 0;
+
+  if (p && lastPrice && p !== lastPrice) {
+    el.classList.remove('up','down');
+    void el.offsetWidth;
+    el.classList.add(p > lastPrice ? 'up' : 'down');
+    setTimeout(() => el.classList.remove('up','down'), 700);
+  }
+  lastPrice = p;
+  el.textContent = p ? `BTC $${fmt(p, 2)}` : 'BTC —';
+
+  const age = s.feed_age_sec || 0;
+  $('feed-age').textContent = `feed ${age.toFixed(1)}s`;
+  const dot = $('feed-dot');
+  dot.className = 'feed-dot' + (age < 5 ? '' : age < 30 ? ' stale' : ' dead');
+
+  const paper = s.paper_mode !== false;
+  const auto  = s.auto_trade === true;
+  $('mode-badges').innerHTML =
+    `<span class="badge ${paper ? 'b-paper':'b-live'}">${paper ? 'PAPER':'LIVE'}</span>` +
+    `<span class="badge ${auto  ? 'b-auto' :'b-sig' }">${auto  ? 'AUTO-TRADE':'SIGNAL-ONLY'}</span>`;
+
+  const status = (s.status || 'idle').toUpperCase();
+  $('bot-status').textContent = status;
+  $('bot-status').className = `badge ${status === 'RUNNING' ? 'b-running':'b-idle'}`;
+
+  if (s.last_scan) {
+    try {
+      const ago = Math.round((Date.now() - new Date(s.last_scan).getTime()) / 1000);
+      $('scan-time').textContent = `scan ${ago}s ago`;
+    } catch(_) {}
+  }
+}
+
+/* ── Signals ─────────────────────────────────────────────────────────── */
+function sigBadge(sig) {
+  if (!sig || sig === 'NEUTRAL') return `<span class="sig s-neu">NEUTRAL</span>`;
+  const u = sig.toUpperCase();
+  if (u.includes('STRONG') && u.includes('YES')) return `<span class="sig s-syes">${esc(sig)}</span>`;
+  if (u.includes('WEAK')   && u.includes('YES')) return `<span class="sig s-wyes">${esc(sig)}</span>`;
+  if (u.includes('STRONG') && u.includes('NO'))  return `<span class="sig s-sno">${esc(sig)}</span>`;
+  if (u.includes('WEAK')   && u.includes('NO'))  return `<span class="sig s-wno">${esc(sig)}</span>`;
+  return `<span class="sig s-neu">${esc(sig)}</span>`;
+}
+
+function edgeCls(e) {
+  if (e > 0.08) return 'g';
+  if (e > 0.04) return 'g';
+  if (e > 0.01) return 'y';
+  return 'd';
+}
+
+function renderSignals(signals) {
+  const entries = Object.entries(signals);
+  $('sig-cnt').textContent = entries.length;
+  if (!entries.length) { $('signals-body').innerHTML = '<div class="empty">Waiting for markets…</div>'; return; }
+
+  const MIN_CONF = 0.50;
+  const rows = entries.slice(0, 12).map(([ticker, s]) => {
+    const best = Math.max(s.edge_yes || 0, s.edge_no || 0);
+    const sign = best > 0 ? '+' : '';
+    const conf = s.confidence || 0;
+    const gap  = conf - MIN_CONF;
+    const confCls = conf >= MIN_CONF ? 'g' : gap >= -0.05 ? 'y' : 'd';
+    return `<tr class="${s.tradeable === false ? 'dimrow' : ''}">
+      <td class="ticker">${esc(ticker.slice(-20))}</td>
+      <td class="r">$${fmtInt(s.strike||0)}</td>
+      <td class="r d">${fmtSecs(s.seconds_left||0)}</td>
+      <td class="r">${((s.prob_yes||0)*100).toFixed(1)}%</td>
+      <td class="r ${confCls}">${(conf*100).toFixed(0)}%</td>
+      <td class="r ${edgeCls(best)}">${sign}${(best*100).toFixed(1)}%</td>
+      <td class="r">${sigBadge(s.signal)}</td>
+    </tr>`;
+  }).join('');
+
+  $('signals-body').innerHTML = `<table>
+    <thead><tr>
+      <th>Ticker</th><th class="r">Strike</th><th class="r">T-Left</th>
+      <th class="r">P(YES)</th><th class="r">Conf</th><th class="r">Edge</th><th class="r">Signal</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+/* ── Markets ─────────────────────────────────────────────────────────── */
+function renderMarkets(markets) {
+  $('mkt-cnt').textContent = markets.length;
+  if (!markets.length) { $('markets-body').innerHTML = '<div class="empty">No open markets</div>'; return; }
+
+  const rows = markets.slice(0, 12).map(m => {
+    const noAsk = Math.round(100 - (m.yes_bid || 0));
+    return `<tr>
+      <td class="r">$${fmtInt(m.strike||0)}</td>
+      <td class="r g">${(m.yes_ask||0).toFixed(0)}¢</td>
+      <td class="r r">${noAsk}¢</td>
+      <td class="r d">${(m.volume||0).toLocaleString()}</td>
+      <td class="r d">${fmtSecs(m.seconds_left||0)}</td>
+    </tr>`;
+  }).join('');
+
+  $('markets-body').innerHTML = `<table>
+    <thead><tr>
+      <th class="r">Strike</th>
+      <th class="r">UP (YES ask)</th>
+      <th class="r">DN (NO ask)</th>
+      <th class="r">Volume</th>
+      <th class="r">T-Left</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+/* ── Risk / Balance ──────────────────────────────────────────────────── */
+function renderRisk(risk, bal) {
+  if (bal) {
+    $('r-avail').textContent = `$${fmt(bal.available||0, 2)}`;
+    $('r-port').textContent  = `$${fmt(bal.portfolio||0, 2)}`;
+  }
+  const pnl = risk.daily_pnl || 0;
+  const pnlEl = $('r-pnl');
+  pnlEl.textContent = `${pnl >= 0 ? '+':''}$${fmt(Math.abs(pnl),2)}`;
+  pnlEl.className = `rv ${pnl >= 0 ? 'g':'r'}`;
+
+  $('r-trades').textContent = risk.daily_trades || 0;
+  $('r-open').textContent   = risk.open_positions || 0;
+
+  const wr = risk.win_rate;
+  const wrEl = $('r-wr');
+  if (wr !== null && wr !== undefined) {
+    wrEl.textContent = `${(wr*100).toFixed(1)}%`;
+    wrEl.className = `rv ${wr >= 0.55 ? 'g' : wr >= 0.45 ? 'y' : 'r'}`;
+  } else {
+    wrEl.textContent = '—'; wrEl.className = 'rv d';
+  }
+
+  const halt = $('halt-banner');
+  $('card-risk').classList.toggle('halted', !!risk.halted);
+  if (risk.halted) {
+    halt.style.display = 'block';
+    halt.textContent = `⛔  HALTED — ${risk.halt_reason || 'Daily loss limit reached'}`;
+  } else {
+    halt.style.display = 'none';
+  }
+}
+
+/* ── Positions ───────────────────────────────────────────────────────── */
+function renderPositions(positions) {
+  $('pos-cnt').textContent = positions.length;
+  if (!positions.length) { $('positions-body').innerHTML = '<div class="empty">No open positions</div>'; return; }
+
+  const rows = positions.map(p => {
+    const pnl = p.pnl || 0;
+    return `<tr>
+      <td class="ticker">${esc((p.ticker||'').slice(-20))}</td>
+      <td class="${p.side==='yes'?'g':'r'}">${(p.side||'').toUpperCase()}</td>
+      <td class="r">${p.contracts||0}</td>
+      <td class="r">$${fmt(p.cost||0,2)}</td>
+      <td class="r">$${fmt(p.value||0,2)}</td>
+      <td class="r ${pnl>=0?'g':'r'}">${pnl>=0?'+':''}$${fmt(Math.abs(pnl),2)}</td>
+    </tr>`;
+  }).join('');
+
+  $('positions-body').innerHTML = `<table>
+    <thead><tr>
+      <th>Ticker</th><th>Side</th>
+      <th class="r">Qty</th><th class="r">Cost</th>
+      <th class="r">Value</th><th class="r">PnL</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+/* ── Trade log ───────────────────────────────────────────────────────── */
+function renderTrades(trades) {
+  $('trd-cnt').textContent = trades.length;
+  if (!trades.length) { $('trades-body').innerHTML = '<div class="empty">No trades yet</div>'; return; }
+
+  const personaCls = {sniper:'t-p-sniper', scalper:'t-p-scalper', arb:'t-p-arb'};
+  const personaLabels = {sniper:'SNP', scalper:'SCA', arb:'ARB'};
+  const items = trades.slice(0,25).map(t => {
+    let ts = '';
+    try { ts = new Date(t.entry_time).toTimeString().slice(0,8); } catch(_) {}
+    const paper = (t.source||'').includes('paper');
+    const src = (t.source||'').split('/')[0];
+    const pTag = personaCls[src] ? `<span class="t-persona ${personaCls[src]}">${personaLabels[src]}</span>` : '';
+    const side = t.side || '';
+    const isSettled = side.includes('settled');
+    const isExit = side.includes('exit');
+    const baseSide = side.replace('_settled','').replace('_exit','');
+    const sideColor = baseSide === 'yes' ? 'g' : 'r';
+    let actionHtml;
+    if (isSettled) actionHtml = `<span class="b" style="font-weight:700">SETTLED</span>`;
+    else if (isExit) actionHtml = `<span class="y">EXIT</span> <span class="${sideColor}">${baseSide.toUpperCase()}</span>`;
+    else actionHtml = `<span class="${sideColor}">${side.toUpperCase()}</span>`;
+    const pnl = t.pnl;
+    const contracts = t.contracts || 0;
+    const price = t.price_cents || 0;
+    let valueHtml;
+    if (isSettled || isExit) {
+      if (pnl != null) {
+        valueHtml = `<span class="t-qty">×${contracts} @ ${price}¢</span> <span class="${pnl>=0?'g':'r'}" style="font-weight:700">${pnl>=0?'+':''}$${Math.abs(pnl).toFixed(2)}</span>`;
+      } else {
+        valueHtml = `<span class="t-qty">×${contracts} @ <strong>${price}¢</strong></span>`;
+      }
+    } else {
+      const cost = (contracts * price / 100).toFixed(2);
+      valueHtml = `<span class="t-qty">×${contracts} @ ${price}¢ <span class="d">($${cost})</span></span>`;
+    }
+    const tid = t.trade_id ? `<span class="t-tid d">${esc(t.trade_id)}</span>` : '';
+    return `<div class="trade-row">
+      ${tid}
+      <span class="t-time">${ts}</span>
+      ${pTag}
+      ${actionHtml}
+      <span class="ticker">${esc((t.ticker||'').slice(-20))}</span>
+      ${valueHtml}
+      ${paper ? '<span class="t-paper">PAPER</span>' : ''}
+    </div>`;
+  }).join('');
+
+  $('trades-body').innerHTML = `<div class="trade-scroll">${items}</div>`;
+}
+
+/* ── Personas ───────────────────────────────────────────────────────── */
+function renderPersonas(personas) {
+  const entries = Object.entries(personas);
+  if (!entries.length) { $('personas-body').innerHTML = '<div class="empty">Personas inactive</div>'; return; }
+
+  const tagCls = {sniper:'p-snp', scalper:'p-sca', arb:'p-arb'};
+  const labels = {sniper:'SNP', scalper:'SCA', arb:'ARB'};
+
+  const rows = entries.map(([name, p]) => {
+    const pnl = p.daily_pnl || 0;
+    const cls = tagCls[name] || '';
+    const extra = name === 'scalper' && p.inventory !== undefined ? ` inv:${p.inventory}` : '';
+    return `<div class="p-row">
+      <span class="p-tag ${cls}">${labels[name]||name.toUpperCase()}</span>
+      <span class="p-stat">
+        <span class="${pnl>=0?'g':'r'}">${pnl>=0?'+':''}$${fmt(Math.abs(pnl),2)}</span>
+        <span class="d">T:${p.daily_trades||0}</span>
+        <span class="d">P:${p.positions||0}</span>
+        <span class="d">R:${p.resting_orders||0}${extra}</span>
+      </span>
+    </div>`;
+  }).join('');
+
+  $('personas-body').innerHTML = rows;
+}
+
+/* ── Controls ────────────────────────────────────────────────────────── */
+function updateButtons(s) {
+  const autoBtn  = $('btn-auto');
+  const paperBtn = $('btn-paper');
+  autoBtn.textContent  = `Auto-Trade: ${s.auto_trade ? 'ON':'OFF'}`;
+  autoBtn.className    = s.auto_trade ? 'btn-on' : '';
+  paperBtn.textContent = `Paper: ${s.paper_mode !== false ? 'ON':'OFF'}`;
+  paperBtn.className   = s.paper_mode === false ? 'btn-danger' : '';
+}
+
+async function toggleAutoTrade() {
+  $('btn-auto').disabled = true;
+  await fetch('/api/toggle-auto-trade', {method:'POST'}).catch(()=>{});
+  setTimeout(() => $('btn-auto').disabled = false, 1000);
+}
+
+async function togglePaper() {
+  if (lastState && lastState.paper_mode !== false) {
+    if (!confirm('Disable paper mode?\n\nThis enables REAL MONEY trading on Kalshi.\nAre you sure?')) return;
+  }
+  $('btn-paper').disabled = true;
+  await fetch('/api/toggle-paper', {method:'POST'}).catch(()=>{});
+  setTimeout(() => $('btn-paper').disabled = false, 1000);
+}
+
+/* ── Formatters ──────────────────────────────────────────────────────── */
+function fmt(n, dec)  { return Number(n).toLocaleString('en-US',{minimumFractionDigits:dec,maximumFractionDigits:dec}); }
+function fmtInt(n)    { return Number(n).toLocaleString('en-US',{maximumFractionDigits:0}); }
+function fmtSecs(s)   { const m=Math.floor(s/60),r=Math.floor(s%60); return `${m}m${String(r).padStart(2,'0')}s`; }
+
+/* ── Boot ────────────────────────────────────────────────────────────── */
+connect();
+</script>
+</body>
+</html>

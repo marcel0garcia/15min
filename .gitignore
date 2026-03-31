@@ -1,0 +1,29 @@
+# ── Credentials & secrets (NEVER commit these) ────────────────────────────
+.env
+*.pem
+*.pem.save
+bayerische.txt
+*private_key*
+*secret*
+
+# ── Generated data (rebuilt via bootstrap/train commands) ─────────────────
+data/
+logs/
+
+# ── Personal documents ────────────────────────────────────────────────────
+darules.pdf
+
+# ── Python environment ────────────────────────────────────────────────────
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# ── macOS ─────────────────────────────────────────────────────────────────
+.DS_Store

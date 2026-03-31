@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import pdfplumber; pdf = pdfplumber.open\\(''darules.pdf''\\); [print\\(p.extract_text\\(\\)\\) for p in pdf.pages]\")",
+      "Bash(python3 -c \"import PyPDF2; r = PyPDF2.PdfReader\\(''darules.pdf''\\); [print\\(r.pages[i].extract_text\\(\\)\\) for i in range\\(len\\(r.pages\\)\\)]\")"
+    ]
+  }
+}
