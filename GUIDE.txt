@@ -26,13 +26,24 @@ ENSEMBLE (4 models)
   3. Trend regression (20%) — linear slope and R² over recent bars
   4. LightGBM ML (10%)    — trained on historical BTC bars (bootstrap command)
 
-THREE PERSONAS (run concurrently)
-──────────────────────────────────
+FOUR TRADING BEHAVIORS (run concurrently)
+─────────────────────────────────────────
+  [AUTO] Auto — the base engine (original strategy)
+    - Runs on every qualifying signal: confidence ≥ 0.50, edge ≥ 3%
+    - Quarter-Kelly sizing (0.25) — conservative, scales with edge
+    - Entry window: 1–14.5 min remaining; exits managed by engine directly
+    - Take-profit: +65%  |  Stop-loss: −35%
+    - Trailing stop: activates at +20% gain, exits if retraces 50% of peak
+    - Has its own re-entry cooldown, candle loss brake, and cheap-entry cap
+    - This is the primary directional layer; the personas layer on top of it
+    - Controlled by strategy.auto_trade and strategy.* config settings
+
   [SNP] Sniper — aggressive directional bets
     - Fires only on very high conviction: confidence ≥ 0.75, edge ≥ 5%
     - Half-Kelly sizing (0.50) — bigger bets, fewer trades
     - Entry window: 3–10 minutes remaining
     - Take-profit: +50%  |  Stop-loss: −25%  |  Re-entry cooldown: 3 min
+    - Trailing stop: activates at +20% gain, exits if retraces 50% of peak
 
   [SCA] Scalper — market maker / spread capture
     - Posts resting limit orders on BOTH YES and NO sides (post_only = zero fees)
@@ -47,6 +58,7 @@ THREE PERSONAS (run concurrently)
     - Stat arb requires confidence ≥ 0.40, market price ≥ 20¢ (avoids
       contracts where the market has already made up its mind)
     - Stat arb exits: take-profit +80%, stop-loss −65%, cut with < 90s left
+    - Trailing stop: activates at +20% gain, exits if retraces 50% of peak
 
 RISK GUARDS
 ───────────
@@ -79,7 +91,8 @@ POSITIONS — Open positions with live mark-to-market PnL
   Shows auto trades and persona trades (tagged SNP/SCA/ARB)
 
 TRADE LOG — Scrolling execution log
-  [P] = paper trade.  [SNP]/[SCA]/[ARB] = which persona placed it.
+  [P] = paper trade.  [SNP]/[SCA]/[ARB] = persona trades.
+  Auto trades have no persona tag — they come from the base engine.
   Entries show cost; exits/settlements show realized P&L.
 
 PERSONAS PANEL — Per-persona status: budget used, open positions, win rate
