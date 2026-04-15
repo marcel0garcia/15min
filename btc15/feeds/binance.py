@@ -1,7 +1,9 @@
 """
-BTC price feed — Kraken WebSocket as primary (Binance blocked on US IPs).
-Kraken is one of the CF Benchmarks BRTI constituent exchanges, making it
-a better proxy for Kalshi's settlement price than Binance anyway.
+BTC price feed — Coinbase Exchange WebSocket as primary.
+
+Coinbase is a CF Benchmarks BRTI constituent exchange (same index Kalshi uses
+for KXBTC settlement), requires no auth, and is highly reliable on US IPs.
+Binance is HTTP 451 on US IPs. Kraken WS v2 proved intermittently stale.
 
 Keeps the same public API (BinanceFeed class name preserved for compatibility).
 """
@@ -56,11 +58,11 @@ class OHLCBar:
 
 class BinanceFeed:
     """
-    Real-time BTC/USD price feed via Kraken WebSocket v2.
+    Real-time BTC/USD price feed via Coinbase Exchange WebSocket.
     Named BinanceFeed for API compatibility with the rest of the codebase.
     """
 
-    STREAM_URL = "wss://ws.kraken.com/v2"
+    STREAM_URL = "wss://ws-feed.exchange.coinbase.com"
 
     def __init__(self, bar_interval_sec: int = 60, lookback_bars: int = 200):
         self.bar_interval_sec = bar_interval_sec
@@ -130,46 +132,41 @@ class BinanceFeed:
         self._running = False
 
     async def _connect_and_listen(self):
-        log.info(f"Connecting to Kraken WebSocket: {self.STREAM_URL}")
+        log.info(f"Connecting to Coinbase WebSocket: {self.STREAM_URL}")
         async with websockets.connect(
             self.STREAM_URL,
             ping_interval=20,
             ping_timeout=10,
         ) as ws:
-            # Subscribe to ticker (trade-level updates)
+            # Subscribe to matches channel — per-trade price + actual size.
             await ws.send(json.dumps({
-                "method": "subscribe",
-                "params": {
-                    "channel": "ticker",
-                    "symbol": ["BTC/USD"],
-                    "event_trigger": "trades",
-                }
+                "type": "subscribe",
+                "product_ids": ["BTC-USD"],
+                "channels": ["matches"],
             }))
             self._reconnect_delay = 2.0
-            log.info("Kraken WebSocket connected — receiving BTC/USD ticker")
+            log.info("Coinbase WebSocket connected — receiving BTC-USD trade feed")
 
             async for raw in ws:
                 try:
                     data = json.loads(raw)
                     await self._handle_message(data)
                 except Exception as e:
-                    log.error(f"Kraken handler error: {e}", exc_info=True)
+                    log.error(f"Coinbase handler error: {e}", exc_info=True)
 
     async def _handle_message(self, data: dict):
-        channel = data.get("channel")
-        if channel != "ticker":
+        msg_type = data.get("type")
+        # "match" = live trade; "last_match" = snapshot of most recent trade on subscribe
+        if msg_type not in ("match", "last_match"):
+            return
+        if data.get("product_id") != "BTC-USD":
             return
 
-        events = data.get("data", [])
-        if not events:
-            return
-
-        ticker = events[0]
-        price = float(ticker.get("last", 0))
+        price = float(data.get("price", 0))
         if not price:
             return
 
-        qty = float(ticker.get("volume", 0) or 0)
+        qty = float(data.get("size", 0) or 0)
         ts_ms = int(time.time() * 1000)
 
         tick = Tick(price=price, qty=qty, ts_ms=ts_ms)
@@ -205,36 +202,41 @@ class BinanceFeed:
         self._current_bar.add(tick)
 
     async def seed_from_rest(self, limit: int = 100):
-        """Seed initial bars from Kraken REST OHLC endpoint."""
+        """Seed initial bars from Coinbase Exchange REST candles endpoint."""
         import aiohttp
-        interval_map = {60: 1, 300: 5, 900: 15}
-        interval = interval_map.get(self.bar_interval_sec, 1)
-        url = f"https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval={interval}&count={limit}"
+        from datetime import datetime, timezone, timedelta
+        # Coinbase granularity: 60=1m, 300=5m, 900=15m
+        granularity = self.bar_interval_sec
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(seconds=granularity * limit)
+        url = (
+            f"https://api.exchange.coinbase.com/products/BTC-USD/candles"
+            f"?granularity={granularity}"
+            f"&start={start.isoformat()}"
+            f"&end={end.isoformat()}"
+        )
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    body = await resp.json()
-            result = body.get("result", {})
-            ohlc_data = result.get("XXBTZUSD", result.get("XBTUSD", []))
-            for k in ohlc_data[-limit:]:
-                # Kraken OHLC: [time, open, high, low, close, vwap, volume, count]
+                    candles = await resp.json()
+            # Coinbase candles: [[time, low, high, open, close, volume], ...] newest first
+            for k in reversed(candles[-limit:]):
                 bar = OHLCBar(
-                    open=float(k[1]),
+                    open=float(k[3]),
                     high=float(k[2]),
-                    low=float(k[3]),
+                    low=float(k[1]),
                     close=float(k[4]),
-                    volume=float(k[6]),
-                    vwap=float(k[5]),
+                    volume=float(k[5]),
+                    vwap=float(k[4]),   # Coinbase candles have no VWAP; use close
                     ts=int(k[0]),
                     interval_sec=self.bar_interval_sec,
-                    trade_count=int(k[7]),
                 )
                 self._bars.append(bar)
             if self._bars:
                 self._last_price = self._bars[-1].close
-            log.info(f"Seeded {len(self._bars)} bars from Kraken REST (last close: ${self._last_price:,.2f})")
+            log.info(f"Seeded {len(self._bars)} bars from Coinbase REST (last close: ${self._last_price:,.2f})")
         except Exception as e:
-            log.warning(f"Failed to seed bars from Kraken REST: {e}")
+            log.warning(f"Failed to seed bars from Coinbase REST: {e}")
 
 
 class _BarAccumulator:

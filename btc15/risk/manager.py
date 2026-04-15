@@ -63,7 +63,10 @@ class RiskManager:
     """
     Centralized risk gatekeeper.
     All trades must pass check_trade() before execution.
-    Supports per-persona budget isolation.
+
+    The optional `persona` field on records is preserved purely as a
+    label for the dashboard / trade log — it has no behavioral effect
+    after the unified AutoTrader replaced the Sniper/Scalper/Arb trio.
     """
 
     def __init__(self, config):
@@ -105,8 +108,8 @@ class RiskManager:
         if cost_usd > self.cfg.max_trade_usd:
             return False, f"Trade ${cost_usd:.2f} exceeds max ${self.cfg.max_trade_usd:.2f}"
 
-        # 4. Min trade size (exempt scalper — market-making legs can be intentionally cheap)
-        if persona != "scalper" and cost_usd < self.cfg.min_trade_usd:
+        # 4. Min trade size
+        if cost_usd < self.cfg.min_trade_usd:
             return False, f"Trade ${cost_usd:.2f} below min ${self.cfg.min_trade_usd:.2f}"
 
         # 5. Max exposure
@@ -122,17 +125,6 @@ class RiskManager:
         # 7. Sufficient bankroll
         if cost_usd > bankroll_usd * 0.5:
             return False, f"Trade ${cost_usd:.2f} would use >50% of bankroll ${bankroll_usd:.2f}"
-
-        # 8. Per-persona budget check (if persona specified)
-        if persona:
-            persona_pnl = self._persona_pnl.get(persona, 0.0)
-            # Each persona gets a fraction of the daily loss limit
-            # Budget fractions: sniper=0.50, scalper=0.30, arb=0.20
-            budget_fracs = {"sniper": 0.50, "scalper": 0.30, "arb": 0.20}
-            budget_frac = budget_fracs.get(persona, 0.33)
-            persona_limit = self.cfg.daily_loss_limit_usd * budget_frac
-            if persona_pnl <= -persona_limit:
-                return False, f"Persona '{persona}' budget exhausted (PnL ${persona_pnl:.2f}, limit -${persona_limit:.2f})"
 
         return True, ""
 

@@ -37,12 +37,12 @@ class FeedsConfig:
 
 @dataclass
 class ModelsConfig:
-    min_confidence: float = 0.62
-    min_edge: float = 0.04
+    min_confidence: float = 0.55
     ensemble_weights: dict = field(default_factory=lambda: {
-        "binary_options_model": 0.40,
-        "technical_momentum": 0.30,
+        "orderbook_imbalance": 0.25,
+        "technical_momentum": 0.35,
         "trend_regression": 0.20,
+        "binary_options_model": 0.10,
         "ml_model": 0.10,
     })
     rsi_period: int = 14
@@ -56,96 +56,111 @@ class ModelsConfig:
 
 @dataclass
 class StrategyConfig:
-    min_seconds_remaining: int = 90
-    max_seconds_remaining: int = 840
-    preferred_entry_window_sec: list = field(default_factory=lambda: [300, 600])
+    min_seconds_remaining: int = 60
+    max_seconds_remaining: int = 870
+    preferred_entry_window_sec: list = field(default_factory=lambda: [180, 600])
     auto_trade: bool = False
     paper_trade: bool = True
-    max_open_positions: int = 3
+    max_open_positions: int = 4
     allowed_sides: str = "both"
-    # Active position management
-    take_profit_pct: float = 0.65
-    stop_loss_pct: float = 0.35
-    flip_min_edge: float = 0.10
-    lock_profit_seconds: int = 120
-    # Trailing stop — activates once up trail_activate_pct, exits if retraces
-    # more than trail_retracement_pct of the peak gain
-    trail_activate_pct: float = 0.20   # start trailing once up 20%
-    trail_retracement_pct: float = 0.50  # exit if peak gain retraces 50%
-    # Re-entry protection
-    min_entry_price_cents: int = 10       # skip if contract priced < 10¢ (market decided)
-    stop_loss_cooldown_seconds: int = 120  # block re-entry for 2 min after stop-loss
-    # Cheap-entry cost cap — Kelly explodes at penny prices; cap dollar exposure
-    cheap_entry_threshold_cents: int = 25  # applies when price < this
-    max_cost_cheap_entry_usd: float = 4.00
-    # Per-candle loss brake — stop auto entries on a ticker that has lost this much
-    per_candle_max_loss_usd: float = 8.00
+
+
+@dataclass
+class TraderConfig:
+    """Unified auto-trader configuration (replaces Sniper/Scalper/Arb personas)."""
+    enabled: bool = True
+    budget_pct: float = 1.0              # fraction of bankroll available
+
+    # ── Time-phase thresholds (seconds remaining) ──────────────────────────
+    early_window_min_seconds: int = 480  # >8 min: market-make + pre-position GTC
+    prime_window_min_seconds: int = 180  # 3–8 min: directional entries
+    late_window_min_seconds: int = 60    # <1 min: no new entries
+    max_entry_seconds: int = 870         # never enter beyond 14.5 min remaining
+
+    # ── Entry thresholds ──────────────────────────────────────────────────
+    min_confidence: float = 0.55         # minimum model confidence for any entry
+    min_edge: float = 0.05               # minimum edge over market price (5%)
+    min_entry_price_cents: int = 10      # skip contracts priced below 10¢
+    max_entry_price_cents: int = 72      # skip deep-ITM contracts — post-mortem showed
+                                         # 67-82¢ entries dominated losses; 72¢ drops the tail
+
+    # ── Settlement lock (late-window near-certainty entries) ──────────────
+    settlement_lock_enabled: bool = True
+    settlement_lock_min_seconds: int = 20    # earliest: 20s before close
+    settlement_lock_max_seconds: int = 60    # latest:  60s before close (below late window)
+    settlement_lock_min_prob: float = 0.88   # BSM prob must be this extreme
+    settlement_lock_min_confidence: float = 0.50  # model agreement required
+
+    # ── GTC order management ──────────────────────────────────────────────
+    gtc_escalate_seconds: float = 25.0   # escalate GTC entry to IOC after N seconds unfilled
+    slippage_cents: int = 2              # IOC slippage above current ask
+
+    # ── Market making ─────────────────────────────────────────────────────
+    mm_min_spread_cents: int = 5         # minimum spread to post both sides
+    mm_contracts_per_side: int = 2       # contracts per MM quote
+    mm_max_inventory: int = 8            # max net directional inventory before pausing one side
+    mm_cancel_before_seconds: int = 120  # cancel all MM orders with <2 min left
+    mm_quote_offset_cents: int = 2       # quote this many cents inside the best bid/ask
+
+    # ── Exit rules ────────────────────────────────────────────────────────
+    stop_loss_pct: float = 0.40          # cut if losing >40% AND inside stop_loss_min_seconds
+    stop_loss_min_seconds: int = 240     # only cut if <4 min left (let positions breathe)
+    emergency_stop_pct: float = 0.65    # cut IMMEDIATELY (any time) if losing >65%
+    reversal_min_edge: float = 0.10      # edge required to flip sides
+    reversal_min_seconds: int = 300      # only flip with >5 min left
+
+    # ── Position sizing ───────────────────────────────────────────────────
+    kelly_fraction_early: float = 0.25   # quarter-Kelly for GTC early entries
+    kelly_fraction_prime: float = 0.50   # half-Kelly for IOC prime-window entries
+    kelly_fraction_strong: float = 0.75  # 3/4-Kelly for very strong signals
+    max_single_trade_usd: float = 12.0   # hard cap per individual trade ($100 bankroll)
+    min_single_trade_usd: float = 1.0    # skip if Kelly size falls below this
+
+    # ── Pyramiding (add-to-winner) ────────────────────────────────────────
+    pyramid_enabled: bool = True
+    pyramid_min_pnl_pct: float = 0.10    # position must be ≥10% profitable
+    pyramid_min_confidence: float = 0.55 # model must still be confident
+    pyramid_min_edge: float = 0.05       # edge must still exist
+    pyramid_min_seconds: int = 300       # ≥5 min left to add
+    pyramid_max_adds: int = 1            # max 1 add per position
+
+    # ── Stop-loss / whipsaw cooldowns ─────────────────────────────────────
+    stop_cooldown_seconds: int = 90      # after a stop-loss, lock the ticker for N seconds
+                                         # (was 45; session 12APR06:15 showed 4 stops in 10 min
+                                         # on one market — doubling prevents re-entering chop)
+    reversal_cooldown_seconds: int = 60  # after a reversal exit, lock the ticker for N seconds
+                                         # (blocks second/third flips inside one window)
+
+    # ── GTC→IOC escalation drift gate ─────────────────────────────────────
+    # When an early-window GTC sits unfilled and the market has moved past our
+    # resting price, measure how far the IOC would have to cross vs the mid
+    # we saw at signal time. Adverse drift = informed flow already moved us.
+    escalation_drift_halve_cents: int = 2  # IOC price > signal_mid + slip + 2 → halve size
+    escalation_drift_skip_cents: int = 5   # IOC price > signal_mid + 5       → skip entirely
+
+    # ── Reversal re-entry orderbook confirmation ──────────────────────────
+    # After a reversal exit, don't re-enter the flipped side unless the live
+    # orderbook imbalance agrees. Half of last session's reversal re-entries
+    # lost immediately — the edge existed on model but the flow hadn't turned.
+    reversal_require_orderbook_confirm: bool = True
+    reversal_orderbook_min_dev: float = 0.10  # |prob_orderbook - 0.5| must exceed this
+                                              # in the flip direction to allow re-entry
+
+    # ── Arb ───────────────────────────────────────────────────────────────
+    min_arb_cents: int = 2               # YES+NO must cost ≤98¢ for guaranteed arb
+    max_arb_contracts: int = 5           # max contracts per pure-arb pair
 
 
 @dataclass
 class RiskConfig:
-    max_trade_usd: float = 50.00
-    max_position_per_market_usd: float = 200.00
-    daily_loss_limit_usd: float = 150.00
+    max_trade_usd: float = 12.00
+    max_position_per_market_usd: float = 12.00
+    daily_loss_limit_usd: float = 15.00
     kelly_fraction: float = 0.25
-    min_trade_usd: float = 5.00
+    min_trade_usd: float = 1.00
     win_rate_lookback: int = 20
-    win_rate_min: float = 0.45
+    win_rate_min: float = 0.40
     max_open_positions: int = 3
-
-
-@dataclass
-class SniperConfig:
-    enabled: bool = True
-    budget_pct: float = 0.50
-    min_confidence: float = 0.75
-    min_edge: float = 0.05
-    kelly_fraction: float = 0.50
-    slippage_cents: int = 3
-    take_profit_pct: float = 0.50
-    stop_loss_pct: float = 0.25
-    min_seconds: int = 180       # 3 min
-    max_seconds: int = 600       # 10 min
-    stop_loss_cooldown_seconds: int = 180  # no re-entry on same ticker for 3 min after SL
-    trail_activate_pct: float = 0.20
-    trail_retracement_pct: float = 0.50
-
-
-@dataclass
-class ScalperConfig:
-    enabled: bool = True
-    budget_pct: float = 0.30
-    min_spread_cents: int = 3
-    contracts_per_side: int = 1
-    max_inventory_imbalance: int = 10
-    cancel_before_seconds: int = 120
-    min_seconds: int = 120       # 2 min
-    max_seconds: int = 720       # 12 min
-
-
-@dataclass
-class ArbConfig:
-    enabled: bool = True
-    budget_pct: float = 0.20
-    min_arb_cents: int = 2       # YES+NO must cost < 98¢
-    stat_arb_divergence: float = 0.15
-    stat_arb_min_confidence: float = 0.40
-    max_contracts: int = 20
-    # Stat-arb entry filter
-    stat_arb_min_price_cents: int = 20       # skip contracts already priced <20¢ (market has decided)
-    # Stat-arb exit thresholds (pure arb always holds to settlement)
-    stat_arb_take_profit_pct: float = 0.80   # exit when up 80%
-    stat_arb_stop_loss_pct: float = 0.65     # exit when down 65% (widened from 50%)
-    trail_activate_pct: float = 0.20
-    trail_retracement_pct: float = 0.50
-    stat_arb_cut_before_seconds: int = 90    # cut losing stat-arb with <90s left rather than ride to zero
-
-
-@dataclass
-class PersonasConfig:
-    sniper: SniperConfig = field(default_factory=SniperConfig)
-    scalper: ScalperConfig = field(default_factory=ScalperConfig)
-    arb: ArbConfig = field(default_factory=ArbConfig)
 
 
 @dataclass
@@ -162,8 +177,8 @@ class AppConfig:
     feeds: FeedsConfig = field(default_factory=FeedsConfig)
     models: ModelsConfig = field(default_factory=ModelsConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
+    trader: TraderConfig = field(default_factory=TraderConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
-    personas: PersonasConfig = field(default_factory=PersonasConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     database_path: str = "data/btc15.db"
 
@@ -183,7 +198,7 @@ def load_config(config_path: Optional[Path] = None) -> AppConfig:
     cfg = AppConfig()
 
     # Load YAML
-    path = config_path or ROOT / "config.yaml"
+    path = Path(config_path) if config_path else ROOT / "config.yaml"
     if path.exists():
         with open(path) as f:
             raw = yaml.safe_load(f) or {}

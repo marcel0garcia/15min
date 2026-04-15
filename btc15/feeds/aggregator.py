@@ -67,7 +67,7 @@ class PriceAggregator:
             t.cancel()
         self._tasks.clear()
 
-    async def _on_tick(self, _price: float, _qty: float, _ts_ms: int):
+    async def _on_tick(self, __price: float, __qty: float, __ts_ms: int):
         self._last_tick_ts = time.time()
 
     async def _bar_heartbeat(self):
@@ -103,9 +103,10 @@ class PriceAggregator:
                 log.debug(f"Bar heartbeat error: {e}")
 
     async def _fallback_loop(self):
-        """Poll Coinbase REST every 5 seconds as a sanity check / fallback."""
+        """Poll Coinbase REST every 5 seconds as a sanity check / fallback.
+        Fetches immediately on start so there's always a price before the first
+        Kraken tick arrives (prevents RuntimeError during early startup)."""
         while self._running:
-            await asyncio.sleep(5)
             try:
                 price = await self._fetch_coinbase_price()
                 if price is not None:
@@ -113,6 +114,7 @@ class PriceAggregator:
                     self._fallback_price_ts = time.time()
             except Exception:
                 pass
+            await asyncio.sleep(5)
 
     async def _fetch_coinbase_price(self) -> Optional[float]:
         try:
@@ -122,7 +124,10 @@ class PriceAggregator:
                     timeout=aiohttp.ClientTimeout(total=5),
                 ) as resp:
                     data = await resp.json()
-                    return float(data["data"]["amount"])
+                    # Coinbase Exchange ticker: {"price": "66807.00", ...}
+                    # Coinbase consumer API:    {"data": {"amount": "66807.00"}}
+                    price = data.get("price") or data.get("data", {}).get("amount")
+                    return float(price) if price else None
         except Exception as e:
             log.debug(f"Coinbase REST fallback failed: {e}")
             return None
@@ -153,7 +158,9 @@ class PriceAggregator:
                     )
                 self._last_stale_log = now
             return self._fallback_price
-        raise RuntimeError("No price data available from any feed")
+        # Both feeds unavailable — return 0 and let callers skip this cycle
+        log.warning("No price data available from any feed — skipping cycle")
+        return 0.0
 
     @property
     def bars(self) -> list[OHLCBar]:

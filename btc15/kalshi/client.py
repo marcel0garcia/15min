@@ -49,15 +49,19 @@ def _rsa_sign(private_key, timestamp_ms: int, method: str, path: str) -> str:
     """
     Kalshi RSA signature: RSASSA-PSS SHA-256
     Message = str(timestamp_ms) + method.upper() + path_without_query
+    Salt length must equal the hash digest size (32 bytes for SHA-256).
+    Kalshi rejects signatures produced with PSS.MAX_LENGTH.
     """
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding
     msg = f"{timestamp_ms}{method.upper()}{path}".encode("utf-8")
+    # Fresh SHA256 instances for each use — sign() consumes the algorithm object.
+    # salt_length = digest_size (32 bytes) as required by Kalshi; PSS.MAX_LENGTH is rejected.
     sig = private_key.sign(
         msg,
         padding.PSS(
             mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.MAX_LENGTH,
+            salt_length=hashes.SHA256().digest_size,
         ),
         hashes.SHA256(),
     )
@@ -246,7 +250,8 @@ class KalshiClient:
         data = await self.get(f"/markets/{ticker}/orderbook", depth=depth)
         ob = data.get("orderbook", {})
         yes_bids = [(int(p), int(s)) for p, s in ob.get("yes", [])]
-        yes_asks = [(int(p), int(s)) for p, s in ob.get("no", [])]  # no side = yes sells
+        # NO bid levels represent what NO buyers pay. YES ask = 100 - no_bid.
+        yes_asks = [(100 - int(p), int(s)) for p, s in ob.get("no", [])]
         return Orderbook(
             ticker=ticker,
             yes_bids=yes_bids,
@@ -275,9 +280,9 @@ class KalshiClient:
 
         # New API field names use _dollars suffix; fall back to old names
         yes_bid = to_cents(m.get("yes_bid_dollars") or m.get("yes_bid"))
-        yes_ask = to_cents(m.get("yes_ask_dollars") or m.get("yes_ask")) or 100.0
+        yes_ask = to_cents(m.get("yes_ask_dollars") or m.get("yes_ask")) or 0.0
         no_bid  = to_cents(m.get("no_bid_dollars")  or m.get("no_bid"))
-        no_ask  = to_cents(m.get("no_ask_dollars")  or m.get("no_ask")) or 100.0
+        no_ask  = to_cents(m.get("no_ask_dollars")  or m.get("no_ask")) or 0.0
         last    = to_cents(m.get("last_price_dollars") or m.get("last_price")) or 50.0
 
         # Volume: try fractional field first
@@ -335,16 +340,37 @@ class KalshiClient:
     async def get_positions(self) -> list[Position]:
         data = await self.get("/portfolio/positions")
         positions = []
+
+        def _cents(val, default: float) -> float:
+            """Normalize a price value that may be in dollar (0-1) or cent (0-100) format."""
+            try:
+                f = float(val or default)
+                return f * 100 if f <= 1.0 else f
+            except Exception:
+                return float(default)
+
         for p in data.get("market_positions", []):
+            # v2 API uses position_fp (string float): positive = net YES, negative = net NO
+            pos_fp = float(p.get("position_fp", 0) or 0)
+            contracts = abs(round(pos_fp))
+            if contracts == 0:
+                continue  # no active position
+
+            side = Side.YES if pos_fp > 0 else Side.NO
+            # market_exposure_dollars = net dollars at risk in the current position.
+            # total_traded_dollars = gross trading volume (both YES and NO sides summed)
+            # which can exceed 100¢ per net contract when both sides are held (e.g. scalper).
+            exposure_dollars = float(p.get("market_exposure_dollars", 0) or 0)
+            avg_price_cents = min(99.0, (exposure_dollars / max(contracts, 1)) * 100)
+
             positions.append(
                 Position(
                     ticker=p["ticker"],
-                    side=Side.YES if int(p.get("position", 0)) > 0 else Side.NO,
-                    contracts=abs(int(p.get("position", 0))),
-                    avg_price_cents=float(p.get("market_exposure", 0))
-                    / max(abs(int(p.get("position", 1))), 1) * 100,
-                    current_yes_bid=float(p.get("current_yes_bid", 0) or 0),
-                    current_yes_ask=float(p.get("current_yes_ask", 100) or 100),
+                    side=side,
+                    contracts=contracts,
+                    avg_price_cents=avg_price_cents,
+                    current_yes_bid=_cents(p.get("current_yes_bid"), 0),
+                    current_yes_ask=_cents(p.get("current_yes_ask"), 100),
                 )
             )
         return positions
@@ -357,11 +383,32 @@ class KalshiClient:
         return [self._parse_order(o) for o in data.get("orders", [])]
 
     async def get_fills(self, ticker: Optional[str] = None) -> list[dict]:
+        """
+        Return normalized fills. Kalshi REST uses different field names than WS:
+          REST: count_fp (str float), yes_price_dollars / no_price_dollars (str $)
+          WS:   count (int),          yes_price / no_price (int cents)
+        This method normalizes to: count (int), yes_price (int cents), no_price (int cents),
+        plus raw fields preserved.
+        """
         params: dict = {}
         if ticker:
             params["ticker"] = ticker
         data = await self.get("/portfolio/fills", **params)
-        return data.get("fills", [])
+        fills = data.get("fills", [])
+        normalized = []
+        for f in fills:
+            count = round(float(f.get("count_fp", 0) or 0))
+            yes_price = round(float(f.get("yes_price_dollars", 0) or 0) * 100)
+            no_price  = round(float(f.get("no_price_dollars",  0) or 0) * 100)
+            fee_cents = round(float(f.get("fee_cost", 0) or 0) * 100)
+            normalized.append({
+                **f,
+                "count":     count,
+                "yes_price": yes_price,
+                "no_price":  no_price,
+                "fee_cents": fee_cents,
+            })
+        return normalized
 
     # ── Order management ───────────────────────────────────────────────────
 
@@ -396,7 +443,8 @@ class KalshiClient:
         if time_in_force:
             body["time_in_force"] = time_in_force.value
         if self_trade_prevention:
-            body["self_trade_prevention"] = self_trade_prevention.value
+            # v2 spec field is `self_trade_prevention_type`
+            body["self_trade_prevention_type"] = self_trade_prevention.value
 
         data = await self.post("/portfolio/orders", body)
         return self._parse_order(data["order"])
@@ -433,13 +481,26 @@ class KalshiClient:
         contracts: int,
         price_cents: int,
     ) -> Order:
-        """Close an existing position by placing a sell-side limit order."""
+        """Close an existing position at a specific limit price.
+
+        Uses IOC (Immediate or Cancel) so the order either fills on the spot
+        or is cancelled — it never rests on the book. Resting GTC sell orders
+        were the root cause of orphan positions: the bot removed the position
+        from internal tracking assuming the sell filled, but the GTC limit
+        sat unfilled on Kalshi, producing ghost positions that the orphan
+        detector would later re-adopt with wrong contract counts.
+
+        NOTE: This is a price-sensitive sell — the order only crosses bids
+        ≥ `price_cents`. For stop-losses and emergency exits use
+        `sell_position_sweep()` instead, which takes whatever the book gives.
+        """
         body: dict = {
             "ticker": ticker,
             "action": "sell",
             "side": side.value,
             "type": "limit",
             "count": contracts,
+            "time_in_force": TimeInForce.IOC.value,
         }
         if side == Side.YES:
             body["yes_price"] = price_cents
@@ -448,31 +509,140 @@ class KalshiClient:
         data = await self.post("/portfolio/orders", body)
         return self._parse_order(data["order"])
 
+    async def sell_position_sweep(
+        self,
+        ticker: str,
+        side: Side,
+        contracts: int,
+    ) -> Order:
+        """Close a position by sweeping the book — take any bid ≥ 1¢.
+
+        Kalshi limit orders fill at the RESTING maker's price, not the
+        taker's limit, so submitting an IOC sell with `yes_price=1` (or
+        `no_price=1`) tells Kalshi: "take whatever bids exist, highest
+        first, until this order is filled." This is the correct primitive
+        for stop-losses, emergency stops, reversals, and profit-takes:
+        we care about getting out, not about the exact execution price.
+
+        The old `sell_position(price_cents=6)` path was polite but brittle:
+        if the top-of-book bid was a phantom at 6¢ and the real liquidity
+        sat at 3¢ and 2¢, the IOC would reject those fills because they
+        were below our stated limit. Positions then rode to 0¢ settlement
+        even though the book had buyers the whole time.
+        """
+        body: dict = {
+            "ticker": ticker,
+            "action": "sell",
+            "side": side.value,
+            "type": "limit",
+            "count": contracts,
+            "time_in_force": TimeInForce.IOC.value,
+        }
+        # Submit at the floor (1¢). Kalshi matches against the best available
+        # bid in price-time priority; the `yes_price`/`no_price` field acts as
+        # a price floor, not a fill target.
+        if side == Side.YES:
+            body["yes_price"] = 1
+        else:
+            body["no_price"] = 1
+        data = await self.post("/portfolio/orders", body)
+        return self._parse_order(data["order"])
+
     async def cancel_order(self, order_id: str) -> dict:
         return await self.delete(f"/portfolio/orders/{order_id}")
 
     async def cancel_all_orders(self, ticker: Optional[str] = None) -> int:
-        orders = await self.get_orders(ticker=ticker)
+        """Cancel every resting order, batching up to 20 IDs per request.
+
+        Uses `DELETE /portfolio/orders/batched` (v2) so a shutdown with
+        many open orders does not chew through the rate limit one cancel
+        at a time. Falls back to per-order DELETE if the batched endpoint
+        rejects the request (older API path).
+        """
+        resting = [
+            o for o in await self.get_orders(ticker=ticker)
+            if o.status == OrderStatus.RESTING
+        ]
+        if not resting:
+            return 0
+
         cancelled = 0
-        for order in orders:
-            if order.status == OrderStatus.RESTING:
-                try:
-                    await self.cancel_order(order.order_id)
-                    cancelled += 1
-                except Exception as e:
-                    log.warning(f"Failed to cancel {order.order_id}: {e}")
+        for i in range(0, len(resting), 20):
+            chunk = resting[i:i + 20]
+            try:
+                await self._request(
+                    "DELETE",
+                    "/portfolio/orders/batched",
+                    json={"ids": [o.order_id for o in chunk]},
+                )
+                cancelled += len(chunk)
+            except Exception as e:
+                log.warning(
+                    f"Batched cancel failed for {len(chunk)} orders ({e}); "
+                    "falling back to per-order DELETE"
+                )
+                for order in chunk:
+                    try:
+                        await self.cancel_order(order.order_id)
+                        cancelled += 1
+                    except Exception as inner:
+                        log.warning(f"Failed to cancel {order.order_id}: {inner}")
         return cancelled
 
     def _parse_order(self, o: dict) -> Order:
+        """Parse an order response.
+
+        Kalshi v2 uses fixed-point string fields (`fill_count_fp`,
+        `remaining_count_fp`, `initial_count_fp`) and dollar-denominated
+        prices (`yes_price_dollars`, `no_price_dollars`). Older API paths
+        still return integer cents under `yes_price` / `no_price` and
+        plain integer counts. Read both shapes so the parser is robust
+        across versions.
+        """
+
+        def _to_int(val, default: int = 0) -> int:
+            try:
+                return int(round(float(val)))
+            except (TypeError, ValueError):
+                return default
+
+        def _price_cents(dollar_val, cent_val) -> int:
+            """Prefer the *_dollars field; fall back to integer cents."""
+            if dollar_val is not None:
+                try:
+                    return int(round(float(dollar_val) * 100))
+                except (TypeError, ValueError):
+                    pass
+            try:
+                return int(round(float(cent_val or 0)))
+            except (TypeError, ValueError):
+                return 0
+
+        count = _to_int(
+            o.get("count")
+            if o.get("count") is not None
+            else o.get("initial_count_fp")
+        )
+        filled = _to_int(
+            o.get("fill_count_fp")
+            if o.get("fill_count_fp") is not None
+            else o.get("filled_count")
+        )
+        remaining = _to_int(
+            o.get("remaining_count_fp")
+            if o.get("remaining_count_fp") is not None
+            else o.get("remaining_count")
+        )
+
         return Order(
             order_id=o.get("order_id", ""),
             ticker=o.get("ticker", ""),
             side=Side(o.get("side", "yes")),
             order_type=OrderType(o.get("type", "limit")),
-            count=int(o.get("count", 0)),
-            yes_price=int(o.get("yes_price", 0) or 0),
-            no_price=int(o.get("no_price", 0) or 0),
+            count=count,
+            yes_price=_price_cents(o.get("yes_price_dollars"), o.get("yes_price")),
+            no_price=_price_cents(o.get("no_price_dollars"), o.get("no_price")),
             status=OrderStatus(o.get("status", "resting")),
-            filled_count=int(o.get("filled_count", 0) or 0),
-            remaining_count=int(o.get("remaining_count", 0) or 0),
+            filled_count=filled,
+            remaining_count=remaining,
         )

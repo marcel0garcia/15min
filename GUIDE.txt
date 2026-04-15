@@ -7,95 +7,157 @@ WHAT IS THIS BOT?
 Trades Kalshi's KXBTC15M binary markets: "Will BTC be above/below [strike]
 at the end of this 15-minute window?"
 
-  YES contract: pays $1 if BTC closes ABOVE strike  (e.g., costs 65¢)
-  NO contract:  pays $1 if BTC closes BELOW strike  (e.g., costs 35¢)
+  YES contract: pays $1 if BTC closes ABOVE strike  (e.g., costs 52¢ = risk 52¢ to win 48¢)
+  NO contract:  pays $1 if BTC closes BELOW strike  (e.g., costs 48¢ = risk 48¢ to win 52¢)
 
-The bot watches live BTC price, runs an ensemble of models to estimate the
-true probability of YES/NO, and trades when it finds meaningful edge vs
-Kalshi's price. Three concurrent strategies ("personas") run simultaneously.
+The bot watches live BTC price, runs a 5-model ensemble to estimate the true
+probability of YES/NO, and trades when edge vs Kalshi's price is meaningful.
+Optimized for a $100 starting balance.
 
 
 ================================================================================
   HOW IT MAKES DECISIONS
 ================================================================================
 
-ENSEMBLE (4 models)
-───────────────────
-  1. Black-Scholes (40%)  — digital-option pricing: price, strike, time, vol
-  2. Technical (30%)      — RSI, MACD, Bollinger Bands, 1/5/15-min momentum
-  3. Trend regression (20%) — linear slope and R² over recent bars
-  4. LightGBM ML (10%)    — trained on historical BTC bars (bootstrap command)
+STEP 1 — ENSEMBLE MODEL (5 models, weighted)
+─────────────────────────────────────────────
+Every scan cycle the bot combines five independent probability estimates:
 
-FOUR TRADING BEHAVIORS (run concurrently)
-─────────────────────────────────────────
-  [AUTO] Auto — the base engine (original strategy)
-    - Runs on every qualifying signal: confidence ≥ 0.50, edge ≥ 3%
-    - Quarter-Kelly sizing (0.25) — conservative, scales with edge
-    - Entry window: 1–14.5 min remaining; exits managed by engine directly
-    - Take-profit: +65%  |  Stop-loss: −35%
-    - Trailing stop: activates at +20% gain, exits if retraces 50% of peak
-    - Has its own re-entry cooldown, candle loss brake, and cheap-entry cap
-    - This is the primary directional layer; the personas layer on top of it
-    - Controlled by strategy.auto_trade and strategy.* config settings
+  1. Orderbook Imbalance (25%)   ← HIGHEST WEIGHT
+     Real-time buy/sell pressure from the live Kalshi orderbook.
+     If YES bids dominate (buyers loading YES), that's a bullish signal.
+     Requires 10+ total contracts in the book to avoid noise.
+     Maps 70% bid dominance → P(YES) ≈ 0.78, balanced → 0.50.
 
-  [SNP] Sniper — aggressive directional bets
-    - Fires only on very high conviction: confidence ≥ 0.75, edge ≥ 5%
-    - Half-Kelly sizing (0.50) — bigger bets, fewer trades
-    - Entry window: 3–10 minutes remaining
-    - Take-profit: +50%  |  Stop-loss: −25%  |  Re-entry cooldown: 3 min
-    - Trailing stop: activates at +20% gain, exits if retraces 50% of peak
+  2. Technical Momentum (35%)   ← HIGHEST WEIGHT
+     Composite score from RSI, MACD histogram, Bollinger Band position,
+     1/5/15-min price momentum, and EMA trend. Strong for 15-min crypto moves.
 
-  [SCA] Scalper — market maker / spread capture
-    - Posts resting limit orders on BOTH YES and NO sides (post_only = zero fees)
-    - Profits from the bid-ask spread regardless of direction
-    - Amends prices each scan cycle rather than cancelling and re-posting
-    - Cancels all resting orders when < 2 min remain (avoids settlement risk)
-    - Active when spread ≥ 3¢, window 2–12 min remaining
+  3. Trend Regression (20%)
+     OLS slope on recent closes, confidence-weighted by R². A strong trend
+     with high R² pushes probability toward continuation. Low R² shrinks
+     the signal toward neutral (0.50).
 
-  [ARB] Arb — mispricing hunter
-    - Pure arb: buys YES + NO when combined cost < 98¢ (guaranteed ≥ 2¢ profit)
-    - Stat arb: bets on divergence when model differs from market by > 15%
-    - Stat arb requires confidence ≥ 0.40, market price ≥ 20¢ (avoids
-      contracts where the market has already made up its mind)
-    - Stat arb exits: take-profit +80%, stop-loss −65%, cut with < 90s left
-    - Trailing stop: activates at +20% gain, exits if retraces 50% of peak
+  4. Black-Scholes Digital Option (10%)
+     Risk-neutral P(BTC > strike at expiry). Useful as a sanity check when
+     BTC is far from the strike with time left. Becomes a step-function
+     (<5 min remaining) so weight is kept low.
 
-RISK GUARDS
-───────────
-  - Daily loss limit: bot halts when cumulative loss hits the configured cap
-  - Win-rate guard: trading pauses if win rate drops below 15% over 20 trades
-  - Per-candle loss brake: if a single ticker accumulates > $8 in losses this
-    session, no further auto entries on that ticker (prevents loss loops)
-  - Cheap-entry cost cap: when entry price < 25¢, Kelly sizing is capped at
-    $4 of exposure (prevents exploding contract counts at penny prices)
-  - Stop-loss cooldown: 2-min block on re-entry after a stop-loss exit
+  5. LightGBM ML Model (10%)
+     Trained on historical BTC bar data (bootstrap command). Automatically
+     disabled if no model file found — the other 4 models cover for it.
+     Weight increases over time as you accumulate live trade outcomes.
+
+OUTPUT: prob_yes, prob_no, confidence (0–1), edge_yes, edge_no, signal
+
+CONFIDENCE BOOSTERS:
+  - Model agreement: if all 5 models agree, confidence is high. If they
+    diverge, confidence is low even if prob_yes looks strong.
+  - Volume velocity: if the last 3 bars have 1.5× the average volume,
+    confidence gets a +8% boost. Something is happening.
+
+STEP 2 — SIGNAL FILTERING
+──────────────────────────
+A trade action is only generated when ALL of these pass:
+  - confidence ≥ 0.55  (models agree)
+  - edge ≥ 0.05        (5% edge over Kalshi mid-price)
+  - seconds_remaining in allowed window (60s–870s)
+  - not already holding a position on this ticker
+  - not in stop-loss cooldown (2 min after a loss cut)
+
+STEP 3 — TIME-PHASE LOGIC (the core of AutoTrader)
+────────────────────────────────────────────────────
+Once a signal passes filtering, the action type depends on how much time
+remains in the 15-minute window:
+
+  EARLY PHASE  (>8 min remaining)
+  ─────────────────────────────────
+  Post a GTC limit order at mid-price minus 1¢ with post_only=True.
+  This earns the maker rebate = 0% fee (vs ~1.75¢ taker fee on IOC).
+  If the order is not filled within 25 seconds, it gets cancelled and
+  re-submitted as an IOC order (escalation).
+  Also runs market making: if spread ≥ 5¢, posts both YES and NO sides
+  inside the spread to earn the spread regardless of direction.
+
+  PRIME PHASE  (3–8 min remaining)
+  ──────────────────────────────────
+  The window is closing. Enters immediately with an IOC market order
+  (allows 2¢ of slippage above current ask). Half-Kelly sizing is used
+  here (bigger bets, high conviction, short time horizon).
+  Any stale GTC orders from Early phase get escalated to IOC.
+
+  LATE PHASE  (<3 min remaining)
+  ────────────────────────────────
+  No new entries. Manages existing positions only.
+  All market making orders are cancelled (settlement risk).
+
+STEP 4 — POSITION SIZING (Kelly Criterion)
+───────────────────────────────────────────
+  Formula: f* = (b × p − q) / b  where b = net profit per $1 risked
+
+  On a YES contract at 52¢: b = (100-52)/52 × 0.93 = 0.858
+  At prob_win=0.70: full_kelly = 35%
+  Quarter-kelly (Early): 35% × 0.25 = 8.75% of bankroll = $8.75 on $100
+  Half-kelly (Prime):    35% × 0.50 = 17.5% of bankroll → capped at 20% = $20
+
+  Hard limits (on $100 balance):
+    max per trade:        $12.00
+    max open positions:   3 (max simultaneous exposure ~$36)
+    daily loss limit:     $15.00 (bot halts if down $15 in one day)
+    min trade size:       $1.00
+
+STEP 5 — PURE ARBITRAGE (always highest priority)
+───────────────────────────────────────────────────
+Before any directional entry, the bot checks: YES_ask + NO_ask < 98¢
+If YES costs 48¢ and NO costs 49¢, buying both costs 97¢ and pays $1.00
+at settlement = guaranteed 3¢ profit per pair regardless of outcome.
+When found, IOC buys both sides immediately (max 5 contract pairs).
+
+STEP 6 — EXIT RULES (3 rules, no trailing stop, no profit decay)
+─────────────────────────────────────────────────────────────────
+Rule 1 (Arb hold):   Pure arb positions always hold to $1.00 settlement.
+                     Never cut a guaranteed winner.
+
+Rule 2 (Flip):       If the model reverses with edge > 10% AND > 5 min left,
+                     exit current position and enter the opposite side.
+                     The market changed — adjust.
+
+Rule 3 (Loss cut):   If unrealized loss > 40% of entry cost AND < 4 min left,
+                     exit immediately. Don't get trapped near zero.
+
+Rule 4 (Default):    Everything else → hold to $1.00 settlement.
+                     This is the key difference from the old bot. Binary
+                     options pay $1 if you're right. Don't sell a winning
+                     position for 80¢ when you can collect $1.00 in 3 minutes.
 
 
 ================================================================================
   DASHBOARD PANELS
 ================================================================================
 
-HEADER — BTC price, feed freshness, scan time, mode flags, session uptime
+HEADER — BTC price, feed freshness, scan time, mode flags (PAPER/LIVE,
+         SIGNAL/AUTO), session uptime
 
 SIGNALS — Per-market model output
-  Ticker | Strike | T-Left | P(YES) | Edge | Signal
+  Ticker | Strike | T-Left | P(YES) | Confidence | Edge | Signal
   Signal values: STRONG YES / WEAK YES / STRONG NO / WEAK NO / NEUTRAL
+  (STRONG = edge > 10%, WEAK = edge 5–10%)
 
 OPEN MARKETS — Live orderbook snapshot
-  Strike | UP (YES ask) | DN (100−YES bid) | Volume | T-Left
+  Strike | YES ask | NO ask | Spread | Volume | T-Left
 
 RISK / BALANCE — Available cash, day P&L, open positions, win rate
-  "HALTED" shows in red if daily loss limit is hit.
+  "HALTED" shows in red if daily loss limit ($15) is hit.
 
-POSITIONS — Open positions with live mark-to-market PnL
-  Shows auto trades and persona trades (tagged SNP/SCA/ARB)
+POSITIONS — Open positions with live mark-to-market P&L
+  Shows entry price, current price, unrealized P&L, phase when entered.
 
 TRADE LOG — Scrolling execution log
-  [P] = paper trade.  [SNP]/[SCA]/[ARB] = persona trades.
-  Auto trades have no persona tag — they come from the base engine.
+  [P] = paper trade   [A] = auto trade   [MM] = market making
+  GTC = resting limit order (0% fee)   IOC = immediate fill (~1.75¢ fee)
   Entries show cost; exits/settlements show realized P&L.
 
-PERSONAS PANEL — Per-persona status: budget used, open positions, win rate
+TRADER PANEL — AutoTrader status: positions, daily P&L, resting orders
 
 PnL CHART — Session cumulative P&L history
 
@@ -107,11 +169,11 @@ PnL CHART — Session cumulative P&L history
   PAPER (default)   Bot logs trades but sends NO orders to Kalshi.
   LIVE              Real orders sent. Real money at risk.
 
-  SIGNAL-ONLY (default)   Shows signals, no automatic trades.
-  AUTO-TRADE              Places trades automatically on qualifying signals.
+  SIGNAL-ONLY       Shows signals, no automatic trades.
+  AUTO-TRADE        Places trades automatically on qualifying signals.
 
   Combinations:
-    PAPER  + SIGNAL-ONLY  = monitoring only (default)
+    PAPER  + SIGNAL-ONLY  = monitoring only (default, safe)
     PAPER  + AUTO-TRADE   = simulated trading, safe to test
     LIVE   + SIGNAL-ONLY  = manual execution on bot's signals
     LIVE   + AUTO-TRADE   = fully automated real-money trading
@@ -129,72 +191,44 @@ PnL CHART — Session cumulative P&L history
   ./run.sh markets                  List open KXBTC markets
   ./run.sh positions                Show current Kalshi positions
   ./run.sh balance                  Show Kalshi account balance
-  ./run.sh history                  Last 20 trades (aligned table + session)
+  ./run.sh history                  Last 20 trades
   ./run.sh history -n 50            Last 50 trades
   ./run.sh trade yes TICKER 10      Manual paper trade: $10 on YES
   ./run.sh trade yes TICKER 10 --live  Manual real trade
   ./run.sh train                    Retrain ML model on accumulated live data
   ./run.sh config                   Show current configuration
 
-  Ctrl+C — stop the bot gracefully (cancels live resting orders on shutdown)
-
-HISTORY TABLE COLUMNS
-─────────────────────
-  ID       Last 8 chars of trade ID
-  Time     UTC timestamp (HH:MM:SS)
-  Ticker   Human-readable: e.g. MAR29 22:45
-  Side     YES / NO / YES_EXIT / YES_SETTLED etc.
-  Qty      Contracts
-  Price    Entry/exit price in cents
-  Cost     Dollar value
-  Mode     paper / live
-  Session  When the session started (e.g. 30MAR08:02)
-  Source   What triggered the trade (persona, auto, manual)
+  Ctrl+C — stop the bot gracefully (cancels all resting GTC orders on shutdown)
 
 
 ================================================================================
-  CONFIGURATION (config.yaml — key settings)
+  CONFIGURATION — KEY SETTINGS (config.yaml)
 ================================================================================
 
   models:
-    min_confidence: 0.50     # ensemble agreement required (lower = more signals)
-    min_edge: 0.03           # minimum edge over Kalshi price to signal
+    min_confidence: 0.55     # all 5 models must agree to this level
+    min_edge: 0.04           # 4% edge over Kalshi mid-price to signal
 
-  strategy:
-    auto_trade: false        # enable auto-trading (or use --trade flag)
-    paper_trade: true        # use real money (or use --live flag)
-    max_open_positions: 12   # simultaneous positions (all personas combined)
-    take_profit_pct: 0.65    # exit early when up 65%
-    stop_loss_pct: 0.35      # exit early when down 35%
-    min_entry_price_cents: 10     # skip contracts priced < 10¢
-    stop_loss_cooldown_seconds: 120  # 2-min block after a stop-loss
-    cheap_entry_threshold_cents: 25  # cap applies below this price
-    max_cost_cheap_entry_usd: 4.00   # max exposure for cheap entries
-    per_candle_max_loss_usd: 8.00    # per-ticker session loss brake
+  trader:
+    min_confidence: 0.55     # AutoTrader entry threshold
+    min_edge: 0.05           # 5% edge required to enter a trade
+    early_window_min_seconds: 480   # >8 min → GTC post_only (0% fee)
+    prime_window_min_seconds: 180   # 3–8 min → IOC directional
+    gtc_escalate_seconds: 25.0      # cancel GTC → IOC if unfilled after 25s
+    kelly_fraction_early: 0.25      # quarter-Kelly in early phase
+    kelly_fraction_prime: 0.50      # half-Kelly in prime phase
+    max_single_trade_usd: 12.00     # hard cap per trade ($100 bankroll)
+    stop_loss_pct: 0.40             # cut if down 40% AND <4 min left
+    reversal_min_edge: 0.10         # 10% edge required to flip sides
+    mm_min_spread_cents: 5          # only market-make when spread ≥ 5¢
+    mm_contracts_per_side: 2        # 2 contracts per side when market making
 
   risk:
-    max_trade_usd: 25.00     # hard cap per trade
-    min_trade_usd: 1.00      # skip if Kelly size falls below this
-    daily_loss_limit_usd: 25.00
-    kelly_fraction: 0.25     # quarter-Kelly (never exceed 0.5 in live trading)
-    win_rate_min: 0.15       # halt if win rate drops below 15% over 20 trades
-
-  personas:
-    sniper:
-      min_confidence: 0.75   # high bar — only fires on strong signals
-      min_edge: 0.05
-      kelly_fraction: 0.50   # half-Kelly
-      take_profit_pct: 0.50
-      stop_loss_pct: 0.25
-    scalper:
-      min_spread_cents: 3    # only quotes when spread is wide enough
-      contracts_per_side: 1  # 1 contract per side (low exposure)
-      cancel_before_seconds: 120
-    arb:
-      min_arb_cents: 2       # YES+NO combined must cost < 98¢
-      stat_arb_divergence: 0.15
-      stat_arb_min_price_cents: 20
-      stat_arb_stop_loss_pct: 0.65
+    max_trade_usd: 12.00            # matches trader.max_single_trade_usd
+    daily_loss_limit_usd: 15.00     # halt if down $15/day (15% of $100)
+    max_open_positions: 3           # max simultaneous positions
+    kelly_fraction: 0.25
+    win_rate_min: 0.40              # halt if win rate < 40% over 20 trades
 
 
 ================================================================================
@@ -205,25 +239,50 @@ HISTORY TABLE COLUMNS
        KALSHI_API_KEY=your-api-key-uuid
        KALSHI_RSA_KEY_PATH=path/to/private-key.pem
 
-  2. Train the ML model (one-time, ~5–15 min):
+  2. (Optional) Train the ML model — one-time, improves signals:
        ./run.sh bootstrap --months 24
+       Without training, the bot runs on orderbook + technical + BSM (90% of value).
 
-  3. Monitor signals (safe, no trading):
+  3. Monitor signals first — no risk:
        ./run.sh
-       Watch the Signals panel. Learn what STRONG YES/NO looks like.
+       Watch the Signals panel. Wait for STRONG YES / STRONG NO with
+       high confidence. Learn when the model is firing vs when it's quiet.
 
   4. Test with paper auto-trading:
        ./run.sh run --trade
-       Check logs/trades.csv and ./run.sh history for results.
-       Lower min_confidence to 0.50 in config.yaml to see more action.
+       Check logs/trades.csv and ./run.sh history after a session.
+       Paper mode simulates fills at the ask price — conservative.
 
   5. Go live (real money):
        ./run.sh run --trade --live
-       Confirm the prompt. Monitor closely first session.
+       Confirm the prompt. The bot starts in the Early phase each window,
+       posting GTC limit orders first (0% fee), escalating to IOC if needed.
 
-  6. Review and improve periodically:
-       ./run.sh history -n 100
-       ./run.sh train          # ML improves with live trade outcomes
+  6. Improve over time:
+       ./run.sh history -n 100    # review outcomes
+       ./run.sh train             # retrain ML on accumulated live data
+
+
+================================================================================
+  SIGNAL QUALITY GUIDE
+================================================================================
+
+  What makes a STRONG signal:
+    - All 5 models pointing the same direction (high confidence)
+    - Orderbook imbalance aligns with directional bet (buyers loading YES = bullish)
+    - Recent volume spike (3-bar avg > 1.5× overall avg)
+    - BTC clearly above or below strike with time to confirm
+
+  What makes a WEAK / unreliable signal:
+    - Models disagree (orderbook says YES, technical says NO)
+    - Balanced orderbook (50/50 bid/ask) — no directional information
+    - Very close to settlement with BTC near the strike — coin flip
+    - Very early in the window (>13 min) — too much can change
+
+  Why signals often show NEUTRAL:
+    - Confidence < 0.55 → models don't agree enough
+    - Edge < 4% → the market is efficiently priced
+    - Both are common — the bot is designed to be selective
 
 
 ================================================================================
@@ -236,19 +295,19 @@ HISTORY TABLE COLUMNS
 
   btc15/
     config.py          Config dataclasses (mirrors config.yaml)
-    feeds/             Price feed (Kraken WS + Coinbase REST fallback)
+    feeds/             Price feed (Binance WS + Coinbase REST fallback)
     kalshi/
-      client.py        REST API (auth, orders, amend, batch, positions)
-      ws_client.py     WebSocket (live orderbook + fill events)
+      client.py        REST API (auth, orders, positions, orderbook)
+      ws_client.py     WebSocket (live orderbook + ticker + fill events)
       models.py        Data classes (Market, Order, TimeInForce, etc.)
     models/
-      ensemble.py      Combined model (BS + technical + trend + ML)
-      technical.py     RSI, MACD, Bollinger Bands
+      ensemble.py      Combined model (orderbook + technical + trend + BSM + ML)
+      technical.py     RSI, MACD, Bollinger Bands, momentum
       ml_model.py      LightGBM wrapper
       bootstrap.py     Historical data fetcher + batch trainer
     strategy/
       engine.py        Main loop: scan → signal → execute → monitor
-      personas.py      Sniper / Scalper / Arb persona implementations
+      personas.py      AutoTrader: unified time-phase decision engine
       sizer.py         Kelly Criterion position sizing
     risk/
       manager.py       Loss limits, position limits, win-rate guard
@@ -257,43 +316,55 @@ HISTORY TABLE COLUMNS
       terminal.py      Rich live dashboard
 
   data/
-    ml_model.pkl       Trained LightGBM model
-    btc15.db           SQLite database
+    ml_model.pkl       Trained LightGBM model (optional)
+    btc15.db           SQLite database (trade history, features)
   logs/
     bot.log            Full application log
-    trades.csv         Trade history (10 columns including session)
+    trades.csv         Trade history
 
 
 ================================================================================
   TROUBLESHOOTING
 ================================================================================
 
-  "Signals fire but no trades"
-    → Kelly size falling below min_trade_usd (lower it or add balance),
-      or daily loss limit / win-rate guard has paused trading.
+  "Signals fire but no trades placed"
+    → Kelly size below min_trade_usd ($1). Lower it or check balance.
+    → Daily loss limit or win-rate guard paused trading.
+    → Check logs/bot.log for [RISK] or [HALT] lines.
 
-  "Feed showing red"
-    → Kraken WS dropped; falls back to Coinbase REST automatically.
-      Self-heals within ~30 seconds.
+  "NEUTRAL on every market"
+    → Normal when markets are efficiently priced (edge < 4–5%).
+    → Try lowering models.min_confidence to 0.50 for more signals (more noise too).
+    → Most active signal period: 3–10 min before settlement.
+
+  "Feed showing stale / red"
+    → Binance WS dropped. Falls back to Coinbase REST automatically.
+    → Self-heals within ~30 seconds.
+
+  "Cannot connect to api.elections.kalshi.com"
+    → Check internet connection. The correct URL is api.elections.kalshi.com
+      (not api.kalshi.com — that hostname does not exist).
 
   "INCORRECT_API_KEY_SIGNATURE"
-    → Wrong RSA key path in .env, or key file corrupted.
+    → Wrong RSA key path in .env, or key file corrupted / wrong format.
+    → Key must be RSA private key in PEM format (PKCS#8 or PKCS#1).
+
+  "WebSocket rejected (HTTP 401)"
+    → RSA authentication failed. Verify KALSHI_API_KEY matches the key UUID
+      in your Kalshi account settings, and RSA_KEY_PATH points to the matching
+      private key file.
 
   "No open KXBTC markets"
     → Markets are time-limited. Run ./run.sh markets to check.
-      Kalshi may not have opened the next series yet.
+    → Kalshi opens new 15-min windows continuously — try again in a minute.
 
   "Bot halted — daily loss limit"
-    → Restart tomorrow or raise risk.daily_loss_limit_usd in config.yaml.
+    → Down $15 today. Restart tomorrow, or raise risk.daily_loss_limit_usd
+      in config.yaml. Do not raise it impulsively after a bad session.
 
-  "Scalper posting too many orders"
-    → Scalper amends existing resting orders rather than stacking new ones.
-      If you see accumulation, verify paper mode is calling record_order()
-      (prevents the amend-skip → stack-new bug).
-
-  "History table columns misaligned"
-    → Old trades.csv has 7-column headers; new rows have 10. The history
-      command auto-detects both formats. To get clean headers, delete
-      logs/trades.csv and restart (history from old runs is lost).
+  "GTC orders placed but never filled"
+    → Normal in prime phase — escalation kicks in after 25 seconds.
+    → In early phase, market may have moved away from your limit price.
+    → Orders are cancelled at Ctrl+C and at settlement (<2 min).
 
 ================================================================================

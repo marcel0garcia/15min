@@ -170,8 +170,8 @@ def build_markets_panel(state: dict) -> Panel:
 
     table = Table(box=box.SIMPLE, show_header=True, header_style="bold dim")
     table.add_column("Strike", justify="right")
-    table.add_column("UP (YES ask)", justify="right")   # cost to bet price goes up
-    table.add_column("DN (NO ask)",  justify="right")   # cost to bet price goes down
+    table.add_column("YES ask", justify="right")   # cost to buy YES
+    table.add_column("NO ask",  justify="right")   # cost to buy NO = 100 − YES bid
     table.add_column("Vol", justify="right")
     table.add_column("T-Left", justify="right")
 
@@ -179,13 +179,14 @@ def build_markets_panel(state: dict) -> Panel:
         secs = m.get("seconds_left", 0)
         mins = secs // 60
         sec_r = secs % 60
-        yes_ask = m.get("yes_ask", 0) or 0
-        yes_bid = m.get("yes_bid", 0) or 0
-        no_ask = round(100 - yes_bid)   # cost to buy NO = 100 − YES bid
+        yes_ask = m.get("yes_ask")   # None = no data; 0 is not a valid Kalshi price
+        yes_bid = m.get("yes_bid")
+        # NO ask = 100 − YES bid (what you pay to enter a NO position)
+        no_ask = round(100 - yes_bid) if yes_bid is not None else None
         table.add_row(
             f"${m.get('strike', 0):,.0f}",
-            f"[bright_green]{yes_ask:.0f}¢[/bright_green]",
-            f"[bright_red]{no_ask:.0f}¢[/bright_red]",
+            f"[bright_green]{yes_ask:.0f}¢[/bright_green]" if yes_ask is not None else "[dim]--[/dim]",
+            f"[bright_red]{no_ask:.0f}¢[/bright_red]" if no_ask is not None else "[dim]--[/dim]",
             f"{m.get('volume', 0):,}",
             f"{mins}m{sec_r:02d}s",
         )
@@ -196,14 +197,17 @@ def build_risk_panel(state: dict) -> Panel:
     risk = state.get("risk", {})
     balance = state.get("balance", {})
 
+    # Single source of truth: account-level PnL from Kalshi (includes fees + unrealized).
+    # Falls back to internal realized sum while the first 30s balance refresh is pending.
+    true_pnl = balance.get("true_pnl") if balance else None
+    pnl = true_pnl if true_pnl is not None else risk.get("daily_pnl", 0.0)
+    pnl_color = _pnl_color(pnl)
+
     lines = []
     if balance:
         lines.append(f"[bold]Available:[/bold] [bright_cyan]${balance.get('available', 0):,.2f}[/bright_cyan]")
         lines.append(f"[bold]Portfolio:[/bold] ${balance.get('portfolio', 0):,.2f}")
-
-    daily_pnl = risk.get("daily_pnl", 0)
-    pnl_color = _pnl_color(daily_pnl)
-    lines.append(f"[bold]Day P&L:[/bold] [{pnl_color}]${daily_pnl:+.2f}[/{pnl_color}]")
+    lines.append(f"[bold]PnL:[/bold] [{pnl_color}][bold]${pnl:+.2f}[/bold][/{pnl_color}]")
     lines.append(f"[bold]Trades:[/bold] {risk.get('daily_trades', 0)}")
     lines.append(f"[bold]Open:[/bold] {risk.get('open_positions', 0)}")
 
@@ -404,8 +408,13 @@ def _bar_chart(values: list[float], width: int, height: int) -> list[str]:
 def build_pnl_chart(state: dict) -> Panel:
     """P&L bar chart: one bar per closed trade, cumulative P&L curve."""
     risk = state.get("risk", {})
-    daily_pnl = risk.get("daily_pnl", 0.0)
-    pnl_c = "bright_green" if daily_pnl >= 0 else "bright_red"
+    balance = state.get("balance", {})
+
+    # Same single source of truth as build_risk_panel:
+    # account-level PnL when available, internal realized sum as fallback.
+    true_pnl = balance.get("true_pnl") if balance else None
+    pnl_ref = true_pnl if true_pnl is not None else risk.get("daily_pnl", 0.0)
+    pnl_c = "bright_green" if pnl_ref >= 0 else "bright_red"
 
     # Build cumulative P&L series from closed trades in the log
     trades = state.get("recent_trades", [])
@@ -417,18 +426,21 @@ def build_pnl_chart(state: dict) -> Panel:
 
     if len(closed) < 1:
         content = (
-            f"Session P&L: [{pnl_c}][bold]${daily_pnl:+.2f}[/bold][/{pnl_c}]\n\n"
+            f"PnL: [{pnl_c}][bold]${pnl_ref:+.2f}[/bold][/{pnl_c}]\n\n"
             f"[dim]Waiting for first closed trade...[/dim]"
         )
         return Panel(
             Align(Text.from_markup(content), align="center", vertical="middle"),
-            title="[bold]P&L Chart[/bold]",
+            title="[bold]PnL[/bold]",
             border_style="dim",
         )
 
-    # Build cumulative series starting at 0
+    # Anchor cumulative series so the final bar equals pnl_ref.
+    # recent_trades is capped at 50 entries so early trades may have rolled off;
+    # the offset absorbs any gap so the chart endpoint always matches the panel value.
+    visible_sum = sum(t["pnl"] for t in closed)
+    running = pnl_ref - visible_sum
     cumulative = []
-    running = 0.0
     for t in closed:
         running += t["pnl"]
         cumulative.append(running)
@@ -470,12 +482,12 @@ def build_pnl_chart(state: dict) -> Panel:
         f" {hi_lbl}\n"
         + "\n".join(chart_lines)
         + f"\n {lo_lbl}\n"
-        + f"  {wr_str}   [{pnl_c}][bold]${daily_pnl:+.2f}[/bold][/{pnl_c}] session"
+        + f"  {wr_str}   [{pnl_c}][bold]${pnl_ref:+.2f}[/bold][/{pnl_c}] session"
     )
-    trend_color = "bright_green" if daily_pnl >= 0 else "bright_red"
+    trend_color = "bright_green" if pnl_ref >= 0 else "bright_red"
     return Panel(
         Align(Text.from_markup(content), align="center", vertical="middle"),
-        title="[bold]P&L Chart[/bold]",
+        title="[bold]PnL[/bold]",
         border_style=trend_color,
     )
 
@@ -544,7 +556,6 @@ def build_layout(state: dict) -> Layout:
     )
     layout["right_col"].split_column(
         Layout(name="risk"),
-        Layout(name="personas", size=6),
     )
     # Bottom row: positions+trades stacked on left | chart+event_log stacked on right
     layout["bottom"].split_row(
@@ -563,7 +574,6 @@ def build_layout(state: dict) -> Layout:
     layout["signals"].update(build_signals_panel(state))
     layout["markets"].update(build_markets_panel(state))
     layout["risk"].update(build_risk_panel(state))
-    layout["personas"].update(build_personas_panel(state))
     layout["positions"].update(build_positions_panel(state))
     layout["trades"].update(build_trades_panel(state))
     layout["chart"].update(build_pnl_chart(state))

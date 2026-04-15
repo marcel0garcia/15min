@@ -1,605 +1,532 @@
 """
-Multi-persona trading strategy framework.
+Unified AutoTrader — replaces Sniper / Scalper / Arb persona trio.
 
-Three concurrent personas share the same engine but apply different logic:
+Three time phases drive all decisions based on seconds remaining in the
+15-minute KXBTC window:
 
-  Sniper  — High-conviction directional bets (half-Kelly, aggressive fills)
-  Scalper — Market maker posting both sides with post_only (zero fees)
-  Arb     — Arbitrage: buy YES+NO when combined cost < $1, stat-arb divergences
+  Early  (>8 min left)  — GTC post_only at mid-1¢ (0% maker fee)
+                           Market-make both sides if spread ≥ 5¢
+  Prime  (3–8 min left) — IOC directional entry; escalates unfilled GTC orders
+  Late   (<3 min left)  — No new entries; position management only
+
+Exit policy (3 rules — no trailing stop, no profit decay):
+  Rule 1: Pure arb pairs always hold to settlement ($1.00 guaranteed)
+  Rule 2: Flip sides if model reversal edge > reversal_min_edge AND >5 min left
+  Rule 3: Cut losses if pnl < -stop_loss_pct AND <4 min left
+  Rule 4: Everything else → hold to settlement
+
+Market making:
+  When spread ≥ mm_min_spread_cents, post both YES and NO inside the spread
+  with GTC post_only (0% maker fee). Cancel at <mm_cancel_before_seconds left.
+  Inventory tracking prevents over-exposure on one side.
+
+Arb:
+  Always check YES_ask + NO_ask < 98¢ first. When found, IOC both sides
+  immediately — guaranteed profit regardless of direction.
 """
 from __future__ import annotations
 
 import logging
 import time
-import uuid
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional
 
-from btc15.config import SniperConfig, ScalperConfig, ArbConfig
-from btc15.kalshi.models import Side, TimeInForce, SelfTradePrevention
+from btc15.config import TraderConfig
 from btc15.models.ensemble import ModelOutput
 from btc15.strategy.sizer import kelly_fraction_binary
 
 log = logging.getLogger(__name__)
 
 
-# ── Action: what a persona wants the engine to do ────────────────────────────
+# ── Action: what the AutoTrader wants the engine to execute ──────────────────
 
 @dataclass
 class Action:
-    """A trade action requested by a persona."""
-    persona: str               # "sniper" | "scalper" | "arb"
-    action_type: str           # "buy" | "sell" | "amend" | "cancel" | "batch_buy"
+    """A trade action returned by AutoTrader for the engine to execute."""
+    action_type: str            # "buy" | "sell" | "amend" | "cancel" | "batch_buy"
     ticker: str
-    side: Optional[str] = None          # "yes" | "no"
+    side: Optional[str] = None           # "yes" | "no"
     contracts: int = 0
     price_cents: int = 0
     post_only: bool = False
-    time_in_force: Optional[str] = None
+    time_in_force: Optional[str] = None  # "ioc" | "gtc" | None (defaults to ioc)
     self_trade_prevention: Optional[str] = None
-    order_id: Optional[str] = None      # for amend/cancel
+    order_id: Optional[str] = None       # for amend / cancel
     reason: str = ""
-    # For batch_buy (arb): buy both sides
+    # For batch_buy (pure arb): buy both sides atomically
     batch_orders: list = field(default_factory=list)
+    # Kept for engine compatibility
+    persona: str = "auto"
+    # Original GTC price when this action was escalated from a resting order.
+    # Used by the engine to measure price drift at IOC failure time.
+    original_price_cents: Optional[int] = None
+    # Mid price at the moment the signal fired, attached to GTC entries so
+    # the escalation path can measure how far the market drifted while we
+    # rested. Adverse drift → informed flow moved us → halve or skip.
+    signal_mid_cents: Optional[float] = None
 
 
-# ── Base Persona ─────────────────────────────────────────────────────────────
+# ── AutoTrader ───────────────────────────────────────────────────────────────
 
-class BasePersona(ABC):
-    name: str = "base"
-    tag: str = "[BASE]"
+class AutoTrader:
+    """
+    Single unified trading logic class. Replaces Sniper, Scalper, and Arb.
 
-    def __init__(self):
-        self.positions: dict[str, list[dict]] = {}  # ticker → [{side, entry_cents, contracts}, ...]
-        self.resting_orders: dict[str, dict] = {}  # order_id → {ticker, side, price, contracts}
+    State:
+      positions      — ticker → [{side, entry_cents, contracts, mode, trade_id, ...}]
+      resting_orders — order_id → {ticker, side, price, contracts, placed_at, purpose}
+    """
+
+    name = "auto"
+    tag = "[AUTO]"
+
+    def __init__(self, cfg: TraderConfig):
+        self.cfg = cfg
+        # ticker → list of open position dicts
+        self.positions: dict[str, list[dict]] = {}
+        # order_id → {ticker, side, price, contracts, placed_at, purpose, mode}
+        self.resting_orders: dict[str, dict] = {}
         self.daily_pnl: float = 0.0
         self.daily_trades: int = 0
+        # cooldown after stop-loss on a ticker
+        self._stop_cooldown: dict[str, float] = {}
+        # cooldown after a reversal exit — prevents flipping back and forth on
+        # a chop market. The atomic reversal itself (sell + buy in one evaluate
+        # cycle) bypasses this; only SUBSEQUENT new entries are blocked.
+        self._reversal_cooldown: dict[str, float] = {}
+        # cooldown after a failed IOC escalation — prevents price-chase retry loops.
+        # When GTC→IOC escalation fires and the IOC can't fill, it means the market
+        # has moved significantly. Without this cooldown, the next scan posts a fresh
+        # GTC which escalates again at an even higher price (TB76A0271 pattern).
+        self._entry_retry_cooldown: dict[str, float] = {}
+        # cumulative realized P&L per ticker this session
+        self._ticker_session_pnl: dict[str, float] = {}
 
-    @abstractmethod
-    def evaluate(
-        self,
-        ticker: str,
-        market: dict,
-        orderbook: dict,
-        output: ModelOutput,
-        bankroll_usd: float,
-        engine_state: dict,
-    ) -> list[Action]:
-        """Return a list of actions to execute for this market."""
-        ...
-
-    def record_fill(self, ticker: str, side: str, contracts: int, price_cents: int, trade_id: str = ""):
-        """Record that an order was filled (entry)."""
-        entry = {"side": side, "entry_cents": price_cents, "contracts": contracts, "trade_id": trade_id}
-        if ticker not in self.positions:
-            self.positions[ticker] = []
-        # Merge with existing entry on same side (add contracts, avg price)
-        for pos in self.positions[ticker]:
-            if pos["side"] == side:
-                total = pos["contracts"] + contracts
-                pos["entry_cents"] = round(
-                    (pos["entry_cents"] * pos["contracts"] + price_cents * contracts) / total
-                )
-                pos["contracts"] = total
-                self.daily_trades += 1
-                return
-        self.positions[ticker].append(entry)
-        self.daily_trades += 1
-
-    def record_exit(self, ticker: str, pnl: float, side: str | None = None):
-        """Record that a position was closed."""
-        if side and ticker in self.positions:
-            self.positions[ticker] = [p for p in self.positions[ticker] if p["side"] != side]
-            if not self.positions[ticker]:
-                del self.positions[ticker]
-        else:
-            self.positions.pop(ticker, None)
-        self.daily_pnl += pnl
-
-    def record_order(self, order_id: str, ticker: str, side: str, price: int, contracts: int):
-        self.resting_orders[order_id] = {
-            "ticker": ticker, "side": side, "price": price, "contracts": contracts,
-        }
-
-    def remove_order(self, order_id: str):
-        self.resting_orders.pop(order_id, None)
-
-    def summary(self) -> dict:
-        total_pos = sum(len(entries) for entries in self.positions.values())
-        return {
-            "name": self.name,
-            "positions": total_pos,
-            "resting_orders": len(self.resting_orders),
-            "daily_pnl": round(self.daily_pnl, 2),
-            "daily_trades": self.daily_trades,
-        }
-
-
-# ── Sniper: Aggressive Directional ──────────────────────────────────────────
-
-class SniperPersona(BasePersona):
-    name = "sniper"
-    tag = "[SNP]"
-
-    def __init__(self, cfg: SniperConfig):
-        super().__init__()
-        self.cfg = cfg
-        self._stop_cooldown: dict[str, float] = {}  # ticker → timestamp of last stop-loss
+    # ── Main evaluation entry point ──────────────────────────────────────────
 
     def evaluate(
         self,
         ticker: str,
-        market: dict,
-        orderbook: dict,
+        market_info: dict,      # {seconds_left, volume, ticker, annual_vol}
+        orderbook: dict,        # {yes_bid, yes_ask}
         output: ModelOutput,
         bankroll_usd: float,
-        engine_state: dict,
     ) -> list[Action]:
         if not self.cfg.enabled:
             return []
 
-        secs = market.get("seconds_left", 0)
-        if not (self.cfg.min_seconds <= secs <= self.cfg.max_seconds):
-            return []
+        secs = float(market_info.get("seconds_left", 0))
+        annual_vol = float(market_info.get("annual_vol") or 0.80)
+        actions: list[Action] = []
 
-        # Already have a position in this market — check exits
+        # ── Step 1: Manage existing positions ────────────────────────────────
+        reversal_exit = False
+        pyramid_ok = False
         if ticker in self.positions:
-            return self._check_exits(ticker, market, orderbook, output)
-
-        # Block re-entry after a stop-loss on this ticker
-        cooldown = getattr(self.cfg, "stop_loss_cooldown_seconds", 180)
-        last_stop = self._stop_cooldown.get(ticker, 0)
-        if time.time() - last_stop < cooldown:
-            return []
-
-        # Need strong confidence AND edge
-        if output.confidence < self.cfg.min_confidence:
-            return []
-        if not output.recommended_side:
-            return []
-
-        side = output.recommended_side
-        edge = output.edge_yes if side == "yes" else output.edge_no
-        if edge is None or edge < self.cfg.min_edge:
-            return []
-
-        # Kelly sizing at half-Kelly
-        yes_bid = orderbook.get("yes_bid")
-        yes_ask = orderbook.get("yes_ask")
-        if side == "yes":
-            if yes_ask is None:
-                return []
-            raw_price = int(yes_ask)
-            prob_win = output.prob_yes
-        else:
-            if yes_bid is None:
-                return []
-            raw_price = int(100 - yes_bid)
-            prob_win = output.prob_no
-
-        raw_price = max(1, min(99, raw_price))
-        order_price = max(1, min(99, raw_price + self.cfg.slippage_cents))
-
-        frac = kelly_fraction_binary(prob_win, raw_price, self.cfg.kelly_fraction)
-        if frac <= 0:
-            return []
-
-        budget = bankroll_usd * self.cfg.budget_pct
-        dollar_amount = min(frac * bankroll_usd, budget)
-        if dollar_amount < 1.0:
-            return []
-
-        contracts = int(dollar_amount / (raw_price / 100))
-        if contracts <= 0:
-            return []
-
-        log.info(
-            f"{self.tag} SIGNAL: {ticker} {side.upper()} | "
-            f"conf={output.confidence:.0%} edge={edge:+.1%} "
-            f"contracts={contracts} @ {order_price}¢"
-        )
-
-        return [Action(
-            persona=self.name,
-            action_type="buy",
-            ticker=ticker,
-            side=side,
-            contracts=contracts,
-            price_cents=order_price,
-            post_only=False,
-            reason=f"sniper conf={output.confidence:.0%} edge={edge:+.1%}",
-        )]
-
-    def _check_exits(self, ticker: str, market: dict, orderbook: dict, output: ModelOutput) -> list[Action]:
-        actions = []
-        for pos in self.positions[ticker]:
-            side = pos["side"]
-            entry = pos["entry_cents"]
-
-            yes_bid = orderbook.get("yes_bid", 0)
-            yes_ask = orderbook.get("yes_ask", 100)
-            if side == "yes":
-                current_bid = float(yes_bid or 0)
-            else:
-                current_bid = max(0.0, 100.0 - float(yes_ask or 100))
-
-            if entry <= 0 or current_bid <= 0:
-                continue
-
-            pnl_pct = (current_bid - entry) / entry
-
-            # Update trailing peak
-            peak = max(pnl_pct, pos.get("peak_pnl_pct", 0.0))
-            pos["peak_pnl_pct"] = peak
-
-            exit_reason = None
-            if pnl_pct >= self.cfg.take_profit_pct:
-                exit_reason = f"sniper_tp ({pnl_pct:+.1%})"
-            elif pnl_pct <= -self.cfg.stop_loss_pct:
-                self._stop_cooldown[ticker] = time.time()
-                exit_reason = f"sniper_sl ({pnl_pct:+.1%})"
-            else:
-                trail_activate = getattr(self.cfg, "trail_activate_pct", 0.20)
-                trail_retrace = getattr(self.cfg, "trail_retracement_pct", 0.50)
-                if peak >= trail_activate:
-                    trail_floor = peak * (1.0 - trail_retrace)
-                    if pnl_pct < trail_floor:
-                        exit_reason = f"sniper_trail (peak={peak:+.1%} → floor={trail_floor:+.1%} now={pnl_pct:+.1%})"
-
-            if exit_reason:
-                actions.append(Action(
-                    persona=self.name, action_type="sell", ticker=ticker,
-                    side=side, contracts=pos["contracts"], price_cents=int(current_bid),
-                    reason=exit_reason,
-                ))
-        return actions
-
-
-# ── Scalper: Market Maker / Spread Capture ───────────────────────────────────
-
-class ScalperPersona(BasePersona):
-    name = "scalper"
-    tag = "[SCA]"
-
-    def __init__(self, cfg: ScalperConfig):
-        super().__init__()
-        self.cfg = cfg
-        # Track inventory per market: {ticker: {"yes": N, "no": N}}
-        self.inventory: dict[str, dict[str, int]] = {}
-
-    def evaluate(
-        self,
-        ticker: str,
-        market: dict,
-        orderbook: dict,
-        output: ModelOutput,
-        bankroll_usd: float,
-        engine_state: dict,
-    ) -> list[Action]:
-        if not self.cfg.enabled:
-            return []
-
-        secs = market.get("seconds_left", 0)
-
-        # Approaching settlement: cancel resting orders AND exit any held positions
-        if secs < self.cfg.cancel_before_seconds:
-            actions = self._cancel_all_for_ticker(ticker)
-            exit_actions = self._exit_positions_for_ticker(ticker, orderbook)
+            exit_actions = self._evaluate_exits(ticker, secs, orderbook, output)
             actions.extend(exit_actions)
+            reversal_exit = any("reversal" in (a.reason or "") for a in exit_actions)
+            # Reversal: fall through to entry logic so the flip is atomic
+            # (sell + buy in the same action list). Engine processes them
+            # sequentially; if the sell fails, the buy is blocked by the
+            # position guard in _execute_action.
+            #
+            # Pyramid: if position is profitable and model still agrees,
+            # fall through to entry logic to add contracts.
+            if (not reversal_exit
+                    and not exit_actions
+                    and getattr(self.cfg, "pyramid_enabled", False)):
+                pyramid_ok = self._check_pyramid_eligible(
+                    ticker, secs, orderbook, output
+                )
+            if ticker in self.positions and not reversal_exit and not pyramid_ok:
+                return actions  # still holding, no flip/pyramid — no new entry
+
+        # ── Step 2: Cancel MM orders approaching settlement ───────────────────
+        if secs < self.cfg.mm_cancel_before_seconds:
+            actions.extend(self._cancel_mm_orders(ticker))
+
+        # ── Step 3: Escalate stale GTC entry orders → IOC ────────────────────
+        escalate = self._check_gtc_escalation(ticker, orderbook, secs, annual_vol)
+        if escalate:
+            actions.extend(escalate)
+            return actions  # wait for escalation result
+
+        # ── Step 4: No new entries in late window ────────────────────────────
+        # Exception: settlement lock entries when outcome is near-certain.
+        # The BRTI settles on a 60s trailing average — with 30s left, half
+        # is locked in. When BSM says ≥88%, BTC is well clear of the strike.
+        if secs < self.cfg.late_window_min_seconds:
+            lock_cfg_enabled = getattr(self.cfg, "settlement_lock_enabled", True)
+            lock_min_secs = getattr(self.cfg, "settlement_lock_min_seconds", 20)
+            lock_max_secs = getattr(self.cfg, "settlement_lock_max_seconds", 60)
+            lock_min_prob = getattr(self.cfg, "settlement_lock_min_prob", 0.88)
+            lock_min_conf = getattr(self.cfg, "settlement_lock_min_confidence", 0.50)
+
+            if (lock_cfg_enabled
+                    and lock_min_secs <= secs <= lock_max_secs
+                    and ticker not in self.positions
+                    and output.recommended_side
+                    and output.confidence >= lock_min_conf):
+                # Check BSM probability (the most informative model near settlement)
+                bsm_prob = output.prob_binary_options
+                if bsm_prob is not None:
+                    bsm_extreme = bsm_prob >= lock_min_prob or bsm_prob <= (1 - lock_min_prob)
+                    if bsm_extreme:
+                        lock_entry = self._check_settlement_lock_entry(
+                            ticker, orderbook, output, bankroll_usd, secs,
+                        )
+                        if lock_entry:
+                            actions.append(lock_entry)
+                            return actions
             return actions
 
-        if not (self.cfg.min_seconds <= secs <= self.cfg.max_seconds):
-            return []
+        if ticker in self.positions and not reversal_exit and not pyramid_ok:
+            return actions
 
-        yes_bid = orderbook.get("yes_bid")
-        yes_ask = orderbook.get("yes_ask")
-        if yes_bid is None or yes_ask is None:
-            return []
+        # ── Step 5: Stop-loss & whipsaw cooldowns ────────────────────────────
+        # Stop cooldown blocks *any* new entry for N seconds after a loss cut;
+        # reversal cooldown blocks re-entries on a ticker that just flipped.
+        # The atomic reversal itself runs in the same evaluate cycle and
+        # therefore bypasses — only the NEXT scan sees the cooldown.
+        now = time.time()
+        stop_ts = self._stop_cooldown.get(ticker, 0)
+        stop_cd = getattr(self.cfg, "stop_cooldown_seconds", 90)
+        if now - stop_ts < stop_cd:
+            return actions
 
-        spread = yes_ask - yes_bid
-        if spread < self.cfg.min_spread_cents:
-            return []
+        if not reversal_exit:
+            rev_ts = self._reversal_cooldown.get(ticker, 0)
+            rev_cd = getattr(self.cfg, "reversal_cooldown_seconds", 60)
+            if now - rev_ts < rev_cd:
+                return actions
 
-        # Use model's fair value as anchor (even at low confidence)
-        fair_yes = output.prob_yes * 100  # convert to cents
-        fair_yes = max(2, min(98, fair_yes))
+        # ── Step 6: Pure arb (guaranteed profit — always highest priority) ────
+        # Guard: skip if arb legs already resting (same stacking problem as entries)
+        has_resting_arb = any(
+            v.get("ticker") == ticker and v.get("purpose") == "arb"
+            for v in self.resting_orders.values()
+        )
+        if not has_resting_arb:
+            arb = self._check_pure_arb(ticker, orderbook, bankroll_usd)
+            if arb:
+                actions.append(arb)
+                return actions
 
-        # Quote inside the spread, biased by model
-        # YES buy: slightly below fair value
-        yes_buy_price = int(max(1, min(fair_yes - 1, yes_ask - 2)))
-        # NO buy: slightly below inverse fair value
-        no_fair = 100 - fair_yes
-        no_buy_price = int(max(1, min(no_fair - 1, (100 - yes_bid) - 2)))
+        # ── Step 7: Market making in early window ─────────────────────────────
+        if secs > self.cfg.early_window_min_seconds:
+            mm = self._check_market_making(ticker, orderbook)
+            if mm:
+                actions.extend(mm)
+                return actions
 
-        # Ensure we don't cross ourselves (YES buy + NO buy must be < 100)
-        if yes_buy_price + no_buy_price >= 99:
-            # Widen quotes
-            yes_buy_price = int(fair_yes - 2)
-            no_buy_price = int(no_fair - 2)
-            if yes_buy_price + no_buy_price >= 99:
-                return []
+        # ── Step 7b: Block directional entry if one is already resting ───────
+        # GTC fills arrive via WS *after* the order is placed, so positions is
+        # empty while the order rests. Without this guard every 3-second scan
+        # cycle places a new entry, stacking up N orders before the first fill
+        # arrives — producing the rapid-fire / phantom-order pattern.
+        has_resting_entry = any(
+            v.get("ticker") == ticker and v.get("purpose") == "entry"
+            for v in self.resting_orders.values()
+        )
+        if has_resting_entry:
+            return actions
 
-        yes_buy_price = max(1, min(98, yes_buy_price))
-        no_buy_price = max(1, min(98, no_buy_price))
+        # ── Step 8: Directional entry ─────────────────────────────────────────
+        if secs <= self.cfg.max_entry_seconds:
+            entry = self._check_directional_entry(
+                ticker, orderbook, output, bankroll_usd, secs, annual_vol,
+                is_reversal=reversal_exit,
+            )
+            if entry:
+                actions.append(entry)
 
-        # Check inventory imbalance
-        inv = self.inventory.get(ticker, {"yes": 0, "no": 0})
-        net_imbalance = abs(inv["yes"] - inv["no"])
+        # Arm the reversal cooldown AFTER the atomic flip completes so that
+        # subsequent cycles are locked, but the current cycle's re-entry
+        # (handled above) has already passed the cooldown gate.
+        if reversal_exit:
+            self._reversal_cooldown[ticker] = time.time()
 
-        contracts = self.cfg.contracts_per_side
+        return actions
+
+    # ── Exit logic ────────────────────────────────────────────────────────────
+
+    def _evaluate_exits(
+        self,
+        ticker: str,
+        secs: float,
+        orderbook: dict,
+        output: ModelOutput,
+    ) -> list[Action]:
+        """
+        Three exit rules — everything else holds to settlement:
+
+        Rule 1: Pure arb positions — never exit early (guaranteed $1.00).
+        Rule 2: Signal reversal — flip when model flips strongly AND time permits.
+        Rule 3: Loss cut — only near settlement to preserve capital.
+        """
         actions = []
+        yes_bid = float(orderbook.get("yes_bid") or 0)
+        # Do NOT default yes_ask to 100 — that makes NO bid appear as 0¢ when data is missing.
+        # Use 0 (unknown) and let the current_bid <= 0 guard skip the position safely.
+        yes_ask = float(orderbook.get("yes_ask") or 0)
 
-        # Check if we already have resting orders for this ticker
-        existing_tickers = {v["ticker"] for v in self.resting_orders.values()}
-        if ticker in existing_tickers:
-            # Amend existing orders instead of posting new ones
-            return self._amend_existing(ticker, yes_buy_price, no_buy_price)
+        for pos in list(self.positions.get(ticker, [])):
+            side = pos["side"]
+            entry = pos["entry_cents"]
+            mode = pos.get("mode", "directional")
 
-        # Post YES side if not too imbalanced toward YES
-        if inv["yes"] - inv["no"] < self.cfg.max_inventory_imbalance:
-            actions.append(Action(
-                persona=self.name,
-                action_type="buy",
-                ticker=ticker,
-                side="yes",
-                contracts=contracts,
-                price_cents=yes_buy_price,
-                post_only=True,
-                self_trade_prevention="taker_at_cross",
-                reason=f"scalper_quote spread={spread:.0f}¢",
-            ))
+            if pos.get("settling"):
+                continue
+            if mode == "arb":
+                # Guaranteed profit — let it settle
+                continue
 
-        # Post NO side if not too imbalanced toward NO
-        if inv["no"] - inv["yes"] < self.cfg.max_inventory_imbalance:
-            actions.append(Action(
-                persona=self.name,
-                action_type="buy",
-                ticker=ticker,
-                side="no",
-                contracts=contracts,
-                price_cents=no_buy_price,
-                post_only=True,
-                self_trade_prevention="taker_at_cross",
-                reason=f"scalper_quote spread={spread:.0f}¢",
-            ))
+            if entry <= 0:
+                continue  # corrupt position record — skip
 
-        if actions:
-            log.info(
-                f"{self.tag} QUOTING: {ticker} | spread={spread:.0f}¢ | "
-                f"YES@{yes_buy_price}¢ NO@{no_buy_price}¢ x{contracts} | "
-                f"inv=Y{inv['yes']}/N{inv['no']}"
+            if side == "yes":
+                current_bid = yes_bid
+            else:
+                # NO bid = 100 - YES ask (what a NO seller receives).
+                # When yes_ask is 0 (empty book), use YES bid as conservative lower bound.
+                if yes_ask > 0:
+                    current_bid = max(0.0, 100.0 - yes_ask)
+                elif yes_bid > 0:
+                    current_bid = max(0.0, 100.0 - yes_bid)
+                else:
+                    current_bid = 0.0
+
+            # IMPORTANT: do NOT skip when current_bid = 0.
+            # A 0¢ bid means the market has moved fully against us — pnl = -100%.
+            # Skipping here is what caused T13873491 and T0ACDC05C to never stop-loss:
+            # YES buyers vanished, bid → 0, old guard triggered, position sat unmanaged
+            # until settlement. Instead, compute pnl at 0¢ and let stop rules fire.
+            # The engine's sell handler now performs a REST refresh on any 0¢ sell
+            # action and retries next cycle if the book is still thin, rather than
+            # latching `settling=True` — so spurious 0¢ reads no longer retire a
+            # healthy position permanently.
+            pnl_pct = (current_bid - entry) / entry  # -1.0 when bid=0 (full loss)
+
+            # Emergency stop: fire immediately at any time if loss exceeds threshold.
+            # Bypasses the time gate — a 65%+ loss is unrecoverable regardless of
+            # how much time remains.
+            if pnl_pct <= -self.cfg.emergency_stop_pct:
+                self._stop_cooldown[ticker] = time.time()
+                log.warning(
+                    f"{self.tag} EMERGENCY STOP: {ticker} {side.upper()} | "
+                    f"pnl={pnl_pct:+.1%} (threshold={-self.cfg.emergency_stop_pct:.0%}) | "
+                    f"{secs:.0f}s left"
+                )
+                actions.append(Action(
+                    action_type="sell", ticker=ticker, side=side,
+                    contracts=pos["contracts"], price_cents=int(current_bid),
+                    reason=f"emergency_stop pnl={pnl_pct:+.1%}",
+                ))
+                continue
+
+            # Rule 2: Signal reversal with strong edge and time to recover
+            if (output.recommended_side
+                    and output.recommended_side != side
+                    and secs > self.cfg.reversal_min_seconds):
+                opp_edge = float(
+                    (output.edge_no if side == "yes" else output.edge_yes) or 0
+                )
+                if opp_edge >= self.cfg.reversal_min_edge:
+                    log.info(
+                        f"{self.tag} REVERSAL EXIT: {ticker} {side.upper()} | "
+                        f"pnl={pnl_pct:+.1%} → flip to {output.recommended_side.upper()} "
+                        f"(edge={opp_edge:+.1%})"
+                    )
+                    actions.append(Action(
+                        action_type="sell", ticker=ticker, side=side,
+                        contracts=pos["contracts"], price_cents=int(current_bid),
+                        reason=f"reversal→{output.recommended_side} edge={opp_edge:+.1%}",
+                    ))
+                    continue
+
+            # Rule 2.5: Time-adaptive profit-take.
+            # Near settlement, the risk/reward of holding flips: upside shrinks
+            # but gamma risk from thin-book BTC ticks grows. Take profits more
+            # aggressively as time runs down.
+            if secs > 300:
+                pt_bid_thresh, pt_pnl_thresh = 90, 0.30   # >5 min: original rule
+            elif secs > 180:
+                pt_bid_thresh, pt_pnl_thresh = 85, 0.25   # 3-5 min: slightly tighter
+            else:
+                pt_bid_thresh, pt_pnl_thresh = 80, 0.20   # <3 min: bank it
+
+            if current_bid >= pt_bid_thresh and secs > 20 and pnl_pct >= pt_pnl_thresh:
+                log.info(
+                    f"{self.tag} PROFIT TAKE: {ticker} {side.upper()} | "
+                    f"bid={current_bid:.0f}¢ pnl={pnl_pct:+.1%} | {secs:.0f}s left "
+                    f"(thresh={pt_bid_thresh}¢/{pt_pnl_thresh:.0%})"
+                )
+                actions.append(Action(
+                    action_type="sell", ticker=ticker, side=side,
+                    contracts=pos["contracts"], price_cents=int(current_bid),
+                    reason=f"profit_take pnl={pnl_pct:+.1%}",
+                ))
+                continue
+
+            # Rule 3: Time-decayed loss cut — suppressed when model agrees.
+            #
+            # Near settlement, binary prices swing wildly on thin liquidity.
+            # A NO contract can dip to 35¢ on a single BTC tick toward strike,
+            # then settle at 100¢ when BTC doesn't actually cross. The old
+            # rule cut these positions on the dip. Now: if the model still
+            # recommends our side with ≥40% confidence, suppress the time-based
+            # stop and hold through the noise. Only emergency stop (-65%) and
+            # reversal fire unconditionally.
+            model_agrees = (
+                output.recommended_side is not None
+                and output.recommended_side == side
+                and output.confidence >= 0.40
             )
 
-        return actions
-
-    def _amend_existing(self, ticker: str, yes_price: int, no_price: int) -> list[Action]:
-        """Amend resting orders for this ticker to new prices."""
-        actions = []
-        for oid, info in list(self.resting_orders.items()):
-            if info["ticker"] != ticker:
-                continue
-            new_price = yes_price if info["side"] == "yes" else no_price
-            if abs(new_price - info["price"]) >= 1:  # only amend if price moved
-                actions.append(Action(
-                    persona=self.name,
-                    action_type="amend",
-                    ticker=ticker,
-                    side=info["side"],
-                    price_cents=new_price,
-                    order_id=oid,
-                    reason="scalper_reprice",
-                ))
-        return actions
-
-    def _exit_positions_for_ticker(self, ticker: str, orderbook: dict) -> list[Action]:
-        """Exit all held positions for a ticker approaching settlement."""
-        if ticker not in self.positions:
-            return []
-
-        actions = []
-        yes_bid = orderbook.get("yes_bid", 0)
-        yes_ask = orderbook.get("yes_ask", 100)
-
-        for pos in self.positions[ticker]:
-            side = pos["side"]
-            if side == "yes":
-                current_bid = int(yes_bid or 0)
+            if model_agrees:
+                # Log when we would have fired — visibility into suppression
+                if secs > 480:
+                    would_thresh = -0.55
+                elif secs > 240:
+                    would_thresh = -0.40
+                else:
+                    would_thresh = -0.25
+                if pnl_pct <= would_thresh:
+                    log.info(
+                        f"{self.tag} STOP SUPPRESSED: {ticker} {side.upper()} | "
+                        f"pnl={pnl_pct:+.1%} (would cut at {would_thresh:+.0%}) | "
+                        f"model agrees conf={output.confidence:.0%} — holding"
+                    )
             else:
-                current_bid = int(max(0, 100 - (yes_ask or 100)))
+                if secs > 480:
+                    stop_thresh = -0.55  # >8min: lots of recovery time
+                elif secs > 240:
+                    stop_thresh = -0.40  # 4-8min: standard
+                else:
+                    stop_thresh = -0.25  # <4min: cut anything decisively underwater
+                if pnl_pct <= stop_thresh:
+                    self._stop_cooldown[ticker] = time.time()
+                    log.info(
+                        f"{self.tag} LOSS CUT: {ticker} {side.upper()} | "
+                        f"pnl={pnl_pct:+.1%} thresh={stop_thresh:+.0%} | "
+                        f"{secs:.0f}s left | model disagrees/neutral"
+                    )
+                    actions.append(Action(
+                        action_type="sell", ticker=ticker, side=side,
+                        contracts=pos["contracts"], price_cents=int(current_bid),
+                        reason=f"loss_cut pnl={pnl_pct:+.1%} {secs:.0f}s left",
+                    ))
+
+            # Rule 4: Hold to settlement (no trailing stop, no profit decay)
+
+        return actions
+
+    # ── Pyramid check ─────────────────────────────────────────────────────────
+
+    def _check_pyramid_eligible(
+        self,
+        ticker: str,
+        secs: float,
+        orderbook: dict,
+        output: ModelOutput,
+    ) -> bool:
+        """Check if an existing position qualifies for pyramiding (adding).
+
+        Returns True if the position is profitable, model still agrees,
+        and we haven't already added the max times.
+        """
+        min_pnl = getattr(self.cfg, "pyramid_min_pnl_pct", 0.10)
+        min_conf = getattr(self.cfg, "pyramid_min_confidence", 0.55)
+        min_edge = getattr(self.cfg, "pyramid_min_edge", 0.05)
+        min_secs = getattr(self.cfg, "pyramid_min_seconds", 300)
+        max_adds = getattr(self.cfg, "pyramid_max_adds", 1)
+
+        if secs < min_secs:
+            return False
+
+        positions = self.positions.get(ticker, [])
+        if not positions:
+            return False
+
+        for pos in positions:
+            if pos.get("mode") in ("arb", "mm_yes", "mm_no", "mm"):
+                continue  # don't pyramid arb/MM positions
+
+            side = pos["side"]
+            entry = pos["entry_cents"]
+            adds = pos.get("pyramid_adds", 0)
+
+            if adds >= max_adds:
+                continue
+
+            if entry <= 0:
+                continue
+
+            # Check P&L
+            yes_bid = float(orderbook.get("yes_bid") or 0)
+            yes_ask = float(orderbook.get("yes_ask") or 0)
+            if side == "yes":
+                current_bid = yes_bid
+            else:
+                if yes_ask > 0:
+                    current_bid = max(0.0, 100.0 - yes_ask)
+                elif yes_bid > 0:
+                    current_bid = max(0.0, 100.0 - yes_bid)
+                else:
+                    current_bid = 0.0
 
             if current_bid <= 0:
                 continue
 
-            log.info(
-                f"{self.tag} EXIT BEFORE SETTLEMENT: {ticker} {side.upper()} "
-                f"x{pos['contracts']} @ {current_bid}¢"
-            )
+            pnl_pct = (current_bid - entry) / entry
+            if pnl_pct < min_pnl:
+                continue
 
-            actions.append(Action(
-                persona=self.name,
-                action_type="sell",
-                ticker=ticker,
-                side=side,
-                contracts=pos["contracts"],
-                price_cents=current_bid,
-                reason="scalper_pre_settlement",
-            ))
-        return actions
+            # Check model agreement
+            if (output.recommended_side == side
+                    and output.confidence >= min_conf):
+                edge = (output.edge_yes if side == "yes" else output.edge_no) or 0
+                if edge >= min_edge:
+                    log.info(
+                        f"{self.tag} PYRAMID eligible: {ticker} {side.upper()} | "
+                        f"pnl={pnl_pct:+.1%} conf={output.confidence:.0%} "
+                        f"edge={edge:+.1%} adds={adds}/{max_adds}"
+                    )
+                    return True
 
-    def _cancel_all_for_ticker(self, ticker: str) -> list[Action]:
-        """Cancel all resting orders for a ticker approaching settlement."""
-        actions = []
-        for oid, info in list(self.resting_orders.items()):
-            if info["ticker"] == ticker:
-                actions.append(Action(
-                    persona=self.name,
-                    action_type="cancel",
-                    ticker=ticker,
-                    order_id=oid,
-                    reason="scalper_settlement_cancel",
-                ))
-        return actions
+        return False
 
-    def record_fill(self, ticker: str, side: str, contracts: int, price_cents: int, trade_id: str = ""):
-        super().record_fill(ticker, side, contracts, price_cents, trade_id)
-        if ticker not in self.inventory:
-            self.inventory[ticker] = {"yes": 0, "no": 0}
-        self.inventory[ticker][side] += contracts
+    # ── Pure arbitrage ────────────────────────────────────────────────────────
 
-    def record_exit(self, ticker: str, pnl: float, side: str | None = None):
-        super().record_exit(ticker, pnl, side=side)
-        if ticker not in self.positions:
-            self.inventory.pop(ticker, None)
-
-    def summary(self) -> dict:
-        base = super().summary()
-        total_inv = sum(v["yes"] + v["no"] for v in self.inventory.values())
-        base["inventory"] = total_inv
-        return base
-
-
-# ── Arb: Arbitrage / Mispricing Hunter ───────────────────────────────────────
-
-class ArbPersona(BasePersona):
-    name = "arb"
-    tag = "[ARB]"
-
-    def __init__(self, cfg: ArbConfig):
-        super().__init__()
-        self.cfg = cfg
-        self._stat_arb_tickers: set[str] = set()  # tickers with active stat-arb positions
-
-    def evaluate(
+    def _check_pure_arb(
         self,
         ticker: str,
-        market: dict,
         orderbook: dict,
-        output: ModelOutput,
         bankroll_usd: float,
-        engine_state: dict,
-    ) -> list[Action]:
-        if not self.cfg.enabled:
-            return []
-
-        actions = []
-
-        # 0. Check exits for open stat-arb positions (pure arb never exits early)
-        if ticker in self.positions and ticker in self._stat_arb_tickers:
-            exit_actions = self._check_stat_arb_exits(ticker, market, orderbook)
-            if exit_actions:
-                return exit_actions
-
-        # 1. Pure arbitrage: YES_ask + NO_ask < 100¢
-        arb_action = self._check_pure_arb(ticker, orderbook, bankroll_usd)
-        if arb_action:
-            actions.append(arb_action)
-            return actions  # pure arb takes priority
-
-        # 2. Statistical arbitrage: large model-vs-market divergence
-        stat_action = self._check_stat_arb(ticker, market, orderbook, output, bankroll_usd)
-        if stat_action:
-            actions.append(stat_action)
-
-        return actions
-
-    def _check_stat_arb_exits(self, ticker: str, market: dict, orderbook: dict) -> list[Action]:
-        """Check exits for open stat-arb positions: TP/SL on price, time-cut near settlement."""
-        actions = []
-        seconds_left = market.get("seconds_left", 999)
-
-        for pos in self.positions[ticker]:
-            side = pos["side"]
-            entry = pos["entry_cents"]
-            if not entry or entry <= 0:
-                continue
-
-            # Current liquidation value (best bid for our side)
-            if side == "yes":
-                current_bid = orderbook.get("yes_bid")
-            else:
-                yes_ask = orderbook.get("yes_ask")
-                current_bid = (100 - yes_ask) if yes_ask is not None else None
-
-            if current_bid is None:
-                continue
-
-            pnl_pct = (current_bid - entry) / entry
-
-            # Update trailing peak
-            peak = max(pnl_pct, pos.get("peak_pnl_pct", 0.0))
-            pos["peak_pnl_pct"] = peak
-
-            exit_reason = None
-            if pnl_pct >= self.cfg.stat_arb_take_profit_pct:
-                exit_reason = f"arb_tp ({pnl_pct:+.1%})"
-            elif pnl_pct <= -self.cfg.stat_arb_stop_loss_pct:
-                exit_reason = f"arb_sl ({pnl_pct:+.1%})"
-            else:
-                trail_activate = getattr(self.cfg, "trail_activate_pct", 0.20)
-                trail_retrace = getattr(self.cfg, "trail_retracement_pct", 0.50)
-                if peak >= trail_activate:
-                    trail_floor = peak * (1.0 - trail_retrace)
-                    if pnl_pct < trail_floor:
-                        exit_reason = f"arb_trail (peak={peak:+.1%} → floor={trail_floor:+.1%} now={pnl_pct:+.1%})"
-
-            if exit_reason:
-                log.info(
-                    f"{self.tag} STAT ARB EXIT: {ticker} {side.upper()} | "
-                    f"entry={entry}¢ current={current_bid}¢ pnl={pnl_pct:+.1%} | {exit_reason}"
-                )
-                actions.append(Action(
-                    persona=self.name, action_type="sell", ticker=ticker,
-                    side=side, contracts=pos["contracts"], price_cents=int(current_bid),
-                    reason=exit_reason,
-                ))
-                continue
-
-            if seconds_left <= self.cfg.stat_arb_cut_before_seconds and pnl_pct < 0:
-                # Near settlement and losing — sell now to recover whatever the bid offers
-                # rather than riding to zero. If we're winning, let it settle for full $1.
-                log.info(
-                    f"{self.tag} STAT ARB TIME-CUT: {ticker} {side.upper()} | "
-                    f"{seconds_left:.0f}s left | entry={entry}¢ current={current_bid}¢ pnl={pnl_pct:+.1%}"
-                )
-                actions.append(Action(
-                    persona=self.name, action_type="sell", ticker=ticker,
-                    side=side, contracts=pos["contracts"], price_cents=int(current_bid),
-                    reason=f"arb_time_cut ({seconds_left:.0f}s left, {pnl_pct:+.1%})",
-                ))
-        return actions
-
-    def record_exit(self, ticker: str, pnl: float, side: str | None = None):
-        """Override to clean up _stat_arb_tickers when position is fully closed."""
-        super().record_exit(ticker, pnl, side)
-        if ticker not in self.positions:
-            self._stat_arb_tickers.discard(ticker)
-
-    def _check_pure_arb(self, ticker: str, orderbook: dict, bankroll_usd: float) -> Optional[Action]:
-        """Buy both YES and NO when combined cost < $1.00 for guaranteed profit."""
+    ) -> Optional[Action]:
+        """Buy both YES and NO when combined cost < 100¢ → guaranteed profit."""
         yes_ask = orderbook.get("yes_ask")
         yes_bid = orderbook.get("yes_bid")
         if yes_ask is None or yes_bid is None:
             return None
 
-        # Cost to buy YES = yes_ask cents
-        # Cost to buy NO = (100 - yes_bid) cents
         yes_cost = int(yes_ask)
         no_cost = int(100 - yes_bid)
         combined = yes_cost + no_cost
-
         profit_cents = 100 - combined
+
         if profit_cents < self.cfg.min_arb_cents:
             return None
 
-        # Size: as many pairs as budget allows
         budget = bankroll_usd * self.cfg.budget_pct
-        cost_per_pair = combined / 100  # dollars
+        cost_per_pair = combined / 100
         if cost_per_pair <= 0:
             return None
+
         contracts = min(
             int(budget / cost_per_pair),
-            self.cfg.max_contracts,
+            self.cfg.max_arb_contracts,
         )
         if contracts <= 0:
             return None
@@ -607,101 +534,560 @@ class ArbPersona(BasePersona):
         log.info(
             f"{self.tag} PURE ARB: {ticker} | "
             f"YES@{yes_cost}¢ + NO@{no_cost}¢ = {combined}¢ | "
-            f"profit={profit_cents}¢/pair x{contracts} = ${contracts * profit_cents / 100:.2f}"
+            f"guaranteed profit={profit_cents}¢/pair × {contracts} = "
+            f"${contracts * profit_cents / 100:.2f}"
         )
 
         return Action(
-            persona=self.name,
             action_type="batch_buy",
             ticker=ticker,
             contracts=contracts,
             reason=f"pure_arb profit={profit_cents}¢/pair",
             batch_orders=[
-                {
-                    "ticker": ticker,
-                    "action": "buy",
-                    "side": "yes",
-                    "type": "limit",
-                    "count": contracts,
-                    "yes_price": yes_cost,
-                },
-                {
-                    "ticker": ticker,
-                    "action": "buy",
-                    "side": "no",
-                    "type": "limit",
-                    "count": contracts,
-                    "no_price": no_cost,
-                },
+                {"ticker": ticker, "action": "buy", "side": "yes",
+                 "type": "limit", "count": contracts, "yes_price": yes_cost},
+                {"ticker": ticker, "action": "buy", "side": "no",
+                 "type": "limit", "count": contracts, "no_price": no_cost},
             ],
         )
 
-    def _check_stat_arb(
-        self, ticker: str, market: dict, orderbook: dict,
-        output: ModelOutput, bankroll_usd: float,
-    ) -> Optional[Action]:
-        """Bet on large model-vs-market divergence closing."""
-        if ticker in self.positions:
-            return None
+    # ── Market making ─────────────────────────────────────────────────────────
 
-        if output.confidence < self.cfg.stat_arb_min_confidence:
-            return None
-
-        yes_ask = orderbook.get("yes_ask")
+    def _check_market_making(
+        self,
+        ticker: str,
+        orderbook: dict,
+    ) -> list[Action]:
+        """
+        Post both sides inside the spread with GTC post_only (0% maker fee).
+        Only when spread ≥ mm_min_spread_cents.
+        Inventory tracking prevents runaway directional exposure.
+        """
         yes_bid = orderbook.get("yes_bid")
-        if yes_ask is None or yes_bid is None:
-            return None
+        yes_ask = orderbook.get("yes_ask")
+        if yes_bid is None or yes_ask is None:
+            return []
 
-        market_yes = (yes_bid + yes_ask) / 2 / 100  # 0-1 scale
-        model_yes = output.prob_yes
+        spread = float(yes_ask) - float(yes_bid)
+        if spread < self.cfg.mm_min_spread_cents:
+            return []
 
-        divergence = abs(model_yes - market_yes)
-        if divergence < self.cfg.stat_arb_divergence:
-            return None
-
-        # Determine direction: if model says YES is underpriced, buy YES
-        if model_yes > market_yes:
-            side = "yes"
-            price = int(yes_ask)
-            prob_win = output.prob_yes
-        else:
-            side = "no"
-            price = int(100 - yes_bid)
-            prob_win = output.prob_no
-
-        price = max(1, min(99, price))
-
-        # Skip if the market has already priced this side too cheaply —
-        # <min_price_cents means the market is 85%+ confident in the other direction.
-        # The model divergence here is almost certainly the model being stale, not edge.
-        if price < self.cfg.stat_arb_min_price_cents:
-            log.debug(
-                f"{self.tag} SKIP STAT ARB {ticker}: price={price}¢ < min={self.cfg.stat_arb_min_price_cents}¢ "
-                f"(market consensus too strong)"
-            )
-            return None
-
-        budget = bankroll_usd * self.cfg.budget_pct
-        contracts = min(
-            int(budget / (price / 100)),
-            self.cfg.max_contracts,
+        # Inventory: count YES vs NO contracts held from MM mode
+        inv_yes = sum(
+            p["contracts"] for p in self.positions.get(ticker, [])
+            if p.get("mode") in ("mm_yes", "mm")
         )
+        inv_no = sum(
+            p["contracts"] for p in self.positions.get(ticker, [])
+            if p.get("mode") in ("mm_no", "mm")
+        )
+
+        # Quote inside the spread
+        yes_buy = int(max(1, float(yes_ask) - self.cfg.mm_quote_offset_cents - 1))
+        no_buy = int(max(1, (100 - float(yes_bid)) - self.cfg.mm_quote_offset_cents - 1))
+
+        # Prevent quoting against ourselves (combined must be < 100¢)
+        if yes_buy + no_buy >= 99:
+            yes_buy = int(float(yes_bid) + 1)
+            no_buy = int(100 - float(yes_ask) + 1)
+            if yes_buy + no_buy >= 99:
+                return []
+
+        yes_buy = max(1, min(98, yes_buy))
+        no_buy = max(1, min(98, no_buy))
+
+        # Amend existing MM orders if prices have moved
+        existing = {v["ticker"] for v in self.resting_orders.values()
+                    if v.get("purpose") == "mm"}
+        if ticker in existing:
+            return self._amend_mm_orders(ticker, yes_buy, no_buy)
+
+        contracts = self.cfg.mm_contracts_per_side
+        actions = []
+
+        if inv_yes - inv_no < self.cfg.mm_max_inventory:
+            actions.append(Action(
+                action_type="buy", ticker=ticker, side="yes",
+                contracts=contracts, price_cents=yes_buy,
+                post_only=True, time_in_force="gtc",
+                self_trade_prevention="taker_at_cross",
+                reason=f"mm_quote spread={spread:.0f}¢",
+            ))
+
+        if inv_no - inv_yes < self.cfg.mm_max_inventory:
+            actions.append(Action(
+                action_type="buy", ticker=ticker, side="no",
+                contracts=contracts, price_cents=no_buy,
+                post_only=True, time_in_force="gtc",
+                self_trade_prevention="taker_at_cross",
+                reason=f"mm_quote spread={spread:.0f}¢",
+            ))
+
+        if actions:
+            log.info(
+                f"{self.tag} MM QUOTE: {ticker} | spread={spread:.0f}¢ | "
+                f"YES@{yes_buy}¢ NO@{no_buy}¢ ×{contracts} | "
+                f"inv=Y{inv_yes}/N{inv_no}"
+            )
+        return actions
+
+    def _amend_mm_orders(self, ticker: str, yes_price: int, no_price: int) -> list[Action]:
+        actions = []
+        for oid, info in list(self.resting_orders.items()):
+            if info.get("ticker") != ticker or info.get("purpose") != "mm":
+                continue
+            new_price = yes_price if info["side"] == "yes" else no_price
+            if abs(new_price - info["price"]) >= 2:
+                actions.append(Action(
+                    action_type="amend", ticker=ticker, side=info["side"],
+                    price_cents=new_price, order_id=oid, reason="mm_reprice",
+                ))
+        return actions
+
+    def _cancel_mm_orders(self, ticker: str) -> list[Action]:
+        return [
+            Action(
+                action_type="cancel", ticker=ticker, order_id=oid,
+                reason="mm_settlement_cancel",
+            )
+            for oid, info in list(self.resting_orders.items())
+            if info.get("ticker") == ticker and info.get("purpose") == "mm"
+        ]
+
+    # ── Directional entry ─────────────────────────────────────────────────────
+
+    def _check_directional_entry(
+        self,
+        ticker: str,
+        orderbook: dict,
+        output: ModelOutput,
+        bankroll_usd: float,
+        secs: float,
+        annual_vol: float = 0.80,
+        is_reversal: bool = False,
+    ) -> Optional[Action]:
+        """
+        Phase-aware directional entry:
+
+          Early phase (>prime_window threshold):
+            GTC post_only at mid − 1¢ (0% maker fee; patient fill)
+            Will escalate to IOC after gtc_escalate_seconds if unfilled.
+
+          Prime phase (3–8 min left):
+            IOC at ask + slippage (guaranteed fill or miss, no resting order).
+
+          Strong-signal override:
+            When confidence ≥ 0.65 AND |edge| ≥ 0.08, treat as prime regardless
+            of seconds remaining — the move is happening NOW, no patience.
+
+          Reversal re-entry:
+            When is_reversal=True, the reversal already validated edge ≥ 0.10
+            (double the normal threshold). Skip the confidence gate — edge is
+            the binding constraint, not model agreement.
+        """
+        # Block entry if a prior IOC escalation recently failed for this ticker.
+        # Prevents the price-chase loop where each failed IOC lets the next scan
+        # post a new GTC that escalates at an even worse price.
+        if time.time() < self._entry_retry_cooldown.get(ticker, 0):
+            return None
+
+        # Confidence gate: skip for reversal re-entries (edge already validated
+        # at 0.10 — twice the normal bar). For normal entries, require min_confidence.
+        if not is_reversal and output.confidence < self.cfg.min_confidence:
+            return None
+        if not output.recommended_side:
+            return None
+
+        side = output.recommended_side
+        edge = output.edge_yes if side == "yes" else output.edge_no
+        if edge is None or edge < self.cfg.min_edge:
+            return None
+
+        # Reversal re-entry orderbook confirmation.
+        # Post-mortem: reversals exited at strong model edge but re-entries lost
+        # because the orderbook hadn't flipped yet — the ensemble had, but the
+        # tape was still chopping. Require prob_orderbook to actually agree in
+        # the flip direction before buying into the reversal.
+        if (is_reversal
+                and getattr(self.cfg, "reversal_require_orderbook_confirm", True)):
+            min_dev = getattr(self.cfg, "reversal_orderbook_min_dev", 0.10)
+            p_ob = output.prob_orderbook
+            if p_ob is None:
+                log.info(
+                    f"{self.tag} REVERSAL RE-ENTRY SKIPPED: {ticker} {side.upper()} "
+                    f"— orderbook too thin to confirm flip"
+                )
+                return None
+            dev = (p_ob - 0.5) if side == "yes" else (0.5 - p_ob)
+            if dev < min_dev:
+                log.info(
+                    f"{self.tag} REVERSAL RE-ENTRY SKIPPED: {ticker} {side.upper()} "
+                    f"— orderbook P={p_ob:.2f} not confirming flip "
+                    f"(need dev≥{min_dev:.2f} in {side} direction)"
+                )
+                return None
+
+        yes_bid = orderbook.get("yes_bid")
+        yes_ask = orderbook.get("yes_ask")
+
+        # Strong-signal override: when conviction is high, skip the patient
+        # GTC and go straight to IOC. This is what makes earlier "aggressive"
+        # iterations responsive — we stop watching the price run away while
+        # a 12s GTC sits at mid-1¢.
+        strong_signal = output.confidence >= 0.65 and abs(edge) >= 0.08
+        in_prime = secs <= self.cfg.prime_window_min_seconds or strong_signal
+
+        # Adaptive slippage by realized volatility — calm tape stays at 2¢,
+        # storm tape pays up to 4¢ to actually fill.
+        slip = self.cfg.slippage_cents
+        if annual_vol > 1.0:
+            slip += 1
+        if annual_vol > 1.5:
+            slip += 1
+
+        if side == "yes":
+            if yes_ask is None:
+                return None
+            prob_win = output.prob_yes
+            if in_prime:
+                raw_price = int(yes_ask) + slip
+                use_gtc = False
+            else:
+                mid = ((float(yes_bid) + float(yes_ask)) / 2) if yes_bid else float(yes_ask)
+                raw_price = max(1, int(mid) - 1)
+                use_gtc = True
+        else:
+            if yes_bid is None:
+                return None
+            prob_win = output.prob_no
+            if in_prime:
+                raw_price = int(100 - float(yes_bid)) + slip
+                use_gtc = False
+            else:
+                mid = ((float(yes_bid) + float(yes_ask)) / 2) if yes_ask else float(yes_bid)
+                raw_price = max(1, int(100 - mid) - 1)
+                use_gtc = True
+
+        raw_price = max(1, min(99, raw_price))
+
+        if raw_price < self.cfg.min_entry_price_cents:
+            return None
+
+        # Three-tier Kelly: strong signals get 0.75x to capitalize on
+        # high-conviction opportunities. The max_single_trade_usd cap
+        # still bounds absolute exposure.
+        kelly_frac_strong = getattr(self.cfg, "kelly_fraction_strong", 0.75)
+        if strong_signal:
+            kelly_frac = kelly_frac_strong
+        elif in_prime:
+            kelly_frac = self.cfg.kelly_fraction_prime
+        else:
+            kelly_frac = self.cfg.kelly_fraction_early
+
+        frac = kelly_fraction_binary(prob_win, raw_price, kelly_frac)
+        if frac <= 0:
+            return None
+
+        dollar_amount = min(
+            frac * bankroll_usd,
+            bankroll_usd * self.cfg.budget_pct,
+            self.cfg.max_single_trade_usd,
+        )
+        if dollar_amount < self.cfg.min_single_trade_usd:
+            return None
+
+        contracts = int(dollar_amount / (raw_price / 100))
         if contracts <= 0:
             return None
 
+        phase = "prime" if in_prime else "early"
+        order_mode = "IOC" if in_prime else "GTC"
+
+        # Mid at signal time — used by escalation drift gate to measure
+        # adverse selection if a GTC has to escalate.
+        if yes_bid is not None and yes_ask is not None:
+            if side == "yes":
+                signal_mid = (float(yes_bid) + float(yes_ask)) / 2
+            else:
+                # NO side: mid of the implied NO price = 100 - (YES mid)
+                signal_mid = 100 - ((float(yes_bid) + float(yes_ask)) / 2)
+        else:
+            signal_mid = float(raw_price)  # best we can do
+
         log.info(
-            f"{self.tag} STAT ARB: {ticker} {side.upper()} | "
-            f"model={model_yes:.1%} vs market={market_yes:.1%} "
-            f"divergence={divergence:.1%} | x{contracts} @ {price}¢"
+            f"{self.tag} SIGNAL [{phase}|{order_mode}]: {ticker} {side.upper()} | "
+            f"conf={output.confidence:.0%} edge={edge:+.1%} "
+            f"×{contracts} @ {raw_price}¢ mid={signal_mid:.1f}¢"
         )
 
-        self._stat_arb_tickers.add(ticker)
         return Action(
-            persona=self.name,
             action_type="buy",
             ticker=ticker,
             side=side,
             contracts=contracts,
-            price_cents=price,
-            reason=f"stat_arb div={divergence:.1%}",
+            price_cents=raw_price,
+            post_only=use_gtc,
+            time_in_force="gtc" if use_gtc else "ioc",
+            reason=f"dir_{phase} conf={output.confidence:.0%} edge={edge:+.1%}",
+            signal_mid_cents=signal_mid,
         )
+
+    # ── Settlement lock entry ────────────────────────────────────────────────
+
+    def _check_settlement_lock_entry(
+        self,
+        ticker: str,
+        orderbook: dict,
+        output: ModelOutput,
+        bankroll_usd: float,
+        secs: float,
+    ) -> Optional[Action]:
+        """Late-window entry when BRTI settlement is near-certain.
+
+        Only called when BSM probability is extreme (≥88% or ≤12%), meaning
+        BTC is well clear of the strike with <60s remaining. The BRTI uses
+        a 60-second trailing average — with 30s left, half is locked in.
+        Everyone else fears late-window gamma, but gamma only bites when
+        BTC is near the strike. When it's far away, this is free money.
+
+        Always IOC, half-Kelly (bounded market, short hold, near-certain).
+        """
+        side = output.recommended_side
+        if not side:
+            return None
+
+        edge = output.edge_yes if side == "yes" else output.edge_no
+        if edge is None or edge < 0.03:  # lower edge bar — near-certainty
+            return None
+
+        yes_bid = orderbook.get("yes_bid")
+        yes_ask = orderbook.get("yes_ask")
+
+        if side == "yes":
+            if yes_ask is None:
+                return None
+            prob_win = output.prob_yes
+            raw_price = int(yes_ask) + 2  # pay up — speed matters
+        else:
+            if yes_bid is None:
+                return None
+            prob_win = output.prob_no
+            raw_price = int(100 - float(yes_bid)) + 2
+
+        raw_price = max(1, min(99, raw_price))
+
+        # Half-Kelly for settlement locks — high certainty but short window
+        frac = kelly_fraction_binary(prob_win, raw_price, self.cfg.kelly_fraction_prime)
+        if frac <= 0:
+            return None
+
+        dollar_amount = min(
+            frac * bankroll_usd,
+            bankroll_usd * self.cfg.budget_pct,
+            self.cfg.max_single_trade_usd,
+        )
+        if dollar_amount < self.cfg.min_single_trade_usd:
+            return None
+
+        contracts = int(dollar_amount / (raw_price / 100))
+        if contracts <= 0:
+            return None
+
+        log.info(
+            f"{self.tag} SETTLEMENT LOCK: {ticker} {side.upper()} | "
+            f"bsm={output.prob_binary_options:.0%} conf={output.confidence:.0%} "
+            f"edge={edge:+.1%} ×{contracts} @ {raw_price}¢ | {secs:.0f}s left"
+        )
+
+        return Action(
+            action_type="buy",
+            ticker=ticker,
+            side=side,
+            contracts=contracts,
+            price_cents=raw_price,
+            post_only=False,
+            time_in_force="ioc",
+            reason=f"settlement_lock bsm={output.prob_binary_options:.0%} {secs:.0f}s",
+        )
+
+    # ── GTC escalation ────────────────────────────────────────────────────────
+
+    def _check_gtc_escalation(
+        self,
+        ticker: str,
+        orderbook: dict,
+        secs: float,
+        annual_vol: float = 0.80,
+    ) -> list[Action]:
+        """
+        If a GTC entry order has been open longer than gtc_escalate_seconds
+        without filling, cancel it and place an IOC at the current ask.
+        This handles the case where the early-window GTC missed and the market
+        moved into the prime window.
+        """
+        # Never escalate in the late window — too close to settlement
+        if secs < self.cfg.late_window_min_seconds:
+            return []
+
+        now = time.time()
+        actions = []
+
+        # Adaptive slippage by realized vol — same scale as directional entry.
+        slip = self.cfg.slippage_cents
+        if annual_vol > 1.0:
+            slip += 1
+        if annual_vol > 1.5:
+            slip += 1
+
+        halve_thresh = getattr(self.cfg, "escalation_drift_halve_cents", 2)
+        skip_thresh = getattr(self.cfg, "escalation_drift_skip_cents", 5)
+
+        for oid, info in list(self.resting_orders.items()):
+            if info.get("ticker") != ticker or info.get("purpose") != "entry":
+                continue
+
+            age = now - info.get("placed_at", now)
+            if age < self.cfg.gtc_escalate_seconds:
+                continue
+
+            side = info["side"]
+            contracts = info["contracts"]
+            yes_bid = orderbook.get("yes_bid")
+            yes_ask = orderbook.get("yes_ask")
+
+            if side == "yes":
+                ioc_price = int(float(yes_ask or 99)) + slip
+            else:
+                ioc_price = int(100 - float(yes_bid or 1)) + slip
+            ioc_price = max(1, min(99, ioc_price))
+
+            # Adverse-selection drift gate. If the market moved substantially
+            # past our signal-time mid while the GTC rested, informed flow has
+            # already priced in what our model just saw — we're now the slow
+            # money. Either shrink size or abort.
+            signal_mid = info.get("signal_mid_cents")
+            if signal_mid is not None:
+                drift = ioc_price - float(signal_mid) - slip
+                if drift > skip_thresh:
+                    log.warning(
+                        f"{self.tag} GTC→IOC SKIPPED: {ticker} {side.upper()} "
+                        f"order {oid[:8]} — drift={drift:+.1f}¢ > "
+                        f"{skip_thresh}¢ (mid@sig={signal_mid:.1f}¢ → IOC={ioc_price}¢). "
+                        f"Cancelling GTC, entering retry cooldown."
+                    )
+                    actions.append(Action(
+                        action_type="cancel", ticker=ticker, order_id=oid,
+                        reason="gtc_drift_skip",
+                    ))
+                    # 30s retry cooldown so next scan doesn't re-post a fresh GTC
+                    self._entry_retry_cooldown[ticker] = now + 30
+                    continue
+                elif drift > halve_thresh:
+                    original = contracts
+                    contracts = max(1, contracts // 2)
+                    log.info(
+                        f"{self.tag} GTC→IOC DRIFT HALVE: {ticker} {side.upper()} "
+                        f"order {oid[:8]} — drift={drift:+.1f}¢ > "
+                        f"{halve_thresh}¢ (mid@sig={signal_mid:.1f}¢ → IOC={ioc_price}¢). "
+                        f"Size {original} → {contracts}."
+                    )
+
+            log.info(
+                f"{self.tag} GTC→IOC ESCALATE: {ticker} {side.upper()} | "
+                f"order {oid[:8]} age={age:.0f}s → IOC @ {ioc_price}¢ ×{contracts}"
+            )
+
+            actions.append(Action(
+                action_type="cancel", ticker=ticker, order_id=oid,
+                reason="gtc_escalate",
+            ))
+            actions.append(Action(
+                action_type="buy", ticker=ticker, side=side,
+                contracts=contracts, price_cents=ioc_price,
+                post_only=False, time_in_force="ioc",
+                reason=f"gtc_escalated after {age:.0f}s",
+                original_price_cents=info.get("price"),  # original GTC price for drift check
+                signal_mid_cents=signal_mid,  # preserve for any downstream logging
+            ))
+
+        return actions
+
+    # ── Fill / exit recording ─────────────────────────────────────────────────
+
+    def record_fill(
+        self,
+        ticker: str,
+        side: str,
+        contracts: int,
+        price_cents: int,
+        trade_id: str = "",
+        mode: str = "directional",
+    ):
+        """Record that an entry order filled."""
+        entry = {
+            "side": side, "entry_cents": price_cents,
+            "contracts": contracts, "trade_id": trade_id,
+            "mode": mode,
+        }
+        if ticker not in self.positions:
+            self.positions[ticker] = []
+        # Merge with existing entry on same side + mode (average-in)
+        for pos in self.positions[ticker]:
+            if pos["side"] == side and pos.get("mode") == mode:
+                total = pos["contracts"] + contracts
+                pos["entry_cents"] = round(
+                    (pos["entry_cents"] * pos["contracts"] + price_cents * contracts) / total
+                )
+                pos["contracts"] = total
+                pos["pyramid_adds"] = pos.get("pyramid_adds", 0) + 1
+                self.daily_trades += 1
+                return
+        self.positions[ticker].append(entry)
+        self.daily_trades += 1
+
+    def record_exit(self, ticker: str, pnl: float, side: Optional[str] = None):
+        """Record that a position was closed (exit or settlement)."""
+        if side and ticker in self.positions:
+            self.positions[ticker] = [
+                p for p in self.positions[ticker] if p["side"] != side
+            ]
+            if not self.positions[ticker]:
+                del self.positions[ticker]
+        else:
+            self.positions.pop(ticker, None)
+        self.daily_pnl += pnl
+        self._ticker_session_pnl[ticker] = (
+            self._ticker_session_pnl.get(ticker, 0.0) + pnl
+        )
+
+    def record_order(
+        self,
+        order_id: str,
+        ticker: str,
+        side: str,
+        price: int,
+        contracts: int,
+        purpose: str = "entry",
+        mode: str = "directional",
+        signal_mid_cents: Optional[float] = None,
+    ):
+        """Track a resting GTC order."""
+        self.resting_orders[order_id] = {
+            "ticker": ticker, "side": side, "price": price,
+            "contracts": contracts, "placed_at": time.time(),
+            "purpose": purpose, "mode": mode,
+            "signal_mid_cents": signal_mid_cents,
+        }
+
+    def remove_order(self, order_id: str):
+        self.resting_orders.pop(order_id, None)
+
+    def summary(self) -> dict:
+        total_pos = sum(len(v) for v in self.positions.values())
+        return {
+            "name": "auto",
+            "positions": total_pos,
+            "resting_orders": len(self.resting_orders),
+            "daily_pnl": round(self.daily_pnl, 2),
+            "daily_trades": self.daily_trades,
+        }

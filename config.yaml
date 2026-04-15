@@ -6,147 +6,164 @@ kalshi:
   base_url: "https://api.elections.kalshi.com/trade-api/v2"
   ws_url: "wss://api.elections.kalshi.com/trade-api/ws/v2"
   # Credentials loaded from .env (KALSHI_EMAIL / KALSHI_PASSWORD / KALSHI_API_KEY)
-  series_ticker: "KXBTC15M"      # The BTC 15-min Up/Down series
-  order_type: "limit"            # limit | market
-  # How far off mid-price to post limit orders (in cents, 0-100 scale)
+  series_ticker: "KXBTC15M"
+  order_type: "limit"
   limit_slippage_cents: 2
 
 feeds:
-  kraken_ws_url: "wss://ws.kraken.com/v2"   # primary — CF Benchmarks constituent exchange
-  # Backup feeds (REST polling if WS drops)
-  coinbase_rest_url: "https://api.coinbase.com/v2/prices/BTC-USD/spot"
-  kraken_rest_url: "https://api.kraken.com/0/public/Ticker?pair=XBTUSD"
-  # Aggregation window for OHLCV bars (seconds)
+  coinbase_ws_url: "wss://ws-feed.exchange.coinbase.com"
+  coinbase_rest_url: "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
   bar_interval_sec: 60
-  # How many bars to keep in memory for indicators
   lookback_bars: 200
 
 models:
   # Minimum model confidence to generate a signal (0.0–1.0)
-  min_confidence: 0.50
-  # Minimum expected value edge over Kalshi price to trade
-  min_edge: 0.03          # e.g. our prob=0.72 vs Kalshi YES price=0.68
+  # NOTE: trader.min_edge (below) is the single source of truth for edge.
+  min_confidence: 0.55
   # Weights for ensemble (must sum to 1.0)
+  # orderbook_imbalance: real-time buy/sell pressure — highest alpha for this market
+  # technical_momentum: RSI/MACD/BB composite — strong for 15-min moves
+  # trend_regression:   OLS slope & R² — medium-term context
+  # binary_options_model: Black-Scholes sanity check — reduced weight; becomes a step
+  #                        function at short horizons
+  # ml_model: LightGBM trained on historical outcomes (requires 500+ samples)
   ensemble_weights:
-    binary_options_model: 0.40   # Black-Scholes-style probability
-    technical_momentum:   0.30   # RSI/MACD/BB composite
-    trend_regression:     0.20   # Linear regression slope
-    ml_model:             0.10   # LightGBM (requires training data)
-  # Technical indicators config
+    orderbook_imbalance:  0.35
+    technical_momentum:   0.35
+    trend_regression:     0.20
+    binary_options_model: 0.10
+    ml_model:             0.00
   rsi_period: 14
   macd_fast: 12
   macd_slow: 26
   macd_signal: 9
   bb_period: 20
   bb_std: 2.0
-  # Annualized BTC volatility estimate (overridden by realized vol when enough data)
   default_annual_vol: 0.80
 
 strategy:
-  # Don't enter if less than this many seconds remain in the 15-min window
   min_seconds_remaining: 60
-  # Don't enter if more than this many seconds remain (too uncertain)
-  max_seconds_remaining: 870    # just under 15 minutes — allow near-open entries
-  # Preferred entry window: 5–10 minutes remaining (high conviction zone)
-  preferred_entry_window_sec: [300, 600]
-  # Auto-trading enabled (set to false to run in signal-only / paper mode)
-  auto_trade: false
-  # Paper trading mode (logs trades but doesn't execute)
-  paper_trade: true
-  # Max simultaneous open positions
-  max_open_positions: 12
-  # Side filter: "both" | "yes" | "no"
+  max_seconds_remaining: 870
+  preferred_entry_window_sec: [180, 600]
+  auto_trade: false       # set true to enable live trading
+  paper_trade: true       # always start in paper mode
+  max_open_positions: 4
   allowed_sides: "both"
 
-  # ── Active position management ──────────────────────────────────────────
-  # Exit early when unrealized gain reaches this % of entry price
-  take_profit_pct: 0.65      # e.g. bought NO at 25¢, exit when bid hits 41¢
-  # Exit early when unrealized loss reaches this % of entry price
-  stop_loss_pct: 0.35        # e.g. bought NO at 25¢, exit when bid drops to 16¢
-  # Flip to opposite side if model signals reverse with at least this edge
-  flip_min_edge: 0.10        # 10% edge required to flip (lowered from 0.12 — catches more reversals)
-  # Lock in profits in the final N seconds if we're up > 10%
-  lock_profit_seconds: 120   # last 2 minutes: sell winners, don't let them expire
-  # Trailing stop: activates once position is up trail_activate_pct,
-  # exits if the gain retraces more than trail_retracement_pct of the peak
-  # e.g. peak=48% → floor=24% (exits if drops back below 24% gain)
-  trail_activate_pct: 0.20
-  trail_retracement_pct: 0.50
+# ── Unified Auto-Trader ────────────────────────────────────────────────────────
+# Replaces the old Sniper / Scalper / Arb persona trio.
+# All decision-making flows through a single AutoTrader with time-phase logic.
+trader:
+  enabled: true
+  budget_pct: 1.0          # fraction of bankroll available to auto-trader
 
-  # ── Re-entry protection ──────────────────────────────────────────────────
-  # Skip contracts already at penny prices — market has already decided direction
-  min_entry_price_cents: 10
-  # After a stop-loss, block re-entry on the same ticker for this many seconds
-  # Prevents the "stop-loss loop" where the engine re-enters every 5s on a losing candle
-  stop_loss_cooldown_seconds: 120
-  # ── Cheap-entry cost cap ─────────────────────────────────────────────────
-  # Kelly at 3-10¢ entries produces hundreds of contracts — cap dollar exposure
-  cheap_entry_threshold_cents: 25   # apply cap when price < 25¢
-  max_cost_cheap_entry_usd: 4.00    # max ~$4 risk on any cheap entry
-  # ── Per-candle loss brake ─────────────────────────────────────────────────
-  # Block further auto entries on a ticker if cumulative session loss exceeds threshold
-  per_candle_max_loss_usd: 8.00
+  # Time-phase thresholds (seconds remaining in the 15-min window)
+  #   Early  (>8 min):  GTC post_only entries + market making; 0% maker fee
+  #   Prime  (3–8 min): IOC directional entries; escalates unfilled GTC
+  #   Late   (<3 min):  no new entries; manage existing positions only
+  early_window_min_seconds: 480   # 8 min
+  prime_window_min_seconds: 180   # 3 min
+  late_window_min_seconds:  60    # 1 min
+  max_entry_seconds: 870          # never enter beyond 14.5 min remaining
 
-personas:
-  sniper:
-    enabled: true
-    budget_pct: 0.50           # 50% of daily risk budget
-    min_confidence: 0.75       # raised from 0.70 — only very high conviction entries
-    min_edge: 0.05             # 5% edge required
-    kelly_fraction: 0.50       # half-Kelly (aggressive)
-    slippage_cents: 3          # willing to pay 3¢ over mid for fast fills
-    take_profit_pct: 0.50      # take profit at +50%
-    stop_loss_pct: 0.25        # stop loss at -25%
-    min_seconds: 180           # only trade 3-10 min window
-    max_seconds: 600
-    stop_loss_cooldown_seconds: 180  # no re-entry on same ticker for 3 min after SL
-    trail_activate_pct: 0.20
-    trail_retracement_pct: 0.50
-  scalper:
-    enabled: true
-    budget_pct: 0.30           # 30% of daily risk budget
-    min_spread_cents: 3        # only market-make when spread ≥ 3¢
-    contracts_per_side: 1      # post 1 contract on each side (low exposure, scale up once validated)
-    max_inventory_imbalance: 10  # max net directional contracts
-    cancel_before_seconds: 120 # cancel all resting orders with < 2 min left
-    min_seconds: 120
-    max_seconds: 720
-  arb:
-    enabled: true
-    budget_pct: 0.20           # 20% of daily risk budget (can exceed for true arb)
-    min_arb_cents: 2           # YES+NO must cost < 98¢ for pure arb
-    stat_arb_divergence: 0.15  # 15% model-vs-market divergence for stat arb
-    stat_arb_min_confidence: 0.40
-    max_contracts: 20
-    # Stat-arb entry filter
-    stat_arb_min_price_cents: 20     # skip if contract already priced <20¢ (market has made up its mind)
-    # Stat-arb exits (pure arb holds to settlement — guaranteed)
-    stat_arb_take_profit_pct: 0.80   # exit stat arb when up 80% (market repriced)
-    stat_arb_stop_loss_pct: 0.65     # cut stat arb when down 65% (widened from 50%)
-    trail_activate_pct: 0.20
-    trail_retracement_pct: 0.50
+  # Entry thresholds
+  # min_confidence: 0.45 is the new conviction-weighted scale (anchored to
+  # weighted-mean distance from 0.5, NOT std-dev). Looks lower than before
+  # but is harder to clear — old 0.55 admitted near-neutral signals.
+  min_confidence: 0.45            # minimum model confidence
+  min_edge: 0.05                  # minimum edge over Kalshi mid-price
+  min_entry_price_cents: 10       # skip contracts already priced below 10¢
+  max_entry_price_cents: 72       # skip deep-ITM contracts. Tightened from 85:
+                                  # post-mortem on 12APR06:15 showed 67-82¢ entries
+                                  # accounted for most losses in chop.
 
-    stat_arb_cut_before_seconds: 90  # cut any losing stat-arb with <90s left rather than ride to zero
+  # Settlement lock — allow late-window entries when outcome is near-certain
+  # BRTI settles on 60s trailing average; with 30s left, half is locked in.
+  # When BSM says ≥88% and BTC is well clear of strike, enter even <60s.
+  settlement_lock_enabled: true
+  settlement_lock_min_seconds: 20
+  settlement_lock_max_seconds: 60
+  settlement_lock_min_prob: 0.88
+  settlement_lock_min_confidence: 0.50
+
+  # GTC order management
+  # Early-window entries post GTC post_only at mid-1¢ (0% maker fee).
+  # If unfilled after gtc_escalate_seconds, cancel and retry as IOC.
+  # 8s: tight escalation. With the strong-signal override in personas.py,
+  # GTC now only handles genuinely quiet markets where 8s of patience is
+  # plenty and the old 12s was just alpha decay.
+  gtc_escalate_seconds: 8.0
+  slippage_cents: 2               # IOC slippage above current ask (adaptive by vol)
+
+  # Market making — runs in early window when spread ≥ mm_min_spread_cents
+  # Posts both YES and NO sides with GTC post_only; earns spread at 0% fee.
+  mm_min_spread_cents: 5
+  mm_contracts_per_side: 2        # start small; raise after validating edge
+  mm_max_inventory: 8             # stop posting overloaded side above this (~$4 one-sided)
+  mm_cancel_before_seconds: 120   # cancel all MM orders with <2 min to settlement
+  mm_quote_offset_cents: 2        # post this many cents inside best bid/ask
+
+  # Exit rules (simplified — no trailing stop, no profit decay)
+  #   Rule 1: Pure arb pairs always hold to settlement ($1.00 guaranteed — never cut)
+  #   Rule 2: Flip if model reverses with strong edge AND enough time remains
+  #   Rule 3: Cut losses only when close to settlement (don't get trapped near zero)
+  #   Rule 4: Everything else → hold to $1.00 settlement
+  stop_loss_pct: 0.40             # cut if losing >40% AND <stop_loss_min_seconds left
+  stop_loss_min_seconds: 240      # 4 min: only cut losses inside last 4 minutes
+  emergency_stop_pct: 0.65        # cut IMMEDIATELY (any time) if losing >65%
+  reversal_min_edge: 0.10         # 10% edge required to flip sides
+  reversal_min_seconds: 300       # only flip with >5 min left
+
+  # Position sizing (tuned for $100 starting balance)
+  # Early window (GTC): quarter-Kelly — patient entries, time uncertainty higher
+  # Prime window (IOC): half-Kelly — high conviction, short window
+  # Sizer also hard-caps at 20% of bankroll internally (see btc15/strategy/sizer.py)
+  kelly_fraction_early: 0.25
+  kelly_fraction_prime: 0.50
+  kelly_fraction_strong: 0.75     # 3/4-Kelly for very strong signals (conf≥0.65, edge≥0.08)
+  max_single_trade_usd: 12.00     # hard cap per trade (~12% of $100 bankroll)
+
+  # Pyramiding — add to winning positions when model still agrees
+  pyramid_enabled: true
+  pyramid_min_pnl_pct: 0.10       # position must be ≥10% profitable
+  pyramid_min_confidence: 0.55
+  pyramid_min_edge: 0.05
+  pyramid_min_seconds: 300         # ≥5 min left to pyramid
+  pyramid_max_adds: 1              # max 1 add per position
+
+  # Stop/whipsaw cooldowns — the 12APR06:15 session had one market
+  # take 4 losing trades in 10 minutes; these prevent re-entering chop.
+  stop_cooldown_seconds: 90         # entry lockout after a stop-loss (was 45)
+  reversal_cooldown_seconds: 60     # entry lockout after any reversal exit
+
+  # GTC→IOC escalation drift gate. When the resting GTC didn't fill and the
+  # IOC would now have to cross far above signal-time mid, we're chasing
+  # informed flow. Halve or skip depending on how bad the drift is.
+  escalation_drift_halve_cents: 2   # drift > 2¢ beyond slippage → halve contracts
+  escalation_drift_skip_cents: 5    # drift > 5¢                  → skip IOC entirely
+
+  # Reversal re-entry: require the live orderbook imbalance to actually
+  # confirm the flip direction. Prevents taking reversal exits for profit
+  # then immediately losing the re-entry on the same noisy market.
+  reversal_require_orderbook_confirm: true
+  reversal_orderbook_min_dev: 0.10  # |prob_orderbook - 0.5| ≥ this in flip direction
+
+  # Arbitrage — always highest priority when YES+NO < 98¢
+  min_arb_cents: 2                # minimum profit per pair in cents
+  max_arb_contracts: 5            # ~$2.50–4.90 per arb pair on $100 bankroll
 
 risk:
-  # Max simultaneous open positions (across all personas)
-  max_open_positions: 6
-  # Max USD to risk on a single trade
-  max_trade_usd: 25.00
-  # Absolute max position per market (Kalshi limit is $25k but we cap lower)
-  max_position_per_market_usd: 30.00
-  # Daily loss limit — bot pauses if hit
-  daily_loss_limit_usd: 25.00
-  # Kelly fraction multiplier (1.0 = full Kelly, 0.25 = quarter Kelly recommended)
+  max_open_positions: 3           # 3 × $12 = $36 max simultaneous exposure (36%)
+  max_trade_usd: 12.00            # matches trader.max_single_trade_usd
+  max_position_per_market_usd: 12.00
+  daily_loss_limit_usd: 15.00     # stop trading if down $15 on the day (15% of $100)
   kelly_fraction: 0.25
-  # Minimum trade size
-  min_trade_usd: 1.00
-  # Stop trading if win rate over last N trades drops below threshold
+  min_trade_usd: 0.50             # Kalshi practical minimum
   win_rate_lookback: 20
-  win_rate_min: 0.15
+  win_rate_min: 0.40              # halt if recent win rate drops below 40%
 
 logging:
-  level: "INFO"            # DEBUG | INFO | WARNING | ERROR
+  level: "INFO"
   log_file: "logs/bot.log"
   trade_log_file: "logs/trades.csv"
   max_log_size_mb: 50
