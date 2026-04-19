@@ -28,7 +28,7 @@ class KalshiWebSocket:
       - fill: our fills (requires auth)
     """
 
-    CHANNELS = ("orderbook_delta", "ticker", "trade", "fill")
+    CHANNELS = ("orderbook_delta", "orderbook_snapshot", "ticker", "trade", "fill")
 
     def __init__(self, config: KalshiConfig, token: Optional[str] = None,
                  auth_header_factory=None):
@@ -162,8 +162,13 @@ class KalshiWebSocket:
             log.debug(f"WS: {msg}")
             return
 
-        # Route to handlers
-        target = channel or msg_type
+        # Route to handlers. Prefer msg_type when it's a known channel
+        # (Kalshi sends type="orderbook_snapshot" with channel="orderbook_delta"
+        # for the initial snapshot — we need the snapshot handler, not the delta one).
+        if msg_type in self._handlers:
+            target = msg_type
+        else:
+            target = channel or msg_type
         handlers = self._handlers.get(target, [])
         for handler in handlers:
             try:
@@ -182,68 +187,209 @@ class MarketDataCache:
         self._tickers: dict[str, dict] = {}      # ticker → {yes_bid, yes_ask, volume, ...}
         self._orderbooks: dict[str, dict] = {}   # ticker → {yes_bids: [...], yes_asks: [...]}
         self._lock = asyncio.Lock()
+        # Injected by the engine: fire-and-forget REST refresh when cache looks stale.
+        # Signature: async def refresh(ticker: str) -> None
+        self.rest_refresh: Optional[Callable[[str], Coroutine]] = None
+        # Staleness threshold in seconds — reads older than this trigger an
+        # out-of-band REST refresh on the next call.
+        self.staleness_sec: float = 3.0
+        # Per-ticker cooldown so we don't spam REST when a ticker has gone idle.
+        self._refresh_inflight: dict[str, float] = {}
+        # Per-sid expected next sequence number. Populated by snapshots, verified
+        # on every delta. A mismatch means we dropped a message → trigger resync.
+        self._seq_expected: dict[int, int] = {}
 
     async def handle_ticker(self, msg: dict):
         data = msg.get("msg", {})
         ticker = data.get("market_ticker")
         if not ticker:
             return
+
+        def _to_cents(dollars_val, cents_val):
+            """Prefer *_dollars string; fall back to legacy integer cents field."""
+            if dollars_val is not None:
+                try:
+                    return float(dollars_val) * 100
+                except (TypeError, ValueError):
+                    pass
+            if cents_val is not None:
+                try:
+                    v = float(cents_val)
+                    # Normalize: API may return 0.47 (dollars) or 47 (cents)
+                    return v * 100 if v <= 1.0 else v
+                except (TypeError, ValueError):
+                    pass
+            return None
+
         async with self._lock:
             self._tickers[ticker] = {
-                "yes_bid": data.get("yes_bid"),
-                "yes_ask": data.get("yes_ask"),
-                "no_bid": data.get("no_bid"),
-                "no_ask": data.get("no_ask"),
-                "last_price": data.get("last_price"),
-                "volume": data.get("volume"),
+                "yes_bid": _to_cents(data.get("yes_bid_dollars"), data.get("yes_bid")),
+                "yes_ask": _to_cents(data.get("yes_ask_dollars"), data.get("yes_ask")),
+                "no_bid":  _to_cents(data.get("no_bid_dollars"),  data.get("no_bid")),
+                "no_ask":  _to_cents(data.get("no_ask_dollars"),  data.get("no_ask")),
+                "last_price": _to_cents(data.get("price_dollars"), data.get("last_price")),
+                "volume": data.get("volume_fp") or data.get("volume"),
                 "ts": time.time(),
             }
 
-    async def handle_orderbook_delta(self, msg: dict):
+    async def handle_orderbook_snapshot(self, msg: dict):
+        """
+        Full orderbook snapshot from WS (sent on subscribe and occasionally after
+        gaps). Unlike a delta, this message is authoritative — clear any prior
+        state for the ticker so stale levels don't linger.
+
+        Schema (Kalshi v2, current as of 2026):
+          msg.yes_dollars_fp: list[[price_dollars_str, size_fp_str]]
+          msg.no_dollars_fp:  list[[price_dollars_str, size_fp_str]]
+        """
+        sid = msg.get("sid")
+        seq = msg.get("seq")
         data = msg.get("msg", {})
         ticker = data.get("market_ticker")
         if not ticker:
             return
         async with self._lock:
+            self._orderbooks[ticker] = {"yes_bids": {}, "yes_asks": {}}
+            ob = self._orderbooks[ticker]
+            for price_dollars, size_fp in data.get("yes_dollars_fp", []):
+                try:
+                    price_cents = int(round(float(price_dollars) * 100))
+                    size = float(size_fp)
+                except (TypeError, ValueError):
+                    continue
+                if size > 0:
+                    ob["yes_bids"][price_cents] = size
+            for price_dollars, size_fp in data.get("no_dollars_fp", []):
+                try:
+                    price_cents = int(round(float(price_dollars) * 100))
+                    size = float(size_fp)
+                except (TypeError, ValueError):
+                    continue
+                if size > 0:
+                    ob["yes_asks"][100 - price_cents] = size
+            ob["ts"] = time.time()
+        if sid is not None and seq is not None:
+            # Snapshot is authoritative — reset seq tracking.
+            try:
+                self._seq_expected[int(sid)] = int(seq) + 1
+            except (TypeError, ValueError):
+                pass
+
+    async def handle_orderbook_delta(self, msg: dict):
+        """
+        Single-level signed delta (Kalshi v2 current schema):
+          msg.price_dollars: "0.960"   (string)
+          msg.delta_fp:      "-54.00"  (signed fixed-point string)
+          msg.side:          "yes" | "no"
+        A gap in `seq` per `sid` means we dropped a message — trigger a REST
+        refresh so the cache re-converges on truth.
+        """
+        sid = msg.get("sid")
+        seq = msg.get("seq")
+        data = msg.get("msg", {})
+        ticker = data.get("market_ticker")
+        if not ticker:
+            return
+
+        gap_detected = False
+        if sid is not None and seq is not None:
+            try:
+                sid_i, seq_i = int(sid), int(seq)
+                expected = self._seq_expected.get(sid_i)
+                if expected is not None and seq_i != expected:
+                    gap_detected = True
+                    log.warning(
+                        f"[SEQ GAP] {ticker} sid={sid_i} expected={expected} got={seq_i}"
+                    )
+                self._seq_expected[sid_i] = seq_i + 1
+            except (TypeError, ValueError):
+                pass
+
+        price_dollars = data.get("price_dollars")
+        delta_fp = data.get("delta_fp")
+        side = data.get("side")
+        if price_dollars is None or delta_fp is None or side not in ("yes", "no"):
+            return
+        try:
+            price_cents = int(round(float(price_dollars) * 100))
+            delta = float(delta_fp)
+        except (TypeError, ValueError):
+            return
+
+        async with self._lock:
             if ticker not in self._orderbooks:
                 self._orderbooks[ticker] = {"yes_bids": {}, "yes_asks": {}}
             ob = self._orderbooks[ticker]
-            # Apply delta updates: price → size (0 = remove)
-            for price, size in data.get("yes", []):
-                if size == 0:
-                    ob["yes_bids"].pop(price, None)
-                else:
-                    ob["yes_bids"][price] = size
-            # NO bid levels: YES ask = 100 - no_bid_price
-            for price, size in data.get("no", []):
-                yes_ask_price = 100 - price
-                if size == 0:
-                    ob["yes_asks"].pop(yes_ask_price, None)
-                else:
-                    ob["yes_asks"][yes_ask_price] = size
+            if side == "yes":
+                book = ob["yes_bids"]
+                key = price_cents
+            else:
+                book = ob["yes_asks"]
+                key = 100 - price_cents
+            new_size = book.get(key, 0.0) + delta
+            if new_size <= 0:
+                book.pop(key, None)
+            else:
+                book[key] = new_size
             ob["ts"] = time.time()
+
+        if gap_detected and self.rest_refresh is not None:
+            asyncio.create_task(self.rest_refresh(ticker))
 
     async def get_ticker(self, ticker: str) -> Optional[dict]:
         async with self._lock:
             return self._tickers.get(ticker)
 
     async def get_best_prices(self, ticker: str) -> tuple[Optional[float], Optional[float]]:
-        """Returns (best_yes_bid, best_yes_ask) in cents from the WS orderbook cache.
-        Falls back to ticker-channel snapshot when orderbook has no levels.
+        """Returns (best_yes_bid, best_yes_ask) in cents.
+        Prefers whichever source (orderbook vs ticker snapshot) was updated most
+        recently. When both caches are older than `staleness_sec`, fires an
+        out-of-band REST refresh (non-blocking) so the next call is fresh.
         Returns (None, None) when no data is cached yet."""
         async with self._lock:
             ob = self._orderbooks.get(ticker, {})
             bids = ob.get("yes_bids", {})
             asks = ob.get("yes_asks", {})
+            ob_ts = ob.get("ts")
             best_bid = max(bids.keys(), default=None)
             best_ask = min(asks.keys(), default=None)
             t = self._tickers.get(ticker, {})
-            # Only fall back to ticker snapshot if the orderbook has no levels.
-            # Never coerce None → 0 here; callers decide how to handle missing data.
-            return (
-                float(best_bid) if best_bid is not None else t.get("yes_bid"),
-                float(best_ask) if best_ask is not None else t.get("yes_ask"),
-            )
+            t_ts = t.get("ts")
+
+            # Pick the fresher source when both have data.
+            ob_fresh = (ob_ts is not None) and (best_bid is not None or best_ask is not None)
+            tk_fresh = (t_ts is not None) and (t.get("yes_bid") is not None or t.get("yes_ask") is not None)
+            if ob_fresh and tk_fresh:
+                if (t_ts or 0) > (ob_ts or 0):
+                    bid = t.get("yes_bid") if t.get("yes_bid") is not None else (float(best_bid) if best_bid is not None else None)
+                    ask = t.get("yes_ask") if t.get("yes_ask") is not None else (float(best_ask) if best_ask is not None else None)
+                else:
+                    bid = float(best_bid) if best_bid is not None else t.get("yes_bid")
+                    ask = float(best_ask) if best_ask is not None else t.get("yes_ask")
+            elif ob_fresh:
+                bid = float(best_bid) if best_bid is not None else None
+                ask = float(best_ask) if best_ask is not None else None
+            elif tk_fresh:
+                bid = t.get("yes_bid")
+                ask = t.get("yes_ask")
+            else:
+                bid = None
+                ask = None
+
+            latest_ts = max((ts for ts in (ob_ts, t_ts) if ts is not None), default=None)
+
+        # Out-of-band staleness check (outside the lock to avoid holding it across log/IO).
+        if latest_ts is not None and self.rest_refresh is not None:
+            age = time.time() - latest_ts
+            if age > self.staleness_sec:
+                last = self._refresh_inflight.get(ticker, 0.0)
+                # Debounce: one refresh per ticker per staleness window
+                if time.time() - last > self.staleness_sec:
+                    self._refresh_inflight[ticker] = time.time()
+                    log.warning(f"[STALE CACHE] {ticker} age={age:.1f}s — triggering REST refresh")
+                    asyncio.create_task(self.rest_refresh(ticker))
+
+        return bid, ask
 
     async def get_cache_age(self, ticker: str) -> Optional[float]:
         """Returns seconds since the last WS update for ticker, or None if never seen."""

@@ -101,6 +101,11 @@ class AutoTrader:
         self._entry_retry_cooldown: dict[str, float] = {}
         # cumulative realized P&L per ticker this session
         self._ticker_session_pnl: dict[str, float] = {}
+        # ticker → timestamp when a pure-arb cross was first observed.
+        # Arb only fires if the cross persists for at least two consecutive
+        # scan cycles — filters transient 1-2¢ WS-delta crosses that are
+        # already filled by the time our batch order would reach Kalshi.
+        self._arb_first_seen: dict[str, float] = {}
 
     # ── Main evaluation entry point ──────────────────────────────────────────
 
@@ -511,13 +516,33 @@ class AutoTrader:
         if yes_ask is None or yes_bid is None:
             return None
 
-        yes_cost = int(yes_ask)
-        no_cost = int(100 - yes_bid)
+        # Use round() not int() — floor truncation was inflating apparent profit
+        # by up to 2¢ on sub-cent prices, triggering false arbs on tiny crosses.
+        yes_cost = round(yes_ask)
+        no_cost = round(100 - yes_bid)
         combined = yes_cost + no_cost
         profit_cents = 100 - combined
 
         if profit_cents < self.cfg.min_arb_cents:
+            # No arb — clear any pending confirmation so stale state doesn't linger.
+            self._arb_first_seen.pop(ticker, None)
             return None
+
+        # Persistence guard: require the cross to survive two consecutive scans
+        # (~6s) before acting. The live WS delta stream sees real-time order flow
+        # including transient crosses that the matching engine resolves in <100ms —
+        # far faster than our batch-buy round-trip. Firing on those wastes the
+        # arb budget and blocks directional logic every scan cycle.
+        now = time.time()
+        first_seen = self._arb_first_seen.get(ticker)
+        if first_seen is None:
+            self._arb_first_seen[ticker] = now
+            log.debug(f"{self.tag} ARB CANDIDATE: {ticker} profit={profit_cents}¢ — confirming next scan")
+            return None
+        if now - first_seen < 5.0:
+            return None
+        # Cross persisted — clear candidate and proceed.
+        self._arb_first_seen.pop(ticker, None)
 
         budget = bankroll_usd * self.cfg.budget_pct
         cost_per_pair = combined / 100
@@ -545,9 +570,11 @@ class AutoTrader:
             reason=f"pure_arb profit={profit_cents}¢/pair",
             batch_orders=[
                 {"ticker": ticker, "action": "buy", "side": "yes",
-                 "type": "limit", "count": contracts, "yes_price": yes_cost},
+                 "type": "limit", "count": contracts,
+                 "yes_price_dollars": f"{yes_cost/100:.2f}"},
                 {"ticker": ticker, "action": "buy", "side": "no",
-                 "type": "limit", "count": contracts, "no_price": no_cost},
+                 "type": "limit", "count": contracts,
+                 "no_price_dollars": f"{no_cost/100:.2f}"},
             ],
         )
 

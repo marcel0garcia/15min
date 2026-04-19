@@ -248,10 +248,26 @@ class KalshiClient:
 
     async def get_orderbook(self, ticker: str, depth: int = 10) -> Orderbook:
         data = await self.get(f"/markets/{ticker}/orderbook", depth=depth)
-        ob = data.get("orderbook", {})
-        yes_bids = [(int(p), int(s)) for p, s in ob.get("yes", [])]
-        # NO bid levels represent what NO buyers pay. YES ask = 100 - no_bid.
-        yes_asks = [(100 - int(p), int(s)) for p, s in ob.get("no", [])]
+        # API v2 uses "orderbook_fp" with "yes_dollars"/"no_dollars" string arrays.
+        # Fall back to legacy "orderbook" with integer "yes"/"no" arrays.
+        ob_fp = data.get("orderbook_fp", {})
+        ob_legacy = data.get("orderbook", {})
+
+        if ob_fp:
+            # Current format: [[price_dollars_str, size_fp_str], ...]
+            yes_bids = [
+                (int(round(float(p) * 100)), int(round(float(s))))
+                for p, s in ob_fp.get("yes_dollars", [])
+            ]
+            yes_asks = [
+                (100 - int(round(float(p) * 100)), int(round(float(s))))
+                for p, s in ob_fp.get("no_dollars", [])
+            ]
+        else:
+            # Legacy format: [[price_cents_int, size_int], ...]
+            yes_bids = [(int(p), int(s)) for p, s in ob_legacy.get("yes", [])]
+            yes_asks = [(100 - int(p), int(s)) for p, s in ob_legacy.get("no", [])]
+
         return Orderbook(
             ticker=ticker,
             yes_bids=yes_bids,
@@ -412,6 +428,11 @@ class KalshiClient:
 
     # ── Order management ───────────────────────────────────────────────────
 
+    @staticmethod
+    def _price_dollars(cents: int) -> str:
+        """Convert integer cents (1-99) to Kalshi fixed-point dollars string."""
+        return f"{int(cents) / 100:.2f}"
+
     async def place_order(
         self,
         ticker: str,
@@ -432,10 +453,11 @@ class KalshiClient:
             "count": contracts,
         }
         if order_type == OrderType.LIMIT:
-            if side == Side.YES:
-                body["yes_price"] = price_cents
-            else:
-                body["no_price"] = price_cents
+            # Use the fixed-point `*_dollars` form — matches every other v2
+            # write surface (fills, amend, batch). Legacy integer cent fields
+            # still work but the dollars form is Kalshi's current convention.
+            price_field = "yes_price_dollars" if side == Side.YES else "no_price_dollars"
+            body[price_field] = self._price_dollars(price_cents)
         if client_order_id:
             body["client_order_id"] = client_order_id
         if post_only:
@@ -443,7 +465,6 @@ class KalshiClient:
         if time_in_force:
             body["time_in_force"] = time_in_force.value
         if self_trade_prevention:
-            # v2 spec field is `self_trade_prevention_type`
             body["self_trade_prevention_type"] = self_trade_prevention.value
 
         data = await self.post("/portfolio/orders", body)
@@ -452,17 +473,27 @@ class KalshiClient:
     async def amend_order(
         self,
         order_id: str,
+        ticker: str,
+        side: Side,
         price_cents: Optional[int] = None,
-        side: Optional[Side] = None,
         count: Optional[int] = None,
+        action: str = "buy",
     ) -> Order:
-        """Amend a resting order's price or count in-place (no cancel+replace)."""
-        body: dict = {}
-        if price_cents is not None and side is not None:
-            if side == Side.YES:
-                body["yes_price"] = price_cents
-            else:
-                body["no_price"] = price_cents
+        """Amend a resting order's price or count in-place (no cancel+replace).
+
+        Kalshi requires `ticker`, `side`, and `action` on every amend request —
+        sending only the new price returns HTTP 400. The bot's resting orders
+        are entry buys, so `action` defaults to "buy"; callers amending sell
+        orders must pass action="sell" explicitly.
+        """
+        body: dict = {
+            "ticker": ticker,
+            "side": side.value,
+            "action": action,
+        }
+        if price_cents is not None:
+            price_field = "yes_price_dollars" if side == Side.YES else "no_price_dollars"
+            body[price_field] = self._price_dollars(price_cents)
         if count is not None:
             body["count"] = count
         data = await self.post(f"/portfolio/orders/{order_id}/amend", body)
@@ -501,11 +532,12 @@ class KalshiClient:
             "type": "limit",
             "count": contracts,
             "time_in_force": TimeInForce.IOC.value,
+            # reduce_only: true — exchange-level guarantee that this sell
+            # cannot accidentally open a short if internal position state drifts.
+            "reduce_only": True,
         }
-        if side == Side.YES:
-            body["yes_price"] = price_cents
-        else:
-            body["no_price"] = price_cents
+        price_field = "yes_price_dollars" if side == Side.YES else "no_price_dollars"
+        body[price_field] = self._price_dollars(price_cents)
         data = await self.post("/portfolio/orders", body)
         return self._parse_order(data["order"])
 
@@ -537,14 +569,13 @@ class KalshiClient:
             "type": "limit",
             "count": contracts,
             "time_in_force": TimeInForce.IOC.value,
+            "reduce_only": True,
         }
-        # Submit at the floor (1¢). Kalshi matches against the best available
-        # bid in price-time priority; the `yes_price`/`no_price` field acts as
-        # a price floor, not a fill target.
-        if side == Side.YES:
-            body["yes_price"] = 1
-        else:
-            body["no_price"] = 1
+        # Submit at the floor ($0.01). Kalshi matches against the best available
+        # bid in price-time priority; the `*_price_dollars` field acts as a
+        # price floor, not a fill target.
+        price_field = "yes_price_dollars" if side == Side.YES else "no_price_dollars"
+        body[price_field] = "0.01"
         data = await self.post("/portfolio/orders", body)
         return self._parse_order(data["order"])
 
@@ -573,7 +604,8 @@ class KalshiClient:
                 await self._request(
                     "DELETE",
                     "/portfolio/orders/batched",
-                    json={"ids": [o.order_id for o in chunk]},
+                    # v2 current shape — {"ids": [...]} is deprecated.
+                    json={"orders": [{"order_id": o.order_id} for o in chunk]},
                 )
                 cancelled += len(chunk)
             except Exception as e:

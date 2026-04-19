@@ -45,7 +45,7 @@ from btc15.strategy.personas import Action, AutoTrader
 log = logging.getLogger(__name__)
 
 SCAN_INTERVAL = 3          # seconds between market scans
-OB_REFRESH_INTERVAL = 10   # full orderbook REST snapshot refresh (fills WS gaps)
+OB_REFRESH_INTERVAL = 4    # full orderbook REST snapshot refresh (fills WS gaps)
 POSITION_CHECK = 10        # seconds between position status checks
 
 
@@ -188,8 +188,11 @@ class StrategyEngine:
         )
         self._ws.on("ticker", self._market_cache.handle_ticker)
         self._ws.on("orderbook_delta", self._market_cache.handle_orderbook_delta)
+        self._ws.on("orderbook_snapshot", self._market_cache.handle_orderbook_snapshot)
         self._ws.on("fill", self._handle_fill)
         self._ws.on_reconnect = self._on_ws_reconnect
+        # Lets the cache trigger a REST refresh when data goes stale between ticks.
+        self._market_cache.rest_refresh = self._refresh_ticker_orderbook
         self._tasks.append(asyncio.create_task(self._ws.run(), name="kalshi-ws"))
 
         try:
@@ -338,6 +341,16 @@ class StrategyEngine:
             log.info(f"[WS RECONNECT] Orderbook cache re-seeded for {len(tickers)} markets")
         await self._reconcile_positions()
 
+    async def _refresh_ticker_orderbook(self, ticker: str) -> None:
+        """Single-ticker REST refresh, invoked by the cache when data is stale."""
+        if not self._kalshi:
+            return
+        try:
+            ob = await self._kalshi.get_orderbook(ticker)
+            await self._market_cache.apply_snapshot(ticker, ob)
+        except Exception as e:
+            log.debug(f"[STALE CACHE] REST refresh failed for {ticker}: {e}")
+
     async def _orderbook_refresh_loop(self):
         """
         Periodically fetch full REST orderbook snapshots for all watched markets.
@@ -440,6 +453,10 @@ class StrategyEngine:
 
         signals_snapshot = {}
         markets_snapshot = []
+        # Accumulate live WS prices keyed by ticker so we can refresh position
+        # PnL display at the end of each scan — avoids waiting for the 10s
+        # _position_loop and stops using stale REST market prices for mark-to-market.
+        live_prices: dict[str, tuple[float, float]] = {}  # ticker → (yes_bid, yes_ask)
 
         for market in markets:
             # Compute seconds_remaining from local clock (not stale REST value)
@@ -484,6 +501,10 @@ class StrategyEngine:
                 if fresh_ob.best_yes_ask is not None:
                     trade_ask = fresh_ob.best_yes_ask
 
+            # Stash live prices for position PnL refresh below.
+            if yes_bid is not None or yes_ask is not None:
+                live_prices[market.ticker] = (yes_bid or 0.0, yes_ask or 0.0)
+
             # Open Markets snapshot — terminal display uses display prices.
             markets_snapshot.append({
                 "ticker": market.ticker,
@@ -495,10 +516,11 @@ class StrategyEngine:
                 "status": market.status.value,
             })
 
-            # Strike selection: skip deep ITM/OTM contracts where there's no
-            # edge. A YES contract at 95¢ is correctly priced — the model
-            # can't meaningfully disagree. Focus capital on 15–85¢ range.
-            # Always evaluate markets where we already hold a position (exits).
+            # Determine whether this market is in the entry price window.
+            # Deep ITM/OTM contracts are excluded from new entries — the model
+            # can't add edge there — but we still run the model and show signals
+            # so the UI never goes blank mid-session (e.g. after a profit-take
+            # pushes the contract above 85¢).
             has_position = market.ticker in self.autotrader.positions
             mid_price = None
             if yes_bid and yes_ask:
@@ -508,15 +530,17 @@ class StrategyEngine:
             elif yes_ask:
                 mid_price = yes_ask
             max_entry = getattr(self.cfg.trader, "max_entry_price_cents", 85)
-            if (mid_price is not None
-                    and (mid_price > max_entry or mid_price < self.cfg.trader.min_entry_price_cents)
-                    and not has_position):
-                continue
+            in_entry_window = (
+                mid_price is None
+                or has_position
+                or self.cfg.trader.min_entry_price_cents <= mid_price <= max_entry
+            )
 
             # Orderbook depth for imbalance signal
             bid_depth, ask_depth = await self._market_cache.get_orderbook_depth(market.ticker)
 
-            # Run ensemble model using display prices (last known, never zeroed)
+            # Run ensemble model for all tradeable markets — display uses this
+            # regardless of the entry window check above.
             output = self.ensemble.predict(
                 ticker=market.ticker,
                 strike=market.strike_price,
@@ -542,13 +566,14 @@ class StrategyEngine:
                 "edge_no": round(output.edge_no or 0, 3),
                 "signal": output.signal_str,
                 "kalshi_price": round(((yes_bid or 0) + (yes_ask or 0)) / 2, 1),
-                "tradeable": tradeable,
+                "tradeable": tradeable and in_entry_window,
                 "ob_bid_depth": round(bid_depth, 1),
                 "ob_ask_depth": round(ask_depth, 1),
             }
 
-            # Dispatch to AutoTrader (evaluation + action generation)
-            if self.cfg.strategy.auto_trade:
+            # Dispatch to AutoTrader only when in the entry price window
+            # (or holding a position that needs exit evaluation).
+            if self.cfg.strategy.auto_trade and in_entry_window:
                 ob_info = {"yes_bid": trade_bid, "yes_ask": trade_ask}
                 mkt_info = {
                     "seconds_left": round(secs),
@@ -576,10 +601,41 @@ class StrategyEngine:
                         market.strike_price, current_price, secs, annual_vol, bars
                     )
 
-        if signals_snapshot:
-            self.state["signals"] = signals_snapshot
+        # Always overwrite signals — even when empty (all markets filtered by price
+        # range). The old guard `if signals_snapshot:` left the pane frozen on stale
+        # T-left values whenever BTC moved all contracts deep ITM/OTM.
+        self.state["signals"] = signals_snapshot
         if markets_snapshot:
             self.state["open_markets"] = markets_snapshot
+
+        # Refresh position PnL using the live WS prices computed this scan.
+        # _check_positions runs every 10s and uses stale REST prices — this
+        # gives the Positions panel the same 3s refresh rate as everything else.
+        if self.autotrader.positions and live_prices:
+            refreshed = []
+            for ticker, entries in self.autotrader.positions.items():
+                wb, wa = live_prices.get(ticker, (0.0, 0.0))
+                for entry in entries:
+                    side = entry["side"]
+                    if side == "yes":
+                        bid = wb
+                    else:
+                        bid = max(0.0, 100.0 - wa) if wa else 0.0
+                    cost = round(entry["contracts"] * entry["entry_cents"] / 100, 2)
+                    value = round(entry["contracts"] * bid / 100, 2)
+                    refreshed.append({
+                        "ticker": ticker,
+                        "side": side,
+                        "contracts": entry["contracts"],
+                        "entry_cents": entry["entry_cents"],
+                        "cost": cost,
+                        "value": value,
+                        "pnl": round(value - cost, 2),
+                        "mode": entry.get("mode", "directional"),
+                        "source": "auto",
+                    })
+            if refreshed:
+                self.state["open_positions"] = refreshed
 
     # ── Action execution ──────────────────────────────────────────────────────
 
@@ -949,8 +1005,9 @@ class StrategyEngine:
                     log.debug(f"[AUTO] AMEND: {action.order_id[:8]} → {action.price_cents}¢")
                     await self._kalshi.amend_order(
                         action.order_id,
+                        ticker=action.ticker,
+                        side=Side(action.side),
                         price_cents=action.price_cents,
-                        side=Side(action.side) if action.side else None,
                     )
                     if action.order_id in self.autotrader.resting_orders:
                         self.autotrader.resting_orders[action.order_id]["price"] = action.price_cents

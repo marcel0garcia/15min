@@ -72,7 +72,7 @@ trader:
   # but is harder to clear — old 0.55 admitted near-neutral signals.
   min_confidence: 0.45            # minimum model confidence
   min_edge: 0.05                  # minimum edge over Kalshi mid-price
-  min_entry_price_cents: 10       # skip contracts already priced below 10¢
+  min_entry_price_cents: 15       # skip contracts already priced below 10¢
   max_entry_price_cents: 72       # skip deep-ITM contracts. Tightened from 85:
                                   # post-mortem on 12APR06:15 showed 67-82¢ entries
                                   # accounted for most losses in chop.
@@ -126,10 +126,10 @@ trader:
   # Pyramiding — add to winning positions when model still agrees
   pyramid_enabled: true
   pyramid_min_pnl_pct: 0.10       # position must be ≥10% profitable
-  pyramid_min_confidence: 0.55
-  pyramid_min_edge: 0.05
+  pyramid_min_confidence: 0.60
+  pyramid_min_edge: 0.10
   pyramid_min_seconds: 300         # ≥5 min left to pyramid
-  pyramid_max_adds: 1              # max 1 add per position
+  pyramid_max_adds: 2              # max 1 add per position
 
   # Stop/whipsaw cooldowns — the 12APR06:15 session had one market
   # take 4 losing trades in 10 minutes; these prevent re-entering chop.
@@ -154,8 +154,8 @@ trader:
 
 risk:
   max_open_positions: 3           # 3 × $12 = $36 max simultaneous exposure (36%)
-  max_trade_usd: 12.00            # matches trader.max_single_trade_usd
-  max_position_per_market_usd: 12.00
+  max_trade_usd: 20.00            # matches trader.max_single_trade_usd
+  max_position_per_market_usd: 20.00
   daily_loss_limit_usd: 15.00     # stop trading if down $15 on the day (15% of $100)
   kelly_fraction: 0.25
   min_trade_usd: 0.50             # Kalshi practical minimum
