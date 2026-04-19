@@ -183,8 +183,9 @@ PnL CHART — Session cumulative P&L history
   COMMANDS
 ================================================================================
 
-  ./run.sh                          Start bot (paper + signal-only)
-   ./run.sh run --trade --live       Live auto-trading (confirm prompt)
+  ./run.sh                          Start bot (signal-only)
+  ./run.sh run --trade              Live paper-trading
+  ./run.sh run --trade --live       Live auto-trading (confirm prompt)
   ./run.sh bootstrap                Train ML model from 6 months of history
   ./run.sh bootstrap --months 24    Train from 2 years of history
   ./run.sh markets                  List open KXBTC markets
