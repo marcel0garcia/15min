@@ -165,7 +165,8 @@ class StrategyEngine:
         # _settled_tickers: suppresses reconcile adoption for 60s after settlement to avoid
         #   re-adopting positions still visible in the Kalshi API due to settlement lag
         self._reconcile_lock = asyncio.Lock()
-        self._settled_tickers: dict[str, float] = {}  # ticker → epoch when settled
+        self._settled_tickers: dict[str, float] = {}   # ticker → epoch when settled
+        self._recently_exited: dict[str, float] = {}   # ticker → epoch when we last exited (exit lag guard)
         # Tracks how many _check_settlements cycles a ticker has been past close_time
         # without Kalshi publishing the official result yet (API lag is normal 5–30s).
         self._settlement_pending_count: dict[str, int] = {}
@@ -979,6 +980,7 @@ class StrategyEngine:
                     break
 
             self.autotrader.record_exit(action.ticker, pnl, side=action.side)
+            self._recently_exited[action.ticker] = time.time()
             self.risk.record_close(action.ticker, won=(pnl > 0), pnl=pnl)
             self._log_trade(
                 action.ticker, f"{action.side}_exit",
@@ -1059,7 +1061,8 @@ class StrategyEngine:
         elif action.action_type == "batch_buy":
             # Risk gate each leg
             for bo in action.batch_orders:
-                price = bo.get("yes_price") or bo.get("no_price", 50)
+                _pd = bo.get("yes_price_dollars") or bo.get("no_price_dollars")
+                price = int(round(float(_pd) * 100)) if _pd else (bo.get("yes_price") or bo.get("no_price") or 50)
                 leg_cost = bo.get("count", 0) * price / 100
                 if leg_cost > self.cfg.risk.max_trade_usd:
                     log.info(
@@ -1105,7 +1108,8 @@ class StrategyEngine:
                 batch_id = f"T{uuid.uuid4().hex[:8].upper()}"
                 for bo in action.batch_orders:
                     side_str = bo["side"]
-                    price = bo.get("yes_price") or bo.get("no_price", 50)
+                    _pd = bo.get("yes_price_dollars") or bo.get("no_price_dollars")
+                    price = int(round(float(_pd) * 100)) if _pd else (bo.get("yes_price") or bo.get("no_price") or 50)
                     trade_id = f"{batch_id}-{side_str[:1].upper()}"
                     self.autotrader.record_fill(
                         action.ticker, side_str, bo["count"], price, trade_id, mode="arb"
@@ -1146,11 +1150,15 @@ class StrategyEngine:
             return  # another reconcile is already running — skip this cycle
         async with self._reconcile_lock:
             try:
-                # Clean up stale settled-ticker entries
+                # Clean up stale guard entries
                 now_t = time.time()
                 self._settled_tickers = {
                     t: ts for t, ts in self._settled_tickers.items()
                     if now_t - ts < 120
+                }
+                self._recently_exited = {
+                    t: ts for t, ts in self._recently_exited.items()
+                    if now_t - ts < 60
                 }
 
                 # Step 1: reconcile resting orders (fills missed during WS gaps)
@@ -1176,6 +1184,16 @@ class StrategyEngine:
                         log.debug(
                             f"[RECONCILE] Skipping {ticker} — settled "
                             f"{now_t - self._settled_tickers[ticker]:.0f}s ago (API lag guard)"
+                        )
+                        continue
+
+                    # Skip tickers we just exited — Kalshi API lags ~10-30s before removing
+                    # a position from get_positions() after a sell. Without this guard the
+                    # reconciler re-adopts the just-cleared contracts as a phantom gap.
+                    if ticker in self._recently_exited:
+                        age = now_t - self._recently_exited[ticker]
+                        log.debug(
+                            f"[RECONCILE] Skipping {ticker} — exited {age:.0f}s ago (exit lag guard)"
                         )
                         continue
 
@@ -1261,6 +1279,16 @@ class StrategyEngine:
                 log.warning(f"[RECONCILE] Failed to fetch orders for {ticker}: {e}")
 
         for oid, info in resting.items():
+            # Bug 3: skip null/empty order IDs from edge-case arb pair registration
+            if not oid:
+                continue
+            # Bug 1: if this order was removed from resting_orders during the get_orders() await
+            # (e.g. by GTC→IOC escalation that also called record_fill), skip it here to
+            # prevent recording a second fill for the same order → phantom position inflation.
+            if oid not in self.autotrader.resting_orders:
+                log.debug(f"[RECONCILE] Order {oid[:8]} removed during reconcile await — skipping")
+                continue
+
             ticker = info["ticker"]
             side_str = info["side"]
             price = info["price"]

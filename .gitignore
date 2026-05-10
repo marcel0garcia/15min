@@ -10,6 +10,10 @@ bayerische.txt
 data/
 logs/
 
+# ── Local analysis artifacts (regeneratable via analyze_session.py) ───────
+session_analysis.json
+session_compare.png
+
 # ── Personal documents ────────────────────────────────────────────────────
 darules.pdf
 

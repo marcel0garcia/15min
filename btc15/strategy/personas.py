@@ -106,6 +106,10 @@ class AutoTrader:
         # scan cycles — filters transient 1-2¢ WS-delta crosses that are
         # already filled by the time our batch order would reach Kalshi.
         self._arb_first_seen: dict[str, float] = {}
+        # ticker → number of reversal exits on this ticker this session.
+        # Blocks pyramiding after ≥2 reversals — a choppy market that has
+        # flipped us twice is not a market to double down in.
+        self._reversal_count: dict[str, int] = {}
 
     # ── Main evaluation entry point ──────────────────────────────────────────
 
@@ -338,10 +342,11 @@ class AutoTrader:
                     (output.edge_no if side == "yes" else output.edge_yes) or 0
                 )
                 if opp_edge >= self.cfg.reversal_min_edge:
+                    self._reversal_count[ticker] = self._reversal_count.get(ticker, 0) + 1
                     log.info(
                         f"{self.tag} REVERSAL EXIT: {ticker} {side.upper()} | "
                         f"pnl={pnl_pct:+.1%} → flip to {output.recommended_side.upper()} "
-                        f"(edge={opp_edge:+.1%})"
+                        f"(edge={opp_edge:+.1%}) | reversals_this_market={self._reversal_count[ticker]}"
                     )
                     actions.append(Action(
                         action_type="sell", ticker=ticker, side=side,
@@ -454,6 +459,15 @@ class AutoTrader:
         if not positions:
             return False
 
+        # Block pyramiding on a ticker that has reversed ≥2 times — the market is
+        # chopping and adding size only deepens the hole.
+        rev_count = self._reversal_count.get(ticker, 0)
+        if rev_count >= 2:
+            log.debug(
+                f"{self.tag} PYRAMID BLOCKED: {ticker} — {rev_count} reversals already on this market"
+            )
+            return False
+
         for pos in positions:
             if pos.get("mode") in ("arb", "mm_yes", "mm_no", "mm"):
                 continue  # don't pyramid arb/MM positions
@@ -463,6 +477,12 @@ class AutoTrader:
             adds = pos.get("pyramid_adds", 0)
 
             if adds >= max_adds:
+                continue
+
+            # In the early window (>prime_min_seconds remaining), cap at 1 pyramid add
+            # regardless of max_adds. Don't compound before the initial position is proven.
+            in_early = secs > getattr(self.cfg, "prime_window_min_seconds", 180)
+            if in_early and adds >= 1:
                 continue
 
             if entry <= 0:
@@ -728,6 +748,18 @@ class AutoTrader:
         side = output.recommended_side
         edge = output.edge_yes if side == "yes" else output.edge_no
         if edge is None or edge < self.cfg.min_edge:
+            return None
+
+        # Suppress high-edge, low-confidence entries: when the model shows extreme
+        # edge (>25%) but confidence is near-neutral (<52%), Kalshi's market makers
+        # are pricing a strong directional move our model can't confirm. This exact
+        # pattern (e.g. edge=37.7%, conf=50%) was the largest single-session loss
+        # driver in 21APR09:02 — the market knew; the model was late/wrong.
+        if not is_reversal and edge > 0.25 and output.confidence < 0.52:
+            log.info(
+                f"{self.tag} ENTRY SUPPRESSED: {ticker} {side.upper()} "
+                f"conf={output.confidence:.0%} edge={edge:+.1%} — high-edge/low-conf skip"
+            )
             return None
 
         # Reversal re-entry orderbook confirmation.
