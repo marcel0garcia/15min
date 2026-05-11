@@ -1661,9 +1661,14 @@ class StrategyEngine:
                         available = round(bal.available_usd, 2)
                         portfolio = round(bal.portfolio_usd, 2)
                         start_bal = self.state.get("session_start_balance")
-                        true_pnl = round(
-                            (available + portfolio) - start_bal, 2
-                        ) if start_bal is not None else None
+                        # In paper mode, Kalshi balance never changes (trades are simulated
+                        # locally), so true_pnl from the API would always read ~$0 and
+                        # override the accurate internal risk.daily_pnl. Leave it None so
+                        # the dashboard falls back to risk.daily_pnl instead.
+                        if not self.cfg.strategy.paper_trade and start_bal is not None:
+                            true_pnl = round((available + portfolio) - start_bal, 2)
+                        else:
+                            true_pnl = None
                         self.state["balance"] = {
                             "available": available,
                             "portfolio": portfolio,
