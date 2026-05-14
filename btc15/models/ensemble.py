@@ -367,7 +367,12 @@ class EnsembleModel:
         closes = [b.close for b in bars[-30:]]
         signals = compute_signals(closes)
 
-        moneyness = math.log(current_price / strike)
+        # Guard against degenerate markets (strike=0 or price=0 from a stale/malformed snapshot).
+        # Matches the same guard used in _bsm_prob_yes above.
+        if strike > 0 and current_price > 0:
+            moneyness = math.log(current_price / strike)
+        else:
+            moneyness = 0.0
         t_remaining = seconds_remaining / 900  # normalized 0–1
 
         return [

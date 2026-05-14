@@ -1647,7 +1647,7 @@ class StrategyEngine:
 
                 # Sample P&L history every 10s
                 if int(time.time()) % 10 == 0:
-                    pnl_now = round(risk_summary.get("daily_pnl", 0.0), 3)
+                    pnl_now = round(risk_summary.get("session_pnl", 0.0), 3)
                     ts_now = datetime.now(timezone.utc).strftime("%H:%M")
                     history = self.state["pnl_history"]
                     if not history or history[-1][1] != pnl_now:
@@ -1663,8 +1663,8 @@ class StrategyEngine:
                         start_bal = self.state.get("session_start_balance")
                         # In paper mode, Kalshi balance never changes (trades are simulated
                         # locally), so true_pnl from the API would always read ~$0 and
-                        # override the accurate internal risk.daily_pnl. Leave it None so
-                        # the dashboard falls back to risk.daily_pnl instead.
+                        # override the accurate internal risk.session_pnl. Leave it None so
+                        # the dashboard falls back to risk.session_pnl instead.
                         if not self.cfg.strategy.paper_trade and start_bal is not None:
                             true_pnl = round((available + portfolio) - start_bal, 2)
                         else:

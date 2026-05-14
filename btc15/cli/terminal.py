@@ -198,9 +198,9 @@ def build_risk_panel(state: dict) -> Panel:
     balance = state.get("balance", {})
 
     # Single source of truth: account-level PnL from Kalshi (includes fees + unrealized).
-    # Falls back to internal realized sum while the first 30s balance refresh is pending.
+    # Falls back to internal session-realized sum while the first 30s balance refresh is pending.
     true_pnl = balance.get("true_pnl") if balance else None
-    pnl = true_pnl if true_pnl is not None else risk.get("daily_pnl", 0.0)
+    pnl = true_pnl if true_pnl is not None else risk.get("session_pnl", 0.0)
     pnl_color = _pnl_color(pnl)
 
     lines = []
@@ -208,7 +208,7 @@ def build_risk_panel(state: dict) -> Panel:
         lines.append(f"[bold]Available:[/bold] [bright_cyan]${balance.get('available', 0):,.2f}[/bright_cyan]")
         lines.append(f"[bold]Portfolio:[/bold] ${balance.get('portfolio', 0):,.2f}")
     lines.append(f"[bold]PnL:[/bold] [{pnl_color}][bold]${pnl:+.2f}[/bold][/{pnl_color}]")
-    lines.append(f"[bold]Trades:[/bold] {risk.get('daily_trades', 0)}")
+    lines.append(f"[bold]Trades:[/bold] {risk.get('session_trades', 0)}")
     lines.append(f"[bold]Open:[/bold] {risk.get('open_positions', 0)}")
 
     wr = risk.get("win_rate")
@@ -411,9 +411,9 @@ def build_pnl_chart(state: dict) -> Panel:
     balance = state.get("balance", {})
 
     # Same single source of truth as build_risk_panel:
-    # account-level PnL when available, internal realized sum as fallback.
+    # account-level PnL when available, internal session-realized sum as fallback.
     true_pnl = balance.get("true_pnl") if balance else None
-    pnl_ref = true_pnl if true_pnl is not None else risk.get("daily_pnl", 0.0)
+    pnl_ref = true_pnl if true_pnl is not None else risk.get("session_pnl", 0.0)
     pnl_c = "bright_green" if pnl_ref >= 0 else "bright_red"
 
     # Build cumulative P&L series from closed trades in the log

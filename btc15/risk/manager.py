@@ -27,6 +27,11 @@ class RiskState:
     """Live risk metrics."""
     daily_pnl: float = 0.0
     daily_trades: int = 0
+    # Session-scoped counters: persist across midnight rollovers; reset only on
+    # bot restart. Used for the dashboard so long-running sessions don't appear
+    # to "lose" their P&L and trade count overnight.
+    session_pnl: float = 0.0
+    session_trades: int = 0
     open_positions: int = 0
     total_exposure_usd: float = 0.0
     recent_trades: deque = field(default_factory=lambda: deque(maxlen=100))
@@ -133,6 +138,7 @@ class RiskManager:
         self.state.open_positions += 1
         self.state.total_exposure_usd += cost
         self.state.daily_trades += 1
+        self.state.session_trades += 1
         record = TradeRecord(
             ticker=ticker,
             side=side,
@@ -152,6 +158,7 @@ class RiskManager:
     def record_close(self, ticker: str, won: bool, pnl: float, persona: Optional[str] = None):
         self.state.open_positions = max(0, self.state.open_positions - 1)
         self.state.daily_pnl += pnl
+        self.state.session_pnl += pnl
         if persona:
             self._persona_pnl[persona] = self._persona_pnl.get(persona, 0.0) + pnl
         # Update the most recent trade record for this ticker and release exposure
@@ -190,6 +197,8 @@ class RiskManager:
             "halt_reason": self.state.halt_reason,
             "daily_pnl": self.state.daily_pnl,
             "daily_trades": self.state.daily_trades,
+            "session_pnl": self.state.session_pnl,
+            "session_trades": self.state.session_trades,
             "open_positions": self.state.open_positions,
             "total_exposure": self.state.total_exposure_usd,
             "win_rate": self.state.win_rate,

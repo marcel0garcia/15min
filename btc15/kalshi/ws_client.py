@@ -66,7 +66,13 @@ class KalshiWebSocket:
             "cmd": "subscribe",
             "params": {"channels": channels, "market_tickers": tickers},
         }
-        await self._ws.send(json.dumps(msg))
+        try:
+            await self._ws.send(json.dumps(msg))
+        except ConnectionClosed:
+            # Connection dropped mid-send; the reconnect path in _connect_and_listen
+            # will resubscribe to self._subscribed_tickers when it reconnects.
+            log.debug(f"Skipped subscribe for {tickers} — WS reconnecting")
+            return
         log.debug(f"Subscribed to {channels} for {tickers}")
 
     async def run(self):
@@ -121,37 +127,42 @@ class KalshiWebSocket:
                 "Check your .env file."
             )
 
-        async with websockets.connect(
-            url,
-            additional_headers=extra_headers,
-            ping_interval=20,
-            ping_timeout=10,
-        ) as ws:
-            self._ws = ws
-            self._reconnect_delay = 2.0
-            self._connection_count += 1
-            log.info(f"Kalshi WebSocket connected (connection #{self._connection_count})")
+        try:
+            async with websockets.connect(
+                url,
+                additional_headers=extra_headers,
+                ping_interval=20,
+                ping_timeout=10,
+            ) as ws:
+                self._ws = ws
+                self._reconnect_delay = 2.0
+                self._connection_count += 1
+                log.info(f"Kalshi WebSocket connected (connection #{self._connection_count})")
 
-            # On reconnects, notify the engine so it can reconcile resting orders
-            # that may have filled during the disconnect window.
-            if self._connection_count > 1 and self.on_reconnect:
-                asyncio.create_task(self.on_reconnect())
+                # On reconnects, notify the engine so it can reconcile resting orders
+                # that may have filled during the disconnect window.
+                if self._connection_count > 1 and self.on_reconnect:
+                    asyncio.create_task(self.on_reconnect())
 
-            # Re-subscribe to any previously subscribed tickers
-            if self._subscribed_tickers:
-                await self._send_subscribe(
-                    list(self._subscribed_tickers),
-                    ["orderbook_delta", "ticker", "fill"],
-                )
+                # Re-subscribe to any previously subscribed tickers
+                if self._subscribed_tickers:
+                    await self._send_subscribe(
+                        list(self._subscribed_tickers),
+                        ["orderbook_delta", "ticker", "fill"],
+                    )
 
-            async for raw in ws:
-                try:
-                    msg = json.loads(raw)
-                    await self._dispatch(msg)
-                except json.JSONDecodeError as e:
-                    log.warning(f"WS JSON error: {e}")
-                except Exception as e:
-                    log.error(f"WS dispatch error: {e}", exc_info=True)
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                        await self._dispatch(msg)
+                    except json.JSONDecodeError as e:
+                        log.warning(f"WS JSON error: {e}")
+                    except Exception as e:
+                        log.error(f"WS dispatch error: {e}", exc_info=True)
+        finally:
+            # Clear the stale reference so subscribe() doesn't try to send on a
+            # closed socket between disconnect and the next reconnect.
+            self._ws = None
 
     async def _dispatch(self, msg: dict):
         msg_type = msg.get("type", "")
