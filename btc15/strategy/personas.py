@@ -101,6 +101,13 @@ class AutoTrader:
         self._entry_retry_cooldown: dict[str, float] = {}
         # cumulative realized P&L per ticker this session
         self._ticker_session_pnl: dict[str, float] = {}
+        # ticker → timestamp when a loss_cut condition was first detected.
+        # Empirically (Friday paper data, 29 SO loss_cut events): 83% of cuts
+        # were panic-flushes that recovered within 30s. We require the cut
+        # condition to persist across a runway-scaled cool-off window before
+        # firing. Cleared whenever the model returns to agreeing OR pnl
+        # recovers above threshold. Does NOT apply to emergency_stop (-65%).
+        self._pending_loss_cut: dict[str, float] = {}
         # ticker → timestamp when a pure-arb cross was first observed.
         # Arb only fires if the cross persists for at least two consecutive
         # scan cycles — filters transient 1-2¢ WS-delta crosses that are
@@ -318,10 +325,11 @@ class AutoTrader:
             pnl_pct = (current_bid - entry) / entry  # -1.0 when bid=0 (full loss)
 
             # Emergency stop: fire immediately at any time if loss exceeds threshold.
-            # Bypasses the time gate — a 65%+ loss is unrecoverable regardless of
-            # how much time remains.
+            # Bypasses the time gate AND the cool-off below — a 65%+ loss is
+            # unrecoverable regardless of how much time remains.
             if pnl_pct <= -self.cfg.emergency_stop_pct:
                 self._stop_cooldown[ticker] = time.time()
+                self._pending_loss_cut.pop(ticker, None)
                 log.warning(
                     f"{self.tag} EMERGENCY STOP: {ticker} {side.upper()} | "
                     f"pnl={pnl_pct:+.1%} (threshold={-self.cfg.emergency_stop_pct:.0%}) | "
@@ -343,6 +351,7 @@ class AutoTrader:
                 )
                 if opp_edge >= self.cfg.reversal_min_edge:
                     self._reversal_count[ticker] = self._reversal_count.get(ticker, 0) + 1
+                    self._pending_loss_cut.pop(ticker, None)
                     log.info(
                         f"{self.tag} REVERSAL EXIT: {ticker} {side.upper()} | "
                         f"pnl={pnl_pct:+.1%} → flip to {output.recommended_side.upper()} "
@@ -367,6 +376,7 @@ class AutoTrader:
                 pt_bid_thresh, pt_pnl_thresh = 80, 0.20   # <3 min: bank it
 
             if current_bid >= pt_bid_thresh and secs > 20 and pnl_pct >= pt_pnl_thresh:
+                self._pending_loss_cut.pop(ticker, None)
                 log.info(
                     f"{self.tag} PROFIT TAKE: {ticker} {side.upper()} | "
                     f"bid={current_bid:.0f}¢ pnl={pnl_pct:+.1%} | {secs:.0f}s left "
@@ -379,23 +389,39 @@ class AutoTrader:
                 ))
                 continue
 
-            # Rule 3: Time-decayed loss cut — suppressed when model agrees.
+            # Rule 3: Time-decayed loss cut — suppressed when model agrees,
+            # gated by a runway-scaled cool-off when model disagrees.
             #
             # Near settlement, binary prices swing wildly on thin liquidity.
             # A NO contract can dip to 35¢ on a single BTC tick toward strike,
-            # then settle at 100¢ when BTC doesn't actually cross. The old
-            # rule cut these positions on the dip. Now: if the model still
-            # recommends our side with ≥40% confidence, suppress the time-based
-            # stop and hold through the noise. Only emergency stop (-65%) and
-            # reversal fire unconditionally.
+            # then settle at 100¢ when BTC doesn't actually cross.
+            #
+            # Suppression: model recommends our side with ≥40% confidence OR
+            # our side still shows ≥+3% edge at current prices. The edge-floor
+            # disjunction prevents a confidence-cliff effect (model at 38% conf
+            # but +5% edge on our side is still saying we're ahead).
+            #
+            # Cool-off: empirically (Friday paper data, 29 SO loss_cut events)
+            # 83% of stops were panic-flushes that recovered within 30s. When
+            # there's runway, require the cut condition to persist across a
+            # short cool-off window before firing. Wait scales with runway:
+            # more time left = more patience; <240s = no wait, decisive cut.
+            our_side_edge = output.edge_yes if side == "yes" else output.edge_no
+            our_side_edge = float(our_side_edge) if our_side_edge is not None else 0.0
             model_agrees = (
-                output.recommended_side is not None
-                and output.recommended_side == side
-                and output.confidence >= 0.40
+                (output.recommended_side == side and output.confidence >= 0.40)
+                or our_side_edge >= 0.03
             )
 
+            # Snapshot model context for log lines (used in both branches).
+            rec = output.recommended_side or "none"
+            ctx = (f"rec={rec} conf={output.confidence:.0%} "
+                   f"edge_our={our_side_edge:+.1%}")
+
             if model_agrees:
-                # Log when we would have fired — visibility into suppression
+                # Suppression: model still likes our side. Clear any pending cut
+                # — it would only have been there from a brief disagreement window.
+                self._pending_loss_cut.pop(ticker, None)
                 if secs > 480:
                     would_thresh = -0.55
                 elif secs > 240:
@@ -406,7 +432,7 @@ class AutoTrader:
                     log.info(
                         f"{self.tag} STOP SUPPRESSED: {ticker} {side.upper()} | "
                         f"pnl={pnl_pct:+.1%} (would cut at {would_thresh:+.0%}) | "
-                        f"model agrees conf={output.confidence:.0%} — holding"
+                        f"{ctx} — holding"
                     )
             else:
                 if secs > 480:
@@ -415,18 +441,54 @@ class AutoTrader:
                     stop_thresh = -0.40  # 4-8min: standard
                 else:
                     stop_thresh = -0.25  # <4min: cut anything decisively underwater
+
                 if pnl_pct <= stop_thresh:
+                    # Cool-off: more runway → more confirmation required.
+                    if secs > 480:
+                        cool_off_secs = 6.0
+                    elif secs > 240:
+                        cool_off_secs = 3.0
+                    else:
+                        cool_off_secs = 0.0  # final 4 min: no wait
+
+                    now = time.time()
+                    pending_ts = self._pending_loss_cut.get(ticker)
+
+                    if cool_off_secs > 0 and pending_ts is None:
+                        # First detection — arm pending, don't cut yet.
+                        self._pending_loss_cut[ticker] = now
+                        log.info(
+                            f"{self.tag} LOSS CUT PENDING ({cool_off_secs:.0f}s cool-off): "
+                            f"{ticker} {side.upper()} | "
+                            f"pnl={pnl_pct:+.1%} thresh={stop_thresh:+.0%} | "
+                            f"{secs:.0f}s left | {ctx}"
+                        )
+                        continue
+                    if cool_off_secs > 0 and pending_ts is not None \
+                            and (now - pending_ts) < cool_off_secs:
+                        # Still inside cool-off window — wait for next scan.
+                        # (Don't log every tick to avoid spam; the PENDING line above
+                        # marks the start.)
+                        continue
+
+                    # Cool-off elapsed (or zero), and the cut condition is still
+                    # true on this tick → fire.
+                    self._pending_loss_cut.pop(ticker, None)
                     self._stop_cooldown[ticker] = time.time()
+                    cool_str = f" (after {cool_off_secs:.0f}s cool-off)" if cool_off_secs > 0 else ""
                     log.info(
-                        f"{self.tag} LOSS CUT: {ticker} {side.upper()} | "
+                        f"{self.tag} LOSS CUT{cool_str}: {ticker} {side.upper()} | "
                         f"pnl={pnl_pct:+.1%} thresh={stop_thresh:+.0%} | "
-                        f"{secs:.0f}s left | model disagrees/neutral"
+                        f"{secs:.0f}s left | {ctx}"
                     )
                     actions.append(Action(
                         action_type="sell", ticker=ticker, side=side,
                         contracts=pos["contracts"], price_cents=int(current_bid),
                         reason=f"loss_cut pnl={pnl_pct:+.1%} {secs:.0f}s left",
                     ))
+                else:
+                    # pnl recovered above stop threshold — clear any pending cut.
+                    self._pending_loss_cut.pop(ticker, None)
 
             # Rule 4: Hold to settlement (no trailing stop, no profit decay)
 
