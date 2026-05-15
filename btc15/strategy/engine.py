@@ -167,6 +167,16 @@ class StrategyEngine:
         self._reconcile_lock = asyncio.Lock()
         self._settled_tickers: dict[str, float] = {}   # ticker → epoch when settled
         self._recently_exited: dict[str, float] = {}   # ticker → epoch when we last exited (exit lag guard)
+        # _recently_placed: ticker → epoch when we last sent place_order. Suppresses
+        # reconciler for ~15s after each entry to close the race where:
+        #   1. Bot awaits place_order (IOC) — yields to event loop
+        #   2. Order fills on Kalshi within ms
+        #   3. Reconciler runs in this window — sees gap, adopts as ghost
+        #   4. place_order returns, bot calls record_fill — same fill recorded twice
+        # GTC orders are already covered via resting_orders; this guards IOC and
+        # the GTC→IOC escalation path that produced the duplicate "reconciled_gap"
+        # rows in the live trade log.
+        self._recently_placed: dict[str, float] = {}
         # Tracks how many _check_settlements cycles a ticker has been past close_time
         # without Kalshi publishing the official result yet (API lag is normal 5–30s).
         self._settlement_pending_count: dict[str, int] = {}
@@ -282,6 +292,7 @@ class StrategyEngine:
             )
 
             if not paper:
+                self._recently_placed[ticker] = time.time()
                 order = await self._kalshi.place_order(
                     ticker=ticker, side=side_enum, contracts=contracts,
                     price_cents=price_cents, order_type=OrderType.LIMIT,
@@ -688,6 +699,7 @@ class StrategyEngine:
                         SelfTradePrevention(action.self_trade_prevention)
                         if action.self_trade_prevention else None
                     )
+                    self._recently_placed[action.ticker] = time.time()
                     order = await self._kalshi.place_order(
                         ticker=action.ticker,
                         side=side_enum,
@@ -743,6 +755,7 @@ class StrategyEngine:
                                     f"[AUTO] IOC retry: {action.ticker} {action.side.upper()} "
                                     f"×{action.contracts} @ {retry_price}¢ (was {action.price_cents}¢)"
                                 )
+                                self._recently_placed[action.ticker] = time.time()
                                 retry_order = await self._kalshi.place_order(
                                     ticker=action.ticker, side=side_enum,
                                     contracts=action.contracts, price_cents=retry_price,
@@ -786,6 +799,7 @@ class StrategyEngine:
                                                 f"[AUTO] IOC drift only {drift}¢ — forcing "
                                                 f"final IOC @ {force_price}¢: {action.ticker}"
                                             )
+                                            self._recently_placed[action.ticker] = time.time()
                                             force_ord = await self._kalshi.place_order(
                                                 ticker=action.ticker, side=side_enum,
                                                 contracts=action.contracts,
@@ -1078,6 +1092,11 @@ class StrategyEngine:
 
             if not paper and self._kalshi:
                 try:
+                    # Arm reconcile-skip for every ticker in the batch (arb pairs
+                    # touch two tickers at once).
+                    now_ts = time.time()
+                    for bo in action.batch_orders:
+                        self._recently_placed[bo.get("ticker", action.ticker)] = now_ts
                     orders = await self._kalshi.batch_place_orders(action.batch_orders)
                     for o in orders:
                         self._open_orders[o.order_id] = o
@@ -1160,6 +1179,10 @@ class StrategyEngine:
                     t: ts for t, ts in self._recently_exited.items()
                     if now_t - ts < 60
                 }
+                self._recently_placed = {
+                    t: ts for t, ts in self._recently_placed.items()
+                    if now_t - ts < 30
+                }
 
                 # Step 1: reconcile resting orders (fills missed during WS gaps)
                 await self._reconcile_resting_orders()
@@ -1194,6 +1217,19 @@ class StrategyEngine:
                         age = now_t - self._recently_exited[ticker]
                         log.debug(
                             f"[RECONCILE] Skipping {ticker} — exited {age:.0f}s ago (exit lag guard)"
+                        )
+                        continue
+
+                    # Skip tickers with a place_order in flight or just-completed.
+                    # Closes the race where an IOC fills on Kalshi within ms but our
+                    # local record_fill hasn't run yet — without this guard, the
+                    # reconciler adopts the same fill again as a "reconciled_gap"
+                    # ghost, doubling our internal exposure.
+                    placed_ts = self._recently_placed.get(ticker)
+                    if placed_ts is not None and (now_t - placed_ts) < 15:
+                        log.debug(
+                            f"[RECONCILE] Skipping {ticker} — placed "
+                            f"{now_t - placed_ts:.1f}s ago (placement race guard)"
                         )
                         continue
 
