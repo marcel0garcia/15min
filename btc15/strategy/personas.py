@@ -413,10 +413,19 @@ class AutoTrader:
                 or our_side_edge >= 0.03
             )
 
+            # Pyramid-aware rope: each additional leg widens the stop by 10pp.
+            # A 2-leg pyramid means the model confirmed entry twice; the position
+            # has higher cost basis and deserves more retrace tolerance before
+            # cutting. Empirically (Friday paper data): 24 of 67 SO trades were
+            # 2-leg pyramids losing $118 — disproportionate vs single-leg SOs.
+            # Clamped so we always stay inside emergency_stop's 65% floor.
+            adds = pos.get("pyramid_adds", 0)
+            pyramid_rope = min(0.10 * adds, 0.20)  # cap at +20pp (3 legs)
+
             # Snapshot model context for log lines (used in both branches).
             rec = output.recommended_side or "none"
             ctx = (f"rec={rec} conf={output.confidence:.0%} "
-                   f"edge_our={our_side_edge:+.1%}")
+                   f"edge_our={our_side_edge:+.1%} legs={adds + 1}")
 
             if model_agrees:
                 # Suppression: model still likes our side. Clear any pending cut
@@ -428,6 +437,7 @@ class AutoTrader:
                     would_thresh = -0.40
                 else:
                     would_thresh = -0.25
+                would_thresh = max(would_thresh - pyramid_rope, -0.60)
                 if pnl_pct <= would_thresh:
                     log.info(
                         f"{self.tag} STOP SUPPRESSED: {ticker} {side.upper()} | "
@@ -441,6 +451,9 @@ class AutoTrader:
                     stop_thresh = -0.40  # 4-8min: standard
                 else:
                     stop_thresh = -0.25  # <4min: cut anything decisively underwater
+                # Pyramid rope: deeper conviction → wider tolerance. Floor at -60%
+                # so emergency_stop (-65%) stays the absolute backstop.
+                stop_thresh = max(stop_thresh - pyramid_rope, -0.60)
 
                 if pnl_pct <= stop_thresh:
                     # Cool-off: more runway → more confirmation required.
