@@ -396,10 +396,18 @@ class AutoTrader:
             # A NO contract can dip to 35¢ on a single BTC tick toward strike,
             # then settle at 100¢ when BTC doesn't actually cross.
             #
-            # Suppression: model recommends our side with ≥40% confidence OR
-            # our side still shows ≥+3% edge at current prices. The edge-floor
-            # disjunction prevents a confidence-cliff effect (model at 38% conf
-            # but +5% edge on our side is still saying we're ahead).
+            # Suppression: the model must AT LEAST point at our side directionally.
+            # Within that agreement, either high confidence (≥40%) OR a positive
+            # edge floor (≥+3%) on our side counts as a green light to hold.
+            #
+            # Earlier version made the edge floor a standalone OR branch, which
+            # let `rec=none` suppress stops via price-noise edge: when a position
+            # drops sharply, the implied price of our side collapses, making the
+            # edge math read positive even when the model has zero conviction.
+            # Friday data (27h post-Fix#1): 91% of suppressions came from this
+            # bad branch, and 95% of emergency_stops were preceded by one. The
+            # `rec == side` guard preserves the legitimate low-conf-with-edge
+            # case the disjunction was meant to catch.
             #
             # Cool-off: empirically (Friday paper data, 29 SO loss_cut events)
             # 83% of stops were panic-flushes that recovered within 30s. When
@@ -409,8 +417,8 @@ class AutoTrader:
             our_side_edge = output.edge_yes if side == "yes" else output.edge_no
             our_side_edge = float(our_side_edge) if our_side_edge is not None else 0.0
             model_agrees = (
-                (output.recommended_side == side and output.confidence >= 0.40)
-                or our_side_edge >= 0.03
+                output.recommended_side == side
+                and (output.confidence >= 0.40 or our_side_edge >= 0.03)
             )
 
             # Pyramid-aware rope: each additional leg widens the stop by 10pp.
