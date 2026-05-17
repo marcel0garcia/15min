@@ -1512,8 +1512,23 @@ class StrategyEngine:
                 self.risk.state.open_positions = sum(
                     len(v) for v in self.autotrader.positions.values()
                 )
+                # Resync exposure from autotrader (paper has no API truth).
+                self.risk.state.total_exposure_usd = sum(
+                    p["contracts"] * p["entry_cents"] / 100
+                    for v in self.autotrader.positions.values()
+                    for p in v
+                )
             else:
                 self.risk.state.open_positions = len(api_positions)
+                # Resync exposure from Kalshi API. record_close only decrements
+                # one recent_trades record per call, but a pyramid produces N
+                # records and one close, leaking (N-1) records' costs into
+                # total_exposure_usd forever. The resync caps that leak to one
+                # position-loop interval — Kalshi's positions list is truth.
+                self.risk.state.total_exposure_usd = sum(
+                    pos.contracts * pos.avg_price_cents / 100
+                    for pos in api_positions
+                )
         except Exception:
             api_positions = []
 
