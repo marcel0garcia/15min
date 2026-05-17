@@ -397,6 +397,42 @@ def show_config(config_path: str):
 
 
 @cli.command()
+@click.option("--paper", "paper_only", is_flag=True, default=False,
+              help="Restrict to paper-mode trades")
+@click.option("--live", "live_only", is_flag=True, default=False,
+              help="Restrict to live-mode trades")
+@click.option("--since", "since_str", default=None, metavar="YYYY-MM-DD",
+              help="Only include trades on or after this UTC date")
+@click.option("--no-fetch", is_flag=True, default=False,
+              help="Skip Kalshi pre-fetch; use cached market results only")
+def report(paper_only: bool, live_only: bool, since_str: str, no_fetch: bool):
+    """Houston — panoramic snapshot of all bot activity (paper + live).
+
+    Examples:
+      ./run.sh report                              # all sessions, all modes
+      ./run.sh report --paper                      # paper sessions only
+      ./run.sh report --live                       # live sessions only
+      ./run.sh report --paper --since 2026-05-15   # paper since date
+      ./run.sh report --no-fetch                   # skip Kalshi API roundtrip
+    """
+    from datetime import datetime, timezone
+    from btc15.cli.report import run_report
+
+    if paper_only and live_only:
+        console.print("[bright_red]--paper and --live are mutually exclusive[/bright_red]")
+        return
+    mode_filter = "paper" if paper_only else ("live" if live_only else None)
+    since = None
+    if since_str:
+        try:
+            since = datetime.strptime(since_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            console.print(f"[bright_red]--since must be YYYY-MM-DD, got '{since_str}'[/bright_red]")
+            return
+    run_report(mode_filter=mode_filter, since=since, no_fetch=no_fetch)
+
+
+@cli.command()
 @click.option("--min-samples", default=100, help="Minimum samples required to train")
 def train(min_samples: int):
     """Train the ML model on collected trade data."""
