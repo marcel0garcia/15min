@@ -115,6 +115,13 @@ trader:
   reversal_min_edge: 0.10         # 10% edge required to flip sides
   reversal_min_seconds: 300       # only flip with >5 min left
 
+  # Loss-cut cool-off: hold the cut decision for N seconds and re-check.
+  # If model returns to agreeing OR pnl recovers above stop_thresh during the
+  # wait, the cut clears. Calibrated for the 1s scan interval. Tunable here.
+  # The <240s remaining tier always uses 0s (late window = decisive cut).
+  cool_off_seconds_high_runway: 10.0  # >480s remaining
+  cool_off_seconds_mid_runway: 5.0    # 240-480s remaining
+
   # Position sizing (tuned for $100 starting balance)
   # Early window (GTC): quarter-Kelly — patient entries, time uncertainty higher
   # Prime window (IOC): half-Kelly — high conviction, short window

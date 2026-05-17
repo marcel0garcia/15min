@@ -109,6 +109,14 @@ class TraderConfig:
     reversal_min_edge: float = 0.10      # edge required to flip sides
     reversal_min_seconds: int = 300      # only flip with >5 min left
 
+    # ── Loss-cut cool-off (panic-flush guard) ─────────────────────────────
+    # When a loss_cut would fire, we wait N seconds and re-check the condition.
+    # If model returns to agreeing OR pnl recovers above stop_thresh, the cut
+    # is cleared. Calibrated for the 1s scan interval — see commit d0a13be.
+    cool_off_seconds_high_runway: float = 10.0  # used when >480s remaining to settle
+    cool_off_seconds_mid_runway: float = 5.0    # used when 240-480s remaining
+    # Below 240s remaining, cool-off is always 0 (late window = decisive cut).
+
     # ── Position sizing ───────────────────────────────────────────────────
     kelly_fraction_early: float = 0.25   # quarter-Kelly for GTC early entries
     kelly_fraction_prime: float = 0.50   # half-Kelly for IOC prime-window entries
