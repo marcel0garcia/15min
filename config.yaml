@@ -122,6 +122,14 @@ trader:
   cool_off_seconds_high_runway: 10.0  # >480s remaining
   cool_off_seconds_mid_runway: 5.0    # 240-480s remaining
 
+  # Entry signal persistence: fresh entries (not reversal, not pyramid) must
+  # see the conf+edge gate clear for this many consecutive 1s scans before
+  # firing. Filters out single-tick spikes that resolve in <1s.
+  #   1 = fire immediately on first tick (old 3s-scan behavior)
+  #   2 = ~2s of confirmation (conservative default)
+  #   3 = ~3s — matches the OLD implicit gate before scan tightening
+  entry_confirmation_ticks: 2
+
   # Position sizing (tuned for $100 starting balance)
   # Early window (GTC): quarter-Kelly — patient entries, time uncertainty higher
   # Prime window (IOC): half-Kelly — high conviction, short window

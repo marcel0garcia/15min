@@ -117,6 +117,16 @@ class TraderConfig:
     cool_off_seconds_mid_runway: float = 5.0    # used when 240-480s remaining
     # Below 240s remaining, cool-off is always 0 (late window = decisive cut).
 
+    # ── Entry signal persistence (anti-noise gate for fresh entries) ──────
+    # Under 1s scan, the model's tick-by-tick output is noisier than under
+    # the old 3s scan (which implicitly required signals to hold for 3s just
+    # to be observed). Require fresh entries to clear the conf+edge gate for
+    # K consecutive scans before firing. Does NOT apply to reversal re-entries
+    # (already double-gated by reversal_min_edge) or pyramid adds (existing
+    # position implies the original signal was strong). K=1 = fire immediately
+    # (old behavior); K=2 = ~2s of confirmation; K=3 = ~3s.
+    entry_confirmation_ticks: int = 2
+
     # ── Position sizing ───────────────────────────────────────────────────
     kelly_fraction_early: float = 0.25   # quarter-Kelly for GTC early entries
     kelly_fraction_prime: float = 0.50   # half-Kelly for IOC prime-window entries

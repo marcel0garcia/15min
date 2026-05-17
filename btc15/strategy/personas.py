@@ -108,6 +108,13 @@ class AutoTrader:
         # firing. Cleared whenever the model returns to agreeing OR pnl
         # recovers above threshold. Does NOT apply to emergency_stop (-65%).
         self._pending_loss_cut: dict[str, float] = {}
+        # (ticker, side) → {"ticks": N, "last_seen": ts} for fresh-entry
+        # signal persistence. After scan was tightened to 1s, the model's
+        # tick-by-tick output revealed transient spikes that resolved in <1s.
+        # An entry only fires after K consecutive scans of the conf+edge
+        # gate clearing. Reversal re-entries and pyramid adds bypass this
+        # (their gates are already stronger).
+        self._pending_entry_signal: dict[tuple, dict] = {}
         # ticker → timestamp when a pure-arb cross was first observed.
         # Arb only fires if the cross persists for at least two consecutive
         # scan cycles — filters transient 1-2¢ WS-delta crosses that are
@@ -971,6 +978,35 @@ class AutoTrader:
                 signal_mid = 100 - ((float(yes_bid) + float(yes_ask)) / 2)
         else:
             signal_mid = float(raw_price)  # best we can do
+
+        # Entry signal persistence: fresh entries must clear the gate for K
+        # consecutive scans before firing. Filters single-tick spikes that
+        # resolve in <1s (revealed once SCAN_INTERVAL was tightened to 1s).
+        # Reversal re-entries skip this (their entry edge bar is already 2x
+        # the normal threshold). Pyramid adds also skip — an existing
+        # position implies the original signal already cleared the gate.
+        is_pyramid = ticker in self.positions
+        if not is_reversal and not is_pyramid:
+            K = getattr(self.cfg, "entry_confirmation_ticks", 2)
+            if K > 1:
+                key = (ticker, side)
+                now = time.time()
+                STALE_AFTER = 2.0  # restart counter if last observation aged
+                                   # beyond ~2 SCAN_INTERVALs (handles missed scans)
+                prev = self._pending_entry_signal.get(key)
+                if prev and (now - prev["last_seen"]) <= STALE_AFTER:
+                    ticks = prev["ticks"] + 1
+                else:
+                    ticks = 1
+                if ticks < K:
+                    self._pending_entry_signal[key] = {"ticks": ticks, "last_seen": now}
+                    log.info(
+                        f"{self.tag} SIGNAL PENDING [{ticks}/{K}]: {ticker} {side.upper()} | "
+                        f"conf={output.confidence:.0%} edge={edge:+.1%} — confirming"
+                    )
+                    return None
+                # Confirmation complete — fire and clear pending.
+                self._pending_entry_signal.pop(key, None)
 
         log.info(
             f"{self.tag} SIGNAL [{phase}|{order_mode}]: {ticker} {side.upper()} | "
