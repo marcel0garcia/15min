@@ -1723,9 +1723,34 @@ class StrategyEngine:
                 self.state["risk"] = risk_summary
                 self.state["trader"] = self.autotrader.summary()
 
-                # Sample P&L history every 10s
+                # Live unrealized PnL from open positions. Computed every
+                # state-updater tick (1s) using the WS market cache, so the
+                # Risk panel and PnL chart refresh at the same cadence as
+                # the Open Positions table — no more 30s balance-API lag.
+                # The 30s balance refresh below still runs for the halt
+                # check; this is purely for the displayed totals.
+                unrealized = 0.0
+                for ticker, entries in self.autotrader.positions.items():
+                    try:
+                        yes_bid, yes_ask = await self._market_cache.get_best_prices(ticker)
+                    except Exception:
+                        yes_bid = yes_ask = None
+                    for entry in entries:
+                        side = entry["side"]
+                        contracts = entry["contracts"]
+                        entry_cents = entry["entry_cents"]
+                        if side == "yes":
+                            bid = float(yes_bid) if yes_bid else 0.0
+                        else:
+                            bid = max(0.0, 100.0 - float(yes_ask)) if yes_ask else 0.0
+                        unrealized += (bid - entry_cents) * contracts / 100
+                self.state["unrealized_pnl"] = round(unrealized, 2)
+
+                # Sample P&L history every 10s — use realized + unrealized so
+                # the chart and the displayed totals tell the same story.
                 if int(time.time()) % 10 == 0:
-                    pnl_now = round(risk_summary.get("session_pnl", 0.0), 3)
+                    realized = risk_summary.get("session_pnl", 0.0)
+                    pnl_now = round(realized + unrealized, 3)
                     ts_now = datetime.now(timezone.utc).strftime("%H:%M")
                     history = self.state["pnl_history"]
                     if not history or history[-1][1] != pnl_now:

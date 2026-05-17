@@ -197,10 +197,14 @@ def build_risk_panel(state: dict) -> Panel:
     risk = state.get("risk", {})
     balance = state.get("balance", {})
 
-    # Single source of truth: account-level PnL from Kalshi (includes fees + unrealized).
-    # Falls back to internal session-realized sum while the first 30s balance refresh is pending.
-    true_pnl = balance.get("true_pnl") if balance else None
-    pnl = true_pnl if true_pnl is not None else risk.get("session_pnl", 0.0)
+    # PnL = realized (session_pnl, 1s refresh) + unrealized (mark-to-market
+    # from autotrader positions × live WS prices, 1s refresh). This matches
+    # the refresh cadence of the Open Positions table. The Kalshi-derived
+    # `true_pnl` (30s refresh) still drives the daily-loss halt check, but
+    # we don't display it because the 30s lag is jarring on the dashboard.
+    realized = risk.get("session_pnl", 0.0)
+    unrealized = state.get("unrealized_pnl", 0.0)
+    pnl = realized + unrealized
     pnl_color = _pnl_color(pnl)
 
     lines = []
@@ -408,12 +412,12 @@ def _bar_chart(values: list[float], width: int, height: int) -> list[str]:
 def build_pnl_chart(state: dict) -> Panel:
     """P&L bar chart: one bar per closed trade, cumulative P&L curve."""
     risk = state.get("risk", {})
-    balance = state.get("balance", {})
 
-    # Same single source of truth as build_risk_panel:
-    # account-level PnL when available, internal session-realized sum as fallback.
-    true_pnl = balance.get("true_pnl") if balance else None
-    pnl_ref = true_pnl if true_pnl is not None else risk.get("session_pnl", 0.0)
+    # Same realized + unrealized formulation as build_risk_panel — keeps
+    # the chart value and the Risk panel value in lockstep at 1s cadence.
+    realized = risk.get("session_pnl", 0.0)
+    unrealized = state.get("unrealized_pnl", 0.0)
+    pnl_ref = realized + unrealized
     pnl_c = "bright_green" if pnl_ref >= 0 else "bright_red"
 
     # Build cumulative P&L series from closed trades in the log
