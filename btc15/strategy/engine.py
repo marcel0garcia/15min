@@ -699,6 +699,14 @@ class StrategyEngine:
                         SelfTradePrevention(action.self_trade_prevention)
                         if action.self_trade_prevention else None
                     )
+                    # For GTC entries, set server-side expiration matching our
+                    # local escalation timeout. Kalshi auto-cancels at expiration,
+                    # giving us a deterministic upper bound on resting time and
+                    # eliminating the orphan-resting-order class of bugs after
+                    # crashes. Manual escalation still runs as a belt-and-suspenders.
+                    exp_ts = None
+                    if use_gtc:
+                        exp_ts = int(time.time() + self.cfg.trader.gtc_escalate_seconds)
                     self._recently_placed[action.ticker] = time.time()
                     order = await self._kalshi.place_order(
                         ticker=action.ticker,
@@ -710,6 +718,7 @@ class StrategyEngine:
                         time_in_force=tif,
                         client_order_id=f"btc15-auto-{uuid.uuid4().hex[:6]}",
                         self_trade_prevention=stp,
+                        expiration_time=exp_ts,
                     )
                     self._open_orders[order.order_id] = order
 

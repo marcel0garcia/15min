@@ -5,6 +5,7 @@ import asyncio
 import base64
 import logging
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -395,7 +396,8 @@ class KalshiClient:
         params: dict = {}
         if ticker:
             params["ticker"] = ticker
-        data = await self.get("/portfolio/orders", **params)
+        # V2 path — matches the deprecation umbrella for /portfolio/orders*
+        data = await self.get("/portfolio/events/orders", **params)
         return [self._parse_order(o) for o in data.get("orders", [])]
 
     async def get_fills(self, ticker: Optional[str] = None) -> list[dict]:
@@ -433,6 +435,53 @@ class KalshiClient:
         """Convert integer cents (1-99) to Kalshi fixed-point dollars string."""
         return f"{int(cents) / 100:.2f}"
 
+    # ── V2 endpoint conventions ──────────────────────────────────────────
+    # Kalshi V2 (/portfolio/events/orders) uses a single-book bid/ask model:
+    # "bid is equivalent to yes, ask is equivalent to no" per the API changelog.
+    # The legacy `action: buy/sell` field is gone — buy vs sell is inferred from
+    # position state + the reduce_only flag.
+    _V2_SIDE = {Side.YES: "bid", Side.NO: "ask"}
+    _V2_BASE = "/portfolio/events/orders"
+
+    @staticmethod
+    def _count_fp(n: int) -> str:
+        """V2 expects count as a fixed-point string with up to 2 decimals."""
+        return f"{int(n):d}.00"
+
+    def _v2_order_body(
+        self,
+        ticker: str,
+        side: Side,
+        contracts: int,
+        price_cents: int,
+        client_order_id: str,
+        time_in_force: TimeInForce,
+        self_trade_prevention: SelfTradePrevention,
+        post_only: bool = False,
+        reduce_only: bool = False,
+        expiration_time: Optional[int] = None,
+    ) -> dict:
+        """Build a V2 create-order request body. Returns a dict; the caller
+        POSTs it to either the single-order or batched endpoint."""
+        body: dict = {
+            "ticker": ticker,
+            "client_order_id": client_order_id,
+            "side": self._V2_SIDE[side],
+            "count": self._count_fp(contracts),
+            "price": self._price_dollars(price_cents),
+            "time_in_force": time_in_force.value,
+            "self_trade_prevention_type": self_trade_prevention.value,
+            # Auto-cancel during exchange halts — free safety belt.
+            "cancel_order_on_pause": True,
+        }
+        if post_only:
+            body["post_only"] = True
+        if reduce_only:
+            body["reduce_only"] = True
+        if expiration_time is not None:
+            body["expiration_time"] = int(expiration_time)
+        return body
+
     async def place_order(
         self,
         ticker: str,
@@ -444,30 +493,22 @@ class KalshiClient:
         post_only: bool = False,
         time_in_force: Optional[TimeInForce] = None,
         self_trade_prevention: Optional[SelfTradePrevention] = None,
+        expiration_time: Optional[int] = None,
     ) -> Order:
-        body: dict = {
-            "ticker": ticker,
-            "action": "buy",
-            "side": side.value,
-            "type": order_type.value,
-            "count": contracts,
-        }
-        if order_type == OrderType.LIMIT:
-            # Use the fixed-point `*_dollars` form — matches every other v2
-            # write surface (fills, amend, batch). Legacy integer cent fields
-            # still work but the dollars form is Kalshi's current convention.
-            price_field = "yes_price_dollars" if side == Side.YES else "no_price_dollars"
-            body[price_field] = self._price_dollars(price_cents)
-        if client_order_id:
-            body["client_order_id"] = client_order_id
-        if post_only:
-            body["post_only"] = True
-        if time_in_force:
-            body["time_in_force"] = time_in_force.value
-        if self_trade_prevention:
-            body["self_trade_prevention_type"] = self_trade_prevention.value
-
-        data = await self.post("/portfolio/orders", body)
+        # V2 requires client_order_id; generate one if not supplied.
+        if not client_order_id:
+            client_order_id = f"btc15-auto-{uuid.uuid4().hex[:6]}"
+        body = self._v2_order_body(
+            ticker=ticker, side=side, contracts=contracts,
+            price_cents=price_cents,
+            client_order_id=client_order_id,
+            time_in_force=time_in_force or TimeInForce.IOC,
+            self_trade_prevention=self_trade_prevention or SelfTradePrevention.CANCEL_INCOMING,
+            post_only=post_only,
+            reduce_only=False,
+            expiration_time=expiration_time,
+        )
+        data = await self.post(self._V2_BASE, body)
         return self._parse_order(data["order"])
 
     async def amend_order(
@@ -477,32 +518,64 @@ class KalshiClient:
         side: Side,
         price_cents: Optional[int] = None,
         count: Optional[int] = None,
-        action: str = "buy",
+        action: str = "buy",  # kept for caller compat; V2 doesn't use it
     ) -> Order:
         """Amend a resting order's price or count in-place (no cancel+replace).
 
-        Kalshi requires `ticker`, `side`, and `action` on every amend request —
-        sending only the new price returns HTTP 400. The bot's resting orders
-        are entry buys, so `action` defaults to "buy"; callers amending sell
-        orders must pass action="sell" explicitly.
+        V2 path: POST /portfolio/events/orders/{id}/amend with the V2
+        single-book body shape (side: bid/ask, single price field).
+        The `action` parameter is kept in the signature for caller compatibility
+        but is ignored — V2 infers buy/sell from position state.
         """
         body: dict = {
             "ticker": ticker,
-            "side": side.value,
-            "action": action,
+            "side": self._V2_SIDE[side],
         }
         if price_cents is not None:
-            price_field = "yes_price_dollars" if side == Side.YES else "no_price_dollars"
-            body[price_field] = self._price_dollars(price_cents)
+            body["price"] = self._price_dollars(price_cents)
         if count is not None:
-            body["count"] = count
-        data = await self.post(f"/portfolio/orders/{order_id}/amend", body)
+            body["count"] = self._count_fp(count)
+        data = await self.post(f"{self._V2_BASE}/{order_id}/amend", body)
         return self._parse_order(data["order"])
 
     async def batch_place_orders(self, orders: list[dict]) -> list[Order]:
-        """Place multiple orders atomically. Each dict should have:
-        ticker, action, side, type, count, and optionally yes_price/no_price, post_only."""
-        data = await self.post("/portfolio/orders/batched", {"orders": orders})
+        """Place multiple orders atomically via V2 batched endpoint.
+
+        Accepts a list of dicts in the same shape produced by callers today
+        (with `action`/`side: yes/no`/`yes_price_dollars`/etc.) and translates
+        each to V2 shape before posting. Keeps the caller surface unchanged.
+        """
+        v2_orders = []
+        for o in orders:
+            # Translate legacy-shaped dicts (used by the engine's arb batch) to V2.
+            side_str = (o.get("side") or "yes").lower()
+            side_enum = Side.YES if side_str == "yes" else Side.NO
+            # Pull price from whichever legacy field is set
+            price_str = o.get("yes_price_dollars") or o.get("no_price_dollars")
+            if price_str is None and "price" in o:
+                price_str = o["price"]
+            # Caller may pass price as a string ("0.65") or integer cents (65)
+            if isinstance(price_str, (int, float)):
+                price_cents = int(price_str) if price_str > 1 else int(round(price_str * 100))
+            else:
+                price_cents = int(round(float(price_str) * 100))
+            cid = o.get("client_order_id") or f"btc15-batch-{uuid.uuid4().hex[:6]}"
+            tif = o.get("time_in_force", TimeInForce.IOC.value)
+            tif_enum = TimeInForce(tif) if isinstance(tif, str) else tif
+            stp_val = o.get("self_trade_prevention_type", SelfTradePrevention.CANCEL_INCOMING.value)
+            stp_enum = SelfTradePrevention(stp_val) if isinstance(stp_val, str) else stp_val
+            v2_orders.append(self._v2_order_body(
+                ticker=o["ticker"], side=side_enum,
+                contracts=int(o.get("count", 0)),
+                price_cents=price_cents,
+                client_order_id=cid,
+                time_in_force=tif_enum,
+                self_trade_prevention=stp_enum,
+                post_only=bool(o.get("post_only", False)),
+                reduce_only=bool(o.get("reduce_only", False)),
+                expiration_time=o.get("expiration_time"),
+            ))
+        data = await self.post(f"{self._V2_BASE}/batched", {"orders": v2_orders})
         return [self._parse_order(o) for o in data.get("orders", [])]
 
     async def sell_position(
@@ -525,20 +598,15 @@ class KalshiClient:
         ≥ `price_cents`. For stop-losses and emergency exits use
         `sell_position_sweep()` instead, which takes whatever the book gives.
         """
-        body: dict = {
-            "ticker": ticker,
-            "action": "sell",
-            "side": side.value,
-            "type": "limit",
-            "count": contracts,
-            "time_in_force": TimeInForce.IOC.value,
-            # reduce_only: true — exchange-level guarantee that this sell
-            # cannot accidentally open a short if internal position state drifts.
-            "reduce_only": True,
-        }
-        price_field = "yes_price_dollars" if side == Side.YES else "no_price_dollars"
-        body[price_field] = self._price_dollars(price_cents)
-        data = await self.post("/portfolio/orders", body)
+        body = self._v2_order_body(
+            ticker=ticker, side=side, contracts=contracts,
+            price_cents=price_cents,
+            client_order_id=f"btc15-sell-{uuid.uuid4().hex[:6]}",
+            time_in_force=TimeInForce.IOC,
+            self_trade_prevention=SelfTradePrevention.CANCEL_INCOMING,
+            reduce_only=True,  # exchange guarantee against accidental short
+        )
+        data = await self.post(self._V2_BASE, body)
         return self._parse_order(data["order"])
 
     async def sell_position_sweep(
@@ -562,33 +630,27 @@ class KalshiClient:
         were below our stated limit. Positions then rode to 0¢ settlement
         even though the book had buyers the whole time.
         """
-        body: dict = {
-            "ticker": ticker,
-            "action": "sell",
-            "side": side.value,
-            "type": "limit",
-            "count": contracts,
-            "time_in_force": TimeInForce.IOC.value,
-            "reduce_only": True,
-        }
-        # Submit at the floor ($0.01). Kalshi matches against the best available
-        # bid in price-time priority; the `*_price_dollars` field acts as a
-        # price floor, not a fill target.
-        price_field = "yes_price_dollars" if side == Side.YES else "no_price_dollars"
-        body[price_field] = "0.01"
-        data = await self.post("/portfolio/orders", body)
+        body = self._v2_order_body(
+            ticker=ticker, side=side, contracts=contracts,
+            price_cents=1,  # floor at $0.01; Kalshi matches at best available bid
+            client_order_id=f"btc15-sweep-{uuid.uuid4().hex[:6]}",
+            time_in_force=TimeInForce.IOC,
+            self_trade_prevention=SelfTradePrevention.CANCEL_INCOMING,
+            reduce_only=True,
+        )
+        data = await self.post(self._V2_BASE, body)
         return self._parse_order(data["order"])
 
     async def cancel_order(self, order_id: str) -> dict:
-        return await self.delete(f"/portfolio/orders/{order_id}")
+        return await self.delete(f"{self._V2_BASE}/{order_id}")
 
     async def cancel_all_orders(self, ticker: Optional[str] = None) -> int:
-        """Cancel every resting order, batching up to 20 IDs per request.
+        """Cancel every resting order via V2 batched endpoint.
 
-        Uses `DELETE /portfolio/orders/batched` (v2) so a shutdown with
+        Uses `DELETE /portfolio/events/orders/batched` so a shutdown with
         many open orders does not chew through the rate limit one cancel
-        at a time. Falls back to per-order DELETE if the batched endpoint
-        rejects the request (older API path).
+        at a time. Falls back to per-order V2 DELETE if the batched endpoint
+        rejects the request.
         """
         resting = [
             o for o in await self.get_orders(ticker=ticker)
@@ -603,8 +665,7 @@ class KalshiClient:
             try:
                 await self._request(
                     "DELETE",
-                    "/portfolio/orders/batched",
-                    # v2 current shape — {"ids": [...]} is deprecated.
+                    f"{self._V2_BASE}/batched",
                     json={"orders": [{"order_id": o.order_id} for o in chunk]},
                 )
                 cancelled += len(chunk)
