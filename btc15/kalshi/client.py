@@ -440,17 +440,44 @@ class KalshiClient:
         return f"{int(cents) / 100:.2f}"
 
     # ── V2 endpoint conventions ──────────────────────────────────────────
-    # Kalshi V2 (/portfolio/events/orders) uses a single-book bid/ask model:
-    # "bid is equivalent to yes, ask is equivalent to no" per the API changelog.
-    # The legacy `action: buy/sell` field is gone — buy vs sell is inferred from
-    # position state + the reduce_only flag.
-    _V2_SIDE = {Side.YES: "bid", Side.NO: "ask"}
+    # Kalshi V2 (/portfolio/events/orders) uses a single-book YES model:
+    #   bid = bid on YES book = BUY YES exposure (or close a NO short)
+    #   ask = ask on YES book = SELL YES exposure (= equivalent to BUY NO,
+    #                                              or close a YES long)
+    # The changelog's "bid is equivalent to yes" applies to BUY orders only.
+    # For SELL orders the V2 side flips. Mapping table:
+    #
+    #   our intent          v2 side    v2 price (in YES-book cents)
+    #   ─────────────────   ────────   ────────────────────────────
+    #   BUY YES  at P¢      bid        P
+    #   SELL YES at P¢      ask        P             (close long YES)
+    #   BUY NO   at P¢      ask        100 - P       (= short YES at 100-P)
+    #   SELL NO  at P¢      bid        100 - P       (close NO short)
+    #
+    # reduce_only=True is our signal that this is a SELL/close. The legacy
+    # `action: buy/sell` field is gone — V2 infers from reduce_only.
     _V2_BASE = "/portfolio/events/orders"
 
     @staticmethod
     def _count_fp(n: int) -> str:
         """V2 expects count as a fixed-point string with up to 2 decimals."""
         return f"{int(n):d}.00"
+
+    @staticmethod
+    def _v2_side_and_price(side: Side, price_cents: int, reduce_only: bool) -> tuple[str, int]:
+        """Translate (our YES/NO side, our intended price, buy/sell)
+        into V2's single-book (bid/ask, YES-book price).
+        Returns (v2_side, v2_price_cents)."""
+        is_sell = reduce_only
+        if side == Side.YES:
+            v2_side = "ask" if is_sell else "bid"
+            v2_price_cents = price_cents
+        else:  # Side.NO
+            v2_side = "bid" if is_sell else "ask"
+            v2_price_cents = 100 - price_cents
+        # Clamp to valid YES-book range [1, 99]
+        v2_price_cents = max(1, min(99, v2_price_cents))
+        return v2_side, v2_price_cents
 
     def _v2_order_body(
         self,
@@ -467,12 +494,13 @@ class KalshiClient:
     ) -> dict:
         """Build a V2 create-order request body. Returns a dict; the caller
         POSTs it to either the single-order or batched endpoint."""
+        v2_side, v2_price_cents = self._v2_side_and_price(side, price_cents, reduce_only)
         body: dict = {
             "ticker": ticker,
             "client_order_id": client_order_id,
-            "side": self._V2_SIDE[side],
+            "side": v2_side,
             "count": self._count_fp(contracts),
-            "price": self._price_dollars(price_cents),
+            "price": self._price_dollars(v2_price_cents),
             "time_in_force": time_in_force.value,
             "self_trade_prevention_type": self_trade_prevention.value,
             # Auto-cancel during exchange halts — free safety belt.
@@ -530,15 +558,20 @@ class KalshiClient:
 
         V2 path: POST /portfolio/events/orders/{id}/amend with the V2
         single-book body shape (side: bid/ask, single price field).
-        The `action` parameter is kept in the signature for caller compatibility
-        but is ignored — V2 infers buy/sell from position state.
+        The `action` parameter is kept in the signature for caller compatibility;
+        we use action=="sell" as the reduce_only signal for side mapping.
         """
+        is_sell = (action == "sell")
+        # Compute v2 side using a placeholder price; price-transform is done
+        # below only if price_cents was supplied.
+        v2_side, _ = self._v2_side_and_price(side, 50, is_sell)
         body: dict = {
             "ticker": ticker,
-            "side": self._V2_SIDE[side],
+            "side": v2_side,
         }
         if price_cents is not None:
-            body["price"] = self._price_dollars(price_cents)
+            _, v2_price_cents = self._v2_side_and_price(side, price_cents, is_sell)
+            body["price"] = self._price_dollars(v2_price_cents)
         if count is not None:
             body["count"] = self._count_fp(count)
         data = await self.post(f"{self._V2_BASE}/{order_id}/amend", body)
