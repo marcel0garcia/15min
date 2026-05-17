@@ -512,7 +512,9 @@ class KalshiClient:
             reduce_only=False,
             expiration_time=expiration_time,
         )
+        log.info(f"[V2 PLACE REQ] {body}")
         data = await self.post(self._V2_BASE, body)
+        log.info(f"[V2 PLACE RES] {data}")
         return self._parse_order(data.get("order") or data)
 
     async def amend_order(
