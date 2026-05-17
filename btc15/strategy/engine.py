@@ -1315,11 +1315,13 @@ class StrategyEngine:
 
         tickers = {info["ticker"] for info in resting.values()}
         api_orders: dict[str, Order] = {}
+        fetched_tickers: set[str] = set()
         for ticker in tickers:
             try:
                 orders = await self._kalshi.get_orders(ticker=ticker)
                 for o in orders:
                     api_orders[o.order_id] = o
+                fetched_tickers.add(ticker)
             except Exception as e:
                 log.warning(f"[RECONCILE] Failed to fetch orders for {ticker}: {e}")
 
@@ -1335,6 +1337,21 @@ class StrategyEngine:
                 continue
 
             ticker = info["ticker"]
+            # Defensive: if the get_orders fetch failed for this ticker, do NOT
+            # synthesize a phantom fill. The old logic treated "api_order is None"
+            # as "must have filled and been removed", but that's only true when
+            # the fetch SUCCEEDED and returned an empty/missing entry. If the
+            # fetch itself failed (404, network error, etc.), we just don't know
+            # — wait for the next reconcile cycle or the WS fill event. This is
+            # the bug that produced paired duplicate rows in the trade log:
+            # phantom + real fill on the same Kalshi position.
+            if ticker not in fetched_tickers:
+                log.debug(
+                    f"[RECONCILE] Skipping {oid[:8]} on {ticker} — verification "
+                    f"fetch failed; will retry next cycle"
+                )
+                continue
+
             side_str = info["side"]
             price = info["price"]
             contracts = info["contracts"]

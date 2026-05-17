@@ -396,8 +396,12 @@ class KalshiClient:
         params: dict = {}
         if ticker:
             params["ticker"] = ticker
-        # V2 path — matches the deprecation umbrella for /portfolio/orders*
-        data = await self.get("/portfolio/events/orders", **params)
+        # Read endpoint stays on legacy /portfolio/orders — V2 either doesn't
+        # expose a list-orders GET at /portfolio/events/orders (404) or uses
+        # a different query convention. The deprecation wave targets the
+        # write surface; legacy GET still works and is needed by the
+        # reconciler to verify resting orders.
+        data = await self.get("/portfolio/orders", **params)
         return [self._parse_order(o) for o in data.get("orders", [])]
 
     async def get_fills(self, ticker: Optional[str] = None) -> list[dict]:
