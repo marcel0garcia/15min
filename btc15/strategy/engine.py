@@ -739,15 +739,16 @@ class StrategyEngine:
                                 f"×{action.contracts} @ {action.price_cents}¢ "
                                 f"order={order.order_id[:8]}"
                             )
-                            self.state["recent_trades"].insert(0, {
-                                "ticker": action.ticker, "side": action.side,
-                                "contracts": action.contracts,
-                                "price_cents": action.price_cents,
-                                "entry_time": datetime.now(timezone.utc).isoformat(),
-                                "source": "auto/gtc", "status": "resting",
-                                "trade_id": trade_id, "session": self._session_label,
-                            })
-                            self.state["recent_trades"] = self.state["recent_trades"][:50]
+                            # NOTE: do NOT insert a "resting" entry into
+                            # recent_trades. The Personas panel already shows
+                            # resting-order count via `R:N`, so the user has
+                            # visibility into pending orders without polluting
+                            # Recent Trades with pseudo-fills. When the GTC
+                            # actually fills via WS, _handle_fill inserts the
+                            # real entry (status="open") with the correct
+                            # post-fill trade_id. If the GTC is cancelled
+                            # (e.g., server-side expiration_time hits), no
+                            # cleanup is needed since nothing was inserted.
                         return
                     else:
                         # IOC: either filled now or cancelled
