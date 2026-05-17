@@ -89,10 +89,11 @@ trader:
   # GTC order management
   # Early-window entries post GTC post_only at mid-1¢ (0% maker fee).
   # If unfilled after gtc_escalate_seconds, cancel and retry as IOC.
-  # 8s: tight escalation. With the strong-signal override in personas.py,
-  # GTC now only handles genuinely quiet markets where 8s of patience is
-  # plenty and the old 12s was just alpha decay.
-  gtc_escalate_seconds: 8.0
+  # 5s: tightened from 8s for live-trading readiness. With the reconciler
+  # placement-race guard (commit 6801952) closing the duplicate-position
+  # window, we no longer need a wider GTC patience window. 5s still gives
+  # quiet markets time for a maker fill while halving in-flight exposure.
+  gtc_escalate_seconds: 5.0
   slippage_cents: 2               # IOC slippage above current ask (adaptive by vol)
 
   # Market making — runs in early window when spread ≥ mm_min_spread_cents
@@ -121,7 +122,7 @@ trader:
   kelly_fraction_early: 0.25
   kelly_fraction_prime: 0.50
   kelly_fraction_strong: 0.75     # 3/4-Kelly for very strong signals (conf≥0.65, edge≥0.08)
-  max_single_trade_usd: 12.00     # hard cap per trade (~12% of $100 bankroll)
+  max_single_trade_usd: 5.00      # capped at $5 for first live-trading session (was 12.00)
 
   # Pyramiding — add to winning positions when model still agrees
   pyramid_enabled: true
@@ -149,13 +150,17 @@ trader:
   reversal_orderbook_min_dev: 0.10  # |prob_orderbook - 0.5| ≥ this in flip direction
 
   # Arbitrage — always highest priority when YES+NO < 98¢
+  # Disabled for first live-trading session: holding YES+NO simultaneously
+  # on the same market complicates reconciler reasoning and realized arb
+  # edge across 67 paper trades was only +$5. Re-enable after live baseline.
+  arb_enabled: false
   min_arb_cents: 2                # minimum profit per pair in cents
   max_arb_contracts: 5            # ~$2.50–4.90 per arb pair on $100 bankroll
 
 risk:
-  max_open_positions: 3           # 3 × $12 = $36 max simultaneous exposure (36%)
-  max_trade_usd: 20.00            # matches trader.max_single_trade_usd
-  max_position_per_market_usd: 20.00
+  max_open_positions: 3           # 3 × $5 = $15 max simultaneous exposure on first live
+  max_trade_usd: 5.00             # capped at $5 for first live-trading session (was 20.00)
+  max_position_per_market_usd: 5.00  # capped per-market too; raise after live baseline
   daily_loss_limit_usd: 15.00     # stop trading if down $15 on the day (15% of $100)
   kelly_fraction: 0.25
   min_trade_usd: 0.50             # Kalshi practical minimum

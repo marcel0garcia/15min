@@ -147,6 +147,7 @@ class TraderConfig:
                                               # in the flip direction to allow re-entry
 
     # ── Arb ───────────────────────────────────────────────────────────────
+    arb_enabled: bool = True             # master switch; disable for clean first-live debut
     min_arb_cents: int = 2               # YES+NO must cost ≤98¢ for guaranteed arb
     max_arb_contracts: int = 5           # max contracts per pure-arb pair
 

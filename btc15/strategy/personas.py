@@ -219,11 +219,15 @@ class AutoTrader:
 
         # ── Step 6: Pure arb (guaranteed profit — always highest priority) ────
         # Guard: skip if arb legs already resting (same stacking problem as entries)
+        # Master switch: arb_enabled (default True) lets the operator disable
+        # both-side arb trades. Useful for the first live-trading session where
+        # holding YES+NO on the same market complicates reconciler reasoning
+        # and the realized arb edge is tiny (~$5 across 67 paper trades).
         has_resting_arb = any(
             v.get("ticker") == ticker and v.get("purpose") == "arb"
             for v in self.resting_orders.values()
         )
-        if not has_resting_arb:
+        if not has_resting_arb and getattr(self.cfg, "arb_enabled", True):
             arb = self._check_pure_arb(ticker, orderbook, bankroll_usd)
             if arb:
                 actions.append(arb)
