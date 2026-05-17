@@ -469,10 +469,16 @@ class AutoTrader:
 
                 if pnl_pct <= stop_thresh:
                     # Cool-off: more runway → more confirmation required.
+                    # Calibrated for 1s SCAN_INTERVAL (~3x more clearing
+                    # opportunities than the old 3s scan). Empirical flush data
+                    # (29 SO loss_cut events) showed 83% recovered within 30s
+                    # with most in the 5-15s window. Longer cool-off + finer
+                    # checking = catches more flushes; adverse cost per genuine
+                    # loss is bounded at ~$0.50-1 from the extra wait.
                     if secs > 480:
-                        cool_off_secs = 6.0
+                        cool_off_secs = 10.0
                     elif secs > 240:
-                        cool_off_secs = 3.0
+                        cool_off_secs = 5.0
                     else:
                         cool_off_secs = 0.0  # final 4 min: no wait
 

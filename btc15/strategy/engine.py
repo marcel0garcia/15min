@@ -44,7 +44,8 @@ from btc15.strategy.personas import Action, AutoTrader
 
 log = logging.getLogger(__name__)
 
-SCAN_INTERVAL = 3          # seconds between market scans
+SCAN_INTERVAL = 1          # seconds between market scans (was 3s — Pi5 headroom check
+                           # showed ~10% of one core, leaving plenty of room)
 OB_REFRESH_INTERVAL = 4    # full orderbook REST snapshot refresh (fills WS gaps)
 POSITION_CHECK = 10        # seconds between position status checks
 
