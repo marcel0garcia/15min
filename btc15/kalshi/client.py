@@ -509,7 +509,7 @@ class KalshiClient:
             expiration_time=expiration_time,
         )
         data = await self.post(self._V2_BASE, body)
-        return self._parse_order(data["order"])
+        return self._parse_order(data.get("order") or data)
 
     async def amend_order(
         self,
@@ -536,7 +536,7 @@ class KalshiClient:
         if count is not None:
             body["count"] = self._count_fp(count)
         data = await self.post(f"{self._V2_BASE}/{order_id}/amend", body)
-        return self._parse_order(data["order"])
+        return self._parse_order(data.get("order") or data)
 
     async def batch_place_orders(self, orders: list[dict]) -> list[Order]:
         """Place multiple orders atomically via V2 batched endpoint.
@@ -607,7 +607,7 @@ class KalshiClient:
             reduce_only=True,  # exchange guarantee against accidental short
         )
         data = await self.post(self._V2_BASE, body)
-        return self._parse_order(data["order"])
+        return self._parse_order(data.get("order") or data)
 
     async def sell_position_sweep(
         self,
@@ -639,7 +639,7 @@ class KalshiClient:
             reduce_only=True,
         )
         data = await self.post(self._V2_BASE, body)
-        return self._parse_order(data["order"])
+        return self._parse_order(data.get("order") or data)
 
     async def cancel_order(self, order_id: str) -> dict:
         return await self.delete(f"{self._V2_BASE}/{order_id}")
@@ -683,14 +683,19 @@ class KalshiClient:
         return cancelled
 
     def _parse_order(self, o: dict) -> Order:
-        """Parse an order response.
+        """Parse an order response across V1/V2/legacy shapes.
 
-        Kalshi v2 uses fixed-point string fields (`fill_count_fp`,
-        `remaining_count_fp`, `initial_count_fp`) and dollar-denominated
-        prices (`yes_price_dollars`, `no_price_dollars`). Older API paths
-        still return integer cents under `yes_price` / `no_price` and
-        plain integer counts. Read both shapes so the parser is robust
-        across versions.
+        V2 (/portfolio/events/orders):
+          order_id, client_order_id, fill_count (str), remaining_count (str),
+          average_fill_price (str dollars), average_fee_paid (str dollars),
+          ts_ms. Side and ticker are NOT in the V2 response — those are
+          inferred from the request context by the caller if needed.
+        V1 fixed-point legacy:
+          fill_count_fp, remaining_count_fp, initial_count_fp,
+          yes_price_dollars, no_price_dollars.
+        Older legacy:
+          filled_count, remaining_count, count, yes_price/no_price (cents).
+        Read all three shapes so any transition state is tolerated.
         """
 
         def _to_int(val, default: int = 0) -> int:
@@ -698,6 +703,13 @@ class KalshiClient:
                 return int(round(float(val)))
             except (TypeError, ValueError):
                 return default
+
+        def _first(*vals):
+            """Return the first non-None value."""
+            for v in vals:
+                if v is not None:
+                    return v
+            return None
 
         def _price_cents(dollar_val, cent_val) -> int:
             """Prefer the *_dollars field; fall back to integer cents."""
@@ -711,31 +723,60 @@ class KalshiClient:
             except (TypeError, ValueError):
                 return 0
 
-        count = _to_int(
-            o.get("count")
-            if o.get("count") is not None
-            else o.get("initial_count_fp")
+        count = _to_int(_first(o.get("count"), o.get("initial_count_fp")))
+        # V2 uses "fill_count" (plain); fall back to legacy names.
+        filled = _to_int(_first(
+            o.get("fill_count_fp"), o.get("fill_count"), o.get("filled_count")
+        ))
+        remaining = _to_int(_first(
+            o.get("remaining_count_fp"), o.get("remaining_count")
+        ))
+
+        # V2 doesn't echo "status" in the lightweight create response.
+        # Infer: if any contracts filled, executed; otherwise resting.
+        # The caller can override interpretation based on time_in_force.
+        raw_status = o.get("status")
+        if raw_status:
+            status = OrderStatus(raw_status)
+        elif filled > 0 and remaining == 0:
+            status = OrderStatus.EXECUTED
+        elif filled > 0:
+            status = OrderStatus.EXECUTED  # partial fill — treat as executed
+        else:
+            status = OrderStatus.RESTING
+
+        # V2 returns a single average_fill_price; map it onto the right
+        # side-specific field based on the order's side (if present).
+        avg_fill = o.get("average_fill_price")
+        side_str = o.get("side", "yes")
+        # V2's side is "bid"/"ask"; map back to yes/no for internal use.
+        if side_str == "bid":
+            side_str = "yes"
+        elif side_str == "ask":
+            side_str = "no"
+        try:
+            side_enum = Side(side_str)
+        except ValueError:
+            side_enum = Side.YES
+
+        yes_price = _price_cents(
+            o.get("yes_price_dollars") or (avg_fill if side_enum == Side.YES else None),
+            o.get("yes_price"),
         )
-        filled = _to_int(
-            o.get("fill_count_fp")
-            if o.get("fill_count_fp") is not None
-            else o.get("filled_count")
-        )
-        remaining = _to_int(
-            o.get("remaining_count_fp")
-            if o.get("remaining_count_fp") is not None
-            else o.get("remaining_count")
+        no_price = _price_cents(
+            o.get("no_price_dollars") or (avg_fill if side_enum == Side.NO else None),
+            o.get("no_price"),
         )
 
         return Order(
             order_id=o.get("order_id", ""),
             ticker=o.get("ticker", ""),
-            side=Side(o.get("side", "yes")),
+            side=side_enum,
             order_type=OrderType(o.get("type", "limit")),
-            count=count,
-            yes_price=_price_cents(o.get("yes_price_dollars"), o.get("yes_price")),
-            no_price=_price_cents(o.get("no_price_dollars"), o.get("no_price")),
-            status=OrderStatus(o.get("status", "resting")),
+            count=count if count > 0 else (filled + remaining),
+            yes_price=yes_price,
+            no_price=no_price,
+            status=status,
             filled_count=filled,
             remaining_count=remaining,
         )
