@@ -1394,14 +1394,45 @@ class StrategyEngine:
         self.state["recent_trades"] = self.state["recent_trades"][:50]
 
     async def _handle_fill(self, msg: dict):
-        """Route Kalshi WS fill events to the AutoTrader."""
+        """Route Kalshi WS fill events to the AutoTrader.
+
+        V2 fill message schema (per Kalshi docs at
+        https://docs.kalshi.com/websockets/user-fills.md):
+          side: "yes" | "no" (NOT bid/ask — those live in book_side)
+          yes_price_dollars: "0.750"  (string dollars; single field)
+          count_fp: "278.00"          (fixed-point string)
+          fee_cost: paid per fill
+          action: "buy" | "sell"
+        Legacy field names (count, yes_price, no_price as plain integers)
+        are no longer emitted. Reading both ensures forward+backward compat.
+        """
         data = msg.get("msg", {})
         order_id = data.get("order_id", "")
         ticker = data.get("market_ticker", "")
         side_str = data.get("side", "")
-        count = int(data.get("count") or 0)
-        yes_price = int(data.get("yes_price") or 0)
-        no_price = int(data.get("no_price") or 0)
+
+        # count: prefer V2 count_fp, fall back to legacy count
+        count_raw = data.get("count_fp")
+        if count_raw is not None:
+            try:
+                count = int(round(float(count_raw)))
+            except (TypeError, ValueError):
+                count = 0
+        else:
+            count = int(data.get("count") or 0)
+
+        # price: V2 emits only yes_price_dollars; derive no_price from it.
+        # Fall back to legacy yes_price / no_price integer fields if present.
+        yes_price_dollars = data.get("yes_price_dollars")
+        if yes_price_dollars is not None:
+            try:
+                yes_price = int(round(float(yes_price_dollars) * 100))
+            except (TypeError, ValueError):
+                yes_price = 0
+            no_price = 100 - yes_price if yes_price else 0
+        else:
+            yes_price = int(data.get("yes_price") or 0)
+            no_price = int(data.get("no_price") or 0)
         price = yes_price if side_str == "yes" else no_price
 
         if not order_id or not count or not ticker:
