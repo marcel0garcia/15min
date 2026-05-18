@@ -128,7 +128,7 @@ trader:
   #   1 = fire immediately on first tick (old 3s-scan behavior)
   #   2 = ~2s of confirmation (conservative default)
   #   3 = ~3s — matches the OLD implicit gate before scan tightening
-  entry_confirmation_ticks: 2
+  entry_confirmation_ticks: 3
 
   # Position sizing (tuned for $100 starting balance)
   # Early window (GTC): quarter-Kelly — patient entries, time uncertainty higher
