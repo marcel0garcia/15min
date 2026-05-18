@@ -156,7 +156,7 @@ trader:
   # IOC would now have to cross far above signal-time mid, we're chasing
   # informed flow. Halve or skip depending on how bad the drift is.
   escalation_drift_halve_cents: 2   # drift > 2¢ beyond slippage → halve contracts
-  escalation_drift_skip_cents: 5    # drift > 5¢                  → skip IOC entirely
+  escalation_drift_skip_cents: 3    # drift > 3¢                  → skip IOC entirely
 
   # Reversal re-entry: require the live orderbook imbalance to actually
   # confirm the flip direction. Prevents taking reversal exits for profit

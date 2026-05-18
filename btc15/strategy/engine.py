@@ -1139,21 +1139,22 @@ class StrategyEngine:
                     orders = await self._kalshi.batch_place_orders(action.batch_orders)
                     for o in orders:
                         self._open_orders[o.order_id] = o
-                    # Register each leg as resting — fill arrives via WS fill event
-                    for o in orders:
-                        price = o.yes_price if o.side == Side.YES else o.no_price
+                    # Register each leg as resting — fill arrives via WS fill event.
+                    # Trust the input intent (action.batch_orders[i]["side"]) for the
+                    # outcome side; V2 POST doesn't echo side, so o.side is unreliable.
+                    for o, bo in zip(orders, action.batch_orders):
+                        intent_side = (bo.get("side") or "yes").lower()
+                        price = o.yes_price if intent_side == "yes" else o.no_price
                         self.autotrader.record_order(
-                            o.order_id, action.ticker, o.side.value,
+                            o.order_id, action.ticker, intent_side,
                             price, o.count, purpose="arb", mode="arb"
                         )
-                    for o in orders:
-                        price = o.yes_price if o.side == Side.YES else o.no_price
                         self._log_trade(
-                            action.ticker, o.side.value, o.count,
+                            action.ticker, intent_side, o.count,
                             price, f"auto/{action.reason}"
                         )
                         self.state["recent_trades"].insert(0, {
-                            "ticker": action.ticker, "side": o.side.value,
+                            "ticker": action.ticker, "side": intent_side,
                             "contracts": o.count, "price_cents": price,
                             "entry_time": datetime.now(timezone.utc).isoformat(),
                             "source": "auto/arb", "status": "resting",
@@ -1396,9 +1397,13 @@ class StrategyEngine:
                 filled = contracts
                 if api_order and api_order.filled_count > 0:
                     filled = api_order.filled_count
-                    if api_order.side == Side.YES and api_order.yes_price:
+                    # Pick the price by the order's actual intent (info["side"]),
+                    # not api_order.side — V2's side semantics are unreliable, but
+                    # the parser populates both yes_price and no_price via the
+                    # single-book invariant.
+                    if side_str == "yes" and api_order.yes_price:
                         price = api_order.yes_price
-                    elif api_order.side == Side.NO and api_order.no_price:
+                    elif side_str == "no" and api_order.no_price:
                         price = api_order.no_price
 
                 trade_id = f"T{uuid.uuid4().hex[:8].upper()}"
@@ -1437,18 +1442,25 @@ class StrategyEngine:
 
         V2 fill message schema (per Kalshi docs at
         https://docs.kalshi.com/websockets/user-fills.md):
-          side: "yes" | "no" (NOT bid/ask — those live in book_side)
+          side: "yes" | "no"
           yes_price_dollars: "0.750"  (string dollars; single field)
           count_fp: "278.00"          (fixed-point string)
           fee_cost: paid per fill
           action: "buy" | "sell"
-        Legacy field names (count, yes_price, no_price as plain integers)
-        are no longer emitted. Reading both ensures forward+backward compat.
+
+        IMPORTANT: the docs describe `side` as the outcome side, but in V2's
+        single-book reality the fill stream emits the BOOK side. A NO buy at
+        46¢ fills as side="yes", action="sell", yes_price=54 — meaning we
+        sold YES on the book (= bought NO from the user's view). Treat `side`
+        as advisory only; the outcome side comes from resting_orders[order_id]
+        (persona's recorded intent), with action+side as a derivation fallback
+        for untracked fills.
         """
         data = msg.get("msg", {})
         order_id = data.get("order_id", "")
         ticker = data.get("market_ticker", "")
-        side_str = data.get("side", "")
+        ws_side = data.get("side", "")
+        action = data.get("action", "")
 
         # count: prefer V2 count_fp, fall back to legacy count
         count_raw = data.get("count_fp")
@@ -1460,8 +1472,8 @@ class StrategyEngine:
         else:
             count = int(data.get("count") or 0)
 
-        # price: V2 emits only yes_price_dollars; derive no_price from it.
-        # Fall back to legacy yes_price / no_price integer fields if present.
+        # Raw prices on both sides. Don't pick yet — outcome side is determined
+        # below from order intent, not from the WS message's `side` field.
         yes_price_dollars = data.get("yes_price_dollars")
         if yes_price_dollars is not None:
             try:
@@ -1472,7 +1484,10 @@ class StrategyEngine:
         else:
             yes_price = int(data.get("yes_price") or 0)
             no_price = int(data.get("no_price") or 0)
-        price = yes_price if side_str == "yes" else no_price
+            if yes_price > 0 and no_price == 0:
+                no_price = 100 - yes_price
+            elif no_price > 0 and yes_price == 0:
+                yes_price = 100 - no_price
 
         # Per-fill fee from V2 fill message (in dollars; can be negative for rebates)
         try:
@@ -1493,7 +1508,22 @@ class StrategyEngine:
             )
             return
 
-        if order_id not in self.autotrader.resting_orders:
+        # Determine the outcome side authoritatively. Under V2's single-book
+        # model the fill's `side` field is the book side, not the outcome side:
+        # a NO buy fills as side="yes", action="sell" (we sold YES on the book
+        # = we hold NO). Trust resting_orders[order_id]["side"] — the persona
+        # recorded its intent there at submit time. Fall back to deriving from
+        # ws_side + action only when we have no tracked intent.
+        info = self.autotrader.resting_orders.get(order_id)
+        if info is not None and info.get("side"):
+            side_str = info["side"]
+        elif (ws_side == "yes" and action == "sell") or (ws_side == "no" and action == "buy"):
+            side_str = "no"
+        else:
+            side_str = "yes"
+        price = yes_price if side_str == "yes" else no_price
+
+        if info is None:
             # Fill arrived for an order we don't have in resting_orders.
             # This happens when a stacked duplicate order filled after the first
             # order's fill already cleared it from resting_orders.
@@ -1517,7 +1547,6 @@ class StrategyEngine:
             self.state["recent_trades"] = self.state["recent_trades"][:50]
             return
 
-        info = self.autotrader.resting_orders[order_id]
         mode = info.get("mode", "directional")
         trade_id = f"T{uuid.uuid4().hex[:8].upper()}"
 
