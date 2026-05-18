@@ -801,13 +801,19 @@ class KalshiClient:
         except ValueError:
             side_enum = Side.YES
 
-        # Prefer direct yes_price/no_price fields if present (legacy GET
-        # response shape — those fields are already in the right currency
-        # per side). Fall back to V2's single average_fill_price and derive
-        # BOTH prices symmetrically from it: yes = YES-book, no = 100-it.
+        # Read both yes_price and no_price fields. V2 GET /portfolio/orders
+        # typically returns both; V2 POST response only has average_fill_price.
+        # Enforce the single-book invariant (yes + no = 100) to be robust
+        # against any response that populates only one side: whichever price
+        # we have, the other is its complement.
         yes_price = _price_cents(o.get("yes_price_dollars"), o.get("yes_price"))
         no_price = _price_cents(o.get("no_price_dollars"), o.get("no_price"))
-        if yes_price == 0 and no_price == 0 and avg_fill is not None:
+        if yes_price > 0 and no_price == 0:
+            no_price = 100 - yes_price
+        elif no_price > 0 and yes_price == 0:
+            yes_price = 100 - no_price
+        elif yes_price == 0 and no_price == 0 and avg_fill is not None:
+            # POST response path: only average_fill_price is populated.
             try:
                 ys = int(round(float(avg_fill) * 100))
                 yes_price = ys
