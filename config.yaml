@@ -43,7 +43,7 @@ models:
 
 strategy:
   min_seconds_remaining: 60
-  max_seconds_remaining: 870
+  max_seconds_remaining: 840
   preferred_entry_window_sec: [180, 600]
   auto_trade: false       # set true to enable live trading
   paper_trade: true       # always start in paper mode
@@ -64,14 +64,14 @@ trader:
   early_window_min_seconds: 480   # 8 min
   prime_window_min_seconds: 180   # 3 min
   late_window_min_seconds:  60    # 1 min
-  max_entry_seconds: 870          # never enter beyond 14.5 min remaining
+  max_entry_seconds: 840          # wait 60s after market open before entering
 
   # Entry thresholds
   # min_confidence: 0.45 is the new conviction-weighted scale (anchored to
   # weighted-mean distance from 0.5, NOT std-dev). Looks lower than before
   # but is harder to clear — old 0.55 admitted near-neutral signals.
-  min_confidence: 0.45            # minimum model confidence
-  min_edge: 0.05                  # minimum edge over Kalshi mid-price
+  min_confidence: 0.50            # minimum model confidence
+  min_edge: 0.10                  # minimum edge over Kalshi mid-price
   min_entry_price_cents: 15       # skip contracts already priced below 10¢
   max_entry_price_cents: 72       # skip deep-ITM contracts. Tightened from 85:
                                   # post-mortem on 12APR06:15 showed 67-82¢ entries
@@ -176,11 +176,11 @@ risk:
   max_open_positions: 3           # 3 × $5 = $15 max simultaneous exposure on first live
   max_trade_usd: 5.00             # capped at $5 for first live-trading session (was 20.00)
   max_position_per_market_usd: 5.00  # capped per-market too; raise after live baseline
-  daily_loss_limit_usd: 15.00     # stop trading if down $15 on the day (15% of $100)
+  daily_loss_limit_usd: 50.00     # halt trading if down $50 on the day
   kelly_fraction: 0.25
   min_trade_usd: 0.50             # Kalshi practical minimum
   win_rate_lookback: 20
-  win_rate_min: 0.40              # halt if recent win rate drops below 40%
+  win_rate_min: 0.20              # halt if recent win rate drops below 20%
 
 logging:
   level: "INFO"
