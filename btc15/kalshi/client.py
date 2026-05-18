@@ -801,6 +801,24 @@ class KalshiClient:
         except ValueError:
             side_enum = Side.YES
 
+        # Parse fees paid for this order.
+        # V2 POST response:                  average_fee_paid       (string dollars)
+        # V2 GET /portfolio/orders:          taker_fees_dollars + maker_fees_dollars
+        # Convert all to total dollars for the Order's fees_paid_usd field.
+        def _to_float(v) -> float:
+            try:
+                return float(v or 0)
+            except (TypeError, ValueError):
+                return 0.0
+        avg_fee = o.get("average_fee_paid")
+        if avg_fee is not None and filled > 0:
+            # average_fee_paid is per-contract; multiply by filled count
+            fees_paid_usd = _to_float(avg_fee) * filled
+        else:
+            taker = _to_float(o.get("taker_fees_dollars"))
+            maker = _to_float(o.get("maker_fees_dollars"))
+            fees_paid_usd = taker + maker
+
         # Read both yes_price and no_price fields. V2 GET /portfolio/orders
         # typically returns both; V2 POST response only has average_fill_price.
         # Enforce the single-book invariant (yes + no = 100) to be robust

@@ -32,6 +32,11 @@ class RiskState:
     # to "lose" their P&L and trade count overnight.
     session_pnl: float = 0.0
     session_trades: int = 0
+    # Cumulative Kalshi fees paid this session. session_pnl is already net of
+    # fees (each fee is subtracted at fill time via record_fee). This counter
+    # is kept separately so the dashboard can show how much of total P&L
+    # impact came from fees vs trading edge.
+    session_fees_usd: float = 0.0
     open_positions: int = 0
     total_exposure_usd: float = 0.0
     recent_trades: deque = field(default_factory=lambda: deque(maxlen=100))
@@ -177,6 +182,27 @@ class RiskManager:
     def record_exposure_change(self, delta_usd: float):
         self.state.total_exposure_usd = max(0, self.state.total_exposure_usd + delta_usd)
 
+    def record_fee(self, fee_usd: float):
+        """Subtract a Kalshi trading fee from session_pnl and daily_pnl.
+
+        Called by the engine on every fill (entry and exit) using the
+        fee values Kalshi returns in V2 responses and WS fill messages
+        (fee_cost / average_fee_paid / taker_fees_dollars / etc.).
+
+        Keeps the displayed session_pnl honest -- without this the bot's
+        ledger over-states P&L by the cumulative fee burden, even though
+        the account balance correctly reflects the fees.
+
+        Quiet by design (no per-fee log line); aggregate impact is
+        visible in session_pnl + a `session_fees_usd` counter in the
+        summary dict.
+        """
+        if fee_usd <= 0:
+            return
+        self.state.daily_pnl -= fee_usd
+        self.state.session_pnl -= fee_usd
+        self.state.session_fees_usd += fee_usd
+
     def _halt(self, reason: str):
         self.state.halted = True
         self.state.halt_reason = reason
@@ -199,6 +225,7 @@ class RiskManager:
             "daily_trades": self.state.daily_trades,
             "session_pnl": self.state.session_pnl,
             "session_trades": self.state.session_trades,
+            "session_fees_usd": self.state.session_fees_usd,
             "open_positions": self.state.open_positions,
             "total_exposure": self.state.total_exposure_usd,
             "win_rate": self.state.win_rate,

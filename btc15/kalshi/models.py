@@ -92,6 +92,7 @@ class Order:
     remaining_count: int = 0
     created_time: Optional[datetime] = None
     expiration_time: Optional[datetime] = None
+    fees_paid_usd: float = 0.0  # Kalshi fee for this order's fills, in dollars
 
     @property
     def fill_usd(self) -> float:

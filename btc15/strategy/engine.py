@@ -178,6 +178,15 @@ class StrategyEngine:
         # the GTC→IOC escalation path that produced the duplicate "reconciled_gap"
         # rows in the live trade log.
         self._recently_placed: dict[str, float] = {}
+        # _handled_fill_orders: Kalshi order_id → epoch when WE recorded the fill
+        # via HTTP (IOC immediate response, reconciler "Missed fill" synthesis, or
+        # exit sell response). Used by _handle_fill to drop the duplicate WS fill
+        # event that Kalshi emits for the same order_id moments after HTTP fill.
+        # Without this dedup, every IOC-filled order would be double-counted by
+        # the "Untracked fill" branch of _handle_fill once the WS-fill V2 fix
+        # (commit db3f1bb) makes WS fills land in the handler. Entries auto-prune
+        # after 60s (well beyond any HTTP↔WS race window).
+        self._handled_fill_orders: dict[str, float] = {}
         # Tracks how many _check_settlements cycles a ticker has been past close_time
         # without Kalshi publishing the official result yet (API lag is normal 5–30s).
         self._settlement_pending_count: dict[str, int] = {}
@@ -309,6 +318,9 @@ class StrategyEngine:
 
             self.autotrader.record_fill(ticker, side_enum.value, contracts, price_cents, trade_id)
             self.risk.record_open(ticker, side_enum.value, contracts, price_cents)
+            if not paper:
+                self.risk.record_fee(order.fees_paid_usd)
+                self._handled_fill_orders[order.order_id] = time.time()
             self._log_trade(ticker, side_enum.value, contracts, price_cents, "manual", trade_id)
             self.state["recent_trades"].insert(0, {
                 "ticker": ticker, "side": side_enum.value, "contracts": contracts,
@@ -859,6 +871,13 @@ class StrategyEngine:
                         self.risk.record_open(
                             action.ticker, action.side, filled, action.price_cents
                         )
+                        # Capture Kalshi fee from the order response (V2
+                        # average_fee_paid × filled, populated by the parser
+                        # at order parse time). Mark this order_id as handled
+                        # via HTTP so the duplicate WS fill event is dropped
+                        # by _handle_fill's dedup check.
+                        self.risk.record_fee(order.fees_paid_usd)
+                        self._handled_fill_orders[order.order_id] = time.time()
                         self._log_trade(
                             action.ticker, action.side, filled,
                             action.price_cents, f"auto/{action.reason}", trade_id
@@ -971,6 +990,11 @@ class StrategyEngine:
                                 self.risk.record_close(
                                     action.ticker, won=(partial_pnl > 0), pnl=partial_pnl
                                 )
+                                # Capture Kalshi fee on this partial exit. Mark
+                                # the order_id so any WS-side echo for this sell
+                                # gets dropped as a duplicate.
+                                self.risk.record_fee(order.fees_paid_usd)
+                                self._handled_fill_orders[order.order_id] = time.time()
                                 self._log_trade(
                                     action.ticker, f"{action.side}_partial_exit",
                                     filled, actual_price,
@@ -1007,6 +1031,10 @@ class StrategyEngine:
             self.autotrader.record_exit(action.ticker, pnl, side=action.side)
             self._recently_exited[action.ticker] = time.time()
             self.risk.record_close(action.ticker, won=(pnl > 0), pnl=pnl)
+            # Capture Kalshi fee on the sell side and mark the order_id so the
+            # WS fill duplicate (if any) is suppressed by the dedup check.
+            self.risk.record_fee(order.fees_paid_usd)
+            self._handled_fill_orders[order.order_id] = time.time()
             self._log_trade(
                 action.ticker, f"{action.side}_exit",
                 action.contracts, action.price_cents,
@@ -1194,6 +1222,10 @@ class StrategyEngine:
                     t: ts for t, ts in self._recently_placed.items()
                     if now_t - ts < 30
                 }
+                self._handled_fill_orders = {
+                    oid: ts for oid, ts in self._handled_fill_orders.items()
+                    if now_t - ts < 60
+                }
 
                 # Step 1: reconcile resting orders (fills missed during WS gaps)
                 await self._reconcile_resting_orders()
@@ -1376,6 +1408,13 @@ class StrategyEngine:
                 )
                 self.autotrader.record_fill(ticker, side_str, filled, price, trade_id, mode=mode)
                 self.risk.record_open(ticker, side_str, filled, price)
+                # Capture fee from the api_order's parsed fees_paid_usd
+                # (V2 returns taker_fees_dollars + maker_fees_dollars on GET).
+                # Mark Kalshi's order_id (oid) as handled so the duplicate WS
+                # fill event for the same fill is dropped.
+                if api_order is not None:
+                    self.risk.record_fee(api_order.fees_paid_usd)
+                self._handled_fill_orders[oid] = time.time()
                 self._log_trade(ticker, side_str, filled, price, "auto/reconciled", trade_id)
                 self.autotrader.remove_order(oid)
 
@@ -1435,7 +1474,23 @@ class StrategyEngine:
             no_price = int(data.get("no_price") or 0)
         price = yes_price if side_str == "yes" else no_price
 
+        # Per-fill fee from V2 fill message (in dollars; can be negative for rebates)
+        try:
+            fee_usd = float(data.get("fee_cost") or 0)
+        except (TypeError, ValueError):
+            fee_usd = 0.0
+
         if not order_id or not count or not ticker:
+            return
+
+        # Dedup: if the HTTP path already recorded this order's fill (and fee),
+        # the WS fill is a duplicate notification — skip it entirely. Prevents
+        # the "Untracked fill" branch from double-counting IOC immediate fills.
+        if order_id in self._handled_fill_orders:
+            log.debug(
+                f"[FILL] {order_id[:8]} already handled via HTTP — "
+                f"skipping WS duplicate"
+            )
             return
 
         if order_id not in self.autotrader.resting_orders:
@@ -1450,6 +1505,7 @@ class StrategyEngine:
             trade_id = f"T{uuid.uuid4().hex[:8].upper()}"
             self.autotrader.record_fill(ticker, side_str, count, price, trade_id, mode="directional")
             self.risk.record_open(ticker, side_str, count, price)
+            self.risk.record_fee(fee_usd)
             self._log_trade(ticker, side_str, count, price, "auto/untracked_fill", trade_id)
             self.state["recent_trades"].insert(0, {
                 "ticker": ticker, "side": side_str, "contracts": count,
@@ -1472,6 +1528,7 @@ class StrategyEngine:
 
         self.autotrader.record_fill(ticker, side_str, count, price, trade_id, mode=mode)
         self.risk.record_open(ticker, side_str, count, price)
+        self.risk.record_fee(fee_usd)
         self._log_trade(ticker, side_str, count, price, "auto/fill", trade_id)
 
         remaining = info.get("contracts", 0) - count
