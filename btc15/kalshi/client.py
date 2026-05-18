@@ -782,8 +782,13 @@ class KalshiClient:
         else:
             status = OrderStatus.RESTING
 
-        # V2 returns a single average_fill_price; map it onto the right
-        # side-specific field based on the order's side (if present).
+        # V2 single-book model: average_fill_price is ALWAYS the YES-book
+        # price, regardless of whether our order was a YES bid, YES ask, NO
+        # bid, or NO ask. For NO contracts, the actual NO price paid/received
+        # is (100 - YES_book_price). Previous parser version mapped avg_fill
+        # straight onto no_price for Side.NO orders, which is wrong by the
+        # full 100-2P spread (a NO buy intended at 52¢ filled and was
+        # recorded as NO @ 48¢ — inverted around 50¢, breaking pnl accounting).
         avg_fill = o.get("average_fill_price")
         side_str = o.get("side", "yes")
         # V2's side is "bid"/"ask"; map back to yes/no for internal use.
@@ -796,14 +801,19 @@ class KalshiClient:
         except ValueError:
             side_enum = Side.YES
 
-        yes_price = _price_cents(
-            o.get("yes_price_dollars") or (avg_fill if side_enum == Side.YES else None),
-            o.get("yes_price"),
-        )
-        no_price = _price_cents(
-            o.get("no_price_dollars") or (avg_fill if side_enum == Side.NO else None),
-            o.get("no_price"),
-        )
+        # Prefer direct yes_price/no_price fields if present (legacy GET
+        # response shape — those fields are already in the right currency
+        # per side). Fall back to V2's single average_fill_price and derive
+        # BOTH prices symmetrically from it: yes = YES-book, no = 100-it.
+        yes_price = _price_cents(o.get("yes_price_dollars"), o.get("yes_price"))
+        no_price = _price_cents(o.get("no_price_dollars"), o.get("no_price"))
+        if yes_price == 0 and no_price == 0 and avg_fill is not None:
+            try:
+                ys = int(round(float(avg_fill) * 100))
+                yes_price = ys
+                no_price = 100 - ys
+            except (TypeError, ValueError):
+                pass
 
         return Order(
             order_id=o.get("order_id", ""),
