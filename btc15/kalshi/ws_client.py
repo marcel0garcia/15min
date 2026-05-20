@@ -361,26 +361,44 @@ class MarketDataCache:
     async def handle_trade(self, msg: dict):
         """Append a public trade to the per-ticker rolling tape.
 
-        V2 trade message fields:
-          market_ticker, count_fp, yes_price_dollars, no_price_dollars,
-          taker_outcome_side ("yes"|"no") — the outcome the taker bought,
-          taker_book_side ("bid"|"ask") — which book side they crossed,
-          ts (epoch seconds).
+        V2 trade message fields (per Kalshi docs
+        https://docs.kalshi.com/websockets/public-trades):
+          market_ticker:      string
+          count_fp:           string fixed-point (e.g. "12.00")
+          yes_price_dollars:  string dollars
+          no_price_dollars:   string dollars
+          taker_outcome_side: "yes"|"no" — the outcome contract the taker
+                              ended up holding (authoritative outcome signal)
+          taker_book_side:    "bid"|"ask" — which side of the book was hit.
+                              V2 docs equivalence: bid <-> outcome yes,
+                              ask <-> outcome no. Used as a fallback when
+                              outcome_side is absent.
+          taker_side:         legacy alias; description ambiguous in V2 docs,
+                              so we don't trust it before the book-side check.
+          ts_ms:              Unix milliseconds (current field)
+          ts:                 Unix seconds (deprecated)
 
-        We store taker_outcome_side as the directional signal: a "yes"
-        taker is aggressive YES demand (bullish), "no" is aggressive NO
-        demand (bearish). Consumed by get_recent_flow() for the entry
-        flow-alignment gate in strategy/personas.py.
+        We store the outcome side as the directional signal: a "yes" taker
+        is aggressive YES demand (bullish), "no" is aggressive NO demand
+        (bearish). Consumed by get_recent_flow() for the entry flow-alignment
+        gate in strategy/personas.py.
         """
         data = msg.get("msg", {})
         ticker = data.get("market_ticker")
         if not ticker:
             return
-        # Prefer outcome_side (per V2 trade schema); fall back to taker_side
-        # for forward-compat. Either should be "yes"|"no" — anything else
-        # (e.g., legacy "bid"/"ask" book-side phrasing) is treated as unknown
-        # and dropped from the tape.
-        side = (data.get("taker_outcome_side") or data.get("taker_side") or "").lower()
+        # Side resolution: prefer the explicit outcome field, then derive
+        # from book_side per the docs equivalence, then the ambiguous legacy
+        # taker_side as last resort. Anything else is dropped.
+        side = (data.get("taker_outcome_side") or "").lower()
+        if side not in ("yes", "no"):
+            book = (data.get("taker_book_side") or "").lower()
+            if book == "bid":
+                side = "yes"
+            elif book == "ask":
+                side = "no"
+            else:
+                side = (data.get("taker_side") or "").lower()
         if side not in ("yes", "no"):
             return
         try:
@@ -390,8 +408,19 @@ class MarketDataCache:
             yes_cents = int(round(float(data.get("yes_price_dollars") or 0) * 100))
         except (TypeError, ValueError):
             return
-        # Use the WS-provided ts if present, otherwise our local clock.
-        ts = float(data.get("ts") or time.time())
+        # Prefer ts_ms (current field, ms) over ts (deprecated, seconds);
+        # fall back to local clock.
+        ts_ms = data.get("ts_ms")
+        if ts_ms is not None:
+            try:
+                ts = float(ts_ms) / 1000.0
+            except (TypeError, ValueError):
+                ts = time.time()
+        else:
+            try:
+                ts = float(data.get("ts") or time.time())
+            except (TypeError, ValueError):
+                ts = time.time()
 
         async with self._lock:
             buf = self._trades.get(ticker)
