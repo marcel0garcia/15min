@@ -409,6 +409,192 @@ def analyze_session(
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
+# ─── Market dynamics analyzer ────────────────────────────────────────────────
+
+# Lifecycle segments — minutes from market OPEN. 15-min markets run 900s.
+# Phase labels mirror the bot's window logic where useful.
+SEGMENTS = [
+    ("0-3min  (open)",        720, 900),  # secs_left 720-900
+    ("3-6min  (early)",       540, 720),
+    ("6-9min  (mid)",         360, 540),
+    ("9-12min (prime)",       180, 360),
+    ("12-15min (settle)",       0, 180),
+]
+
+
+def analyze_dynamics(session_tag: str, refresh: bool = False) -> None:
+    """Cross-tape view: how do prices actually move during a 15-min market?
+    Aggregates over every ticker the bot touched and answers:
+      - How often does YES touch extreme zones in each segment?
+      - Given an extreme touch at segment S, what's P(settle in that direction)?
+      - What's the typical drawdown / range by segment?
+    """
+    if not CROSS_VALIDATE_JSON.exists():
+        print(f"  ! {CROSS_VALIDATE_JSON} missing — run friday_cross_validate.py first")
+        return
+    cv = json.loads(CROSS_VALIDATE_JSON.read_text())
+    if session_tag not in cv:
+        print(f"  ! session {session_tag} not in cross_validate.json")
+        return
+
+    positions = cv[session_tag]["positions"]
+    tickers = sorted(set(p["ticker"] for p in positions))
+    # Settlement lookup
+    settle = {}
+    for p in positions:
+        settle[p["ticker"]] = p.get("result")
+
+    print(f"\nMarket dynamics — session {session_tag}, {len(tickers)} unique markets\n")
+
+    # Per-ticker segment stats
+    per_segment_stats = {label: [] for (label, _, _) in SEGMENTS}
+    for tk in tickers:
+        trades = fetch_tape(tk, refresh=refresh)
+        close_utc = parse_close_time_utc(tk)
+        if not close_utc or not trades:
+            continue
+        result = settle.get(tk)  # 'yes' / 'no' / None
+        # Parse all trades into (secs_left, yes_cents)
+        ticks = []
+        for t in trades:
+            try:
+                ts = _parse_iso(t["created_time"])
+                yes_cents = int(round(float(t["yes_price_dollars"]) * 100))
+                ticks.append((( close_utc - ts).total_seconds(), yes_cents))
+            except (ValueError, KeyError):
+                continue
+        if not ticks:
+            continue
+        # Bucket by segment
+        for (label, lo, hi) in SEGMENTS:
+            seg_prices = [p for (s, p) in ticks if lo <= s < hi]
+            if not seg_prices:
+                continue
+            per_segment_stats[label].append({
+                "ticker": tk,
+                "min_yes": min(seg_prices),
+                "max_yes": max(seg_prices),
+                "open_yes": seg_prices[-1],   # ticks sorted newest-first by secs_left ASC means oldest=last; but we iterate t in trades sorted by ts — let me fix below
+                "close_yes": seg_prices[0],
+                "n_trades": len(seg_prices),
+                "settle": result,
+            })
+
+    # (Note: secs_left is HIGHER earlier in the market. seg_prices list-order
+    #  reflects iteration order of trades. We don't strictly need open/close
+    #  per-segment for the questions below; we use min/max plus tick count.)
+
+    # ── Question A: How often does YES touch extreme zones in each segment? ──
+    print("=" * 78)
+    print(" A. Extreme-touch frequency by segment")
+    print("=" * 78)
+    print(f"  {'segment':22} {'n':>3}  {'YES<10':>7} {'YES<20':>7} {'YES<30':>7} "
+          f"{'YES>70':>7} {'YES>80':>7} {'YES>90':>7}")
+    for (label, _, _) in SEGMENTS:
+        rows = per_segment_stats[label]
+        if not rows:
+            continue
+        n = len(rows)
+        def pct(cond):
+            return sum(1 for r in rows if cond(r)) / n * 100
+        print(f"  {label:22} {n:>3}  "
+              f"{pct(lambda r: r['min_yes'] < 10):>6.0f}% "
+              f"{pct(lambda r: r['min_yes'] < 20):>6.0f}% "
+              f"{pct(lambda r: r['min_yes'] < 30):>6.0f}% "
+              f"{pct(lambda r: r['max_yes'] > 70):>6.0f}% "
+              f"{pct(lambda r: r['max_yes'] > 80):>6.0f}% "
+              f"{pct(lambda r: r['max_yes'] > 90):>6.0f}%")
+
+    # ── Question B: Given YES touches an extreme, P(settle in that direction) ──
+    print()
+    print("=" * 78)
+    print(" B. Settlement probability given extreme touch in segment")
+    print("    e.g. 'YES<20 → NO' = P(market settles NO | YES touched <20¢ in segment)")
+    print("=" * 78)
+    print(f"  {'segment':22}  {'YES<10 → NO':<14} {'YES<20 → NO':<14} "
+          f"{'YES>80 → YES':<14} {'YES>90 → YES':<14}")
+    for (label, _, _) in SEGMENTS:
+        rows = [r for r in per_segment_stats[label] if r["settle"] in ("yes", "no")]
+        if not rows:
+            continue
+        def cond_settle(touch_cond, target):
+            hit = [r for r in rows if touch_cond(r)]
+            if not hit:
+                return "n=0"
+            won = sum(1 for r in hit if r["settle"] == target)
+            return f"{won}/{len(hit)} ({won/len(hit)*100:.0f}%)"
+        print(f"  {label:22}  "
+              f"{cond_settle(lambda r: r['min_yes'] < 10, 'no'):<14} "
+              f"{cond_settle(lambda r: r['min_yes'] < 20, 'no'):<14} "
+              f"{cond_settle(lambda r: r['max_yes'] > 80, 'yes'):<14} "
+              f"{cond_settle(lambda r: r['max_yes'] > 90, 'yes'):<14}")
+
+    # ── Question C: Range / volatility per segment ──
+    print()
+    print("=" * 78)
+    print(" C. Price range per segment (max - min YES, percentage)")
+    print("=" * 78)
+    print(f"  {'segment':22} {'n':>3}  {'avg range':>10} {'p50':>5} {'p75':>5} {'p90':>5} {'max':>5}")
+    for (label, _, _) in SEGMENTS:
+        rows = per_segment_stats[label]
+        if not rows:
+            continue
+        ranges = sorted(r["max_yes"] - r["min_yes"] for r in rows)
+        n = len(ranges)
+        def pctile(p):
+            return ranges[int(p * (n-1))]
+        avg = sum(ranges) / n
+        print(f"  {label:22} {n:>3}  {avg:>9.1f}¢ {pctile(0.5):>4.0f}¢ "
+              f"{pctile(0.75):>4.0f}¢ {pctile(0.90):>4.0f}¢ {max(ranges):>4.0f}¢")
+
+    # ── Question D: Phase of MAX drawdown for shaken-out trades ──
+    print()
+    print("=" * 78)
+    print(" D. When did the max-adverse-drawdown happen? (segment of low point)")
+    print("    (for positions the bot took — uses entry side and final settlement)")
+    print("=" * 78)
+    by_class = defaultdict(lambda: defaultdict(int))
+    for p in positions:
+        tk = p["ticker"]
+        close_utc = parse_close_time_utc(tk)
+        if not close_utc:
+            continue
+        trades = fetch_tape(tk, refresh=False)
+        try:
+            entry_ts = _parse_iso(p["ts_open"])
+        except (ValueError, KeyError, TypeError):
+            continue
+        post_entry = [
+            (close_utc - _parse_iso(t["created_time"])).total_seconds()
+            for t in trades
+            if _parse_iso(t["created_time"]) >= entry_ts
+        ]
+        post_entry_prices = [
+            int(round(float(t["yes_price_dollars"]) * 100))
+            for t in trades
+            if _parse_iso(t["created_time"]) >= entry_ts
+        ]
+        if not post_entry_prices:
+            continue
+        side = p["side"]
+        # Adversarial price = lowest YES (for YES side) or highest YES (for NO side)
+        if side == "yes":
+            worst_idx = post_entry_prices.index(min(post_entry_prices))
+        else:
+            worst_idx = post_entry_prices.index(max(post_entry_prices))
+        secs_at_worst = post_entry[worst_idx]
+        # Find segment
+        for (label, lo, hi) in SEGMENTS:
+            if lo <= secs_at_worst < hi:
+                by_class[p["class"]][label] += 1
+                break
+    print(f"  {'class':16}  " + "  ".join(f"{lbl[:11]:>11}" for (lbl, _, _) in SEGMENTS))
+    for cls in ("correct_win", "shaken_out", "wrong_loss", "saved_by_exit"):
+        cells = " ".join(f"{by_class[cls].get(lbl, 0):>11d}"
+                         for (lbl, _, _) in SEGMENTS)
+        print(f"  {cls:16}   {cells}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Kalshi market tape analyzer")
     ap.add_argument("--ticker", help="Single ticker to pull and render")
@@ -418,6 +604,9 @@ def main():
                     help="Only positions matching this class")
     ap.add_argument("--summary", action="store_true",
                     help="Session-level summary (default if --session given)")
+    ap.add_argument("--dynamics", action="store_true",
+                    help="Aggregate market-dynamics view (touch frequency, "
+                         "conditional settlement, range distributions)")
     ap.add_argument("--refresh", action="store_true",
                     help="Force re-fetch even if cache exists")
     args = ap.parse_args()
@@ -436,6 +625,8 @@ def main():
                         break
                 if result: break
         print(render_timeline(args.ticker, trades, bot_events, result))
+    elif args.session and args.dynamics:
+        analyze_dynamics(args.session, refresh=args.refresh)
     elif args.session:
         analyze_session(args.session, filter_class=args.filter, refresh=args.refresh)
     else:
