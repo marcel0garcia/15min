@@ -115,12 +115,15 @@ trader:
   reversal_min_edge: 0.10         # 10% edge required to flip sides
   reversal_min_seconds: 300       # only flip with >5 min left
 
-  # Loss-cut cool-off: hold the cut decision for N seconds and re-check.
-  # If model returns to agreeing OR pnl recovers above stop_thresh during the
-  # wait, the cut clears. Calibrated for the 1s scan interval. Tunable here.
-  # The <240s remaining tier always uses 0s (late window = decisive cut).
-  cool_off_seconds_high_runway: 10.0  # >480s remaining
-  cool_off_seconds_mid_runway: 5.0    # 240-480s remaining
+  # Loss-cut cool-off — DISABLED (set to 0).
+  # Rationale: empirical tape data (tools/friday_market_tape.py over 737
+  # markets) showed real recoveries take MINUTES, not the 5-10s the
+  # cool-off was set to. Of 8 cool-off "saves" in the 18MAY22:30 live
+  # session, 7 went on to hit -65% emergency_stop anyway — the cool-off
+  # converted -40% loss_cuts into deeper losses, net-negative for the
+  # session. Replaced by phase-aware emergency_stop tiers in personas.py.
+  cool_off_seconds_high_runway: 0.0   # was 10.0
+  cool_off_seconds_mid_runway: 0.0    # was 5.0
 
   # Entry signal persistence: fresh entries (not reversal, not pyramid) must
   # see the conf+edge gate clear for this many consecutive 1s scans before

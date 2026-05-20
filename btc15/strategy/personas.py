@@ -335,15 +335,26 @@ class AutoTrader:
             # healthy position permanently.
             pnl_pct = (current_bid - entry) / entry  # -1.0 when bid=0 (full loss)
 
-            # Emergency stop: fire immediately at any time if loss exceeds threshold.
-            # Bypasses the time gate AND the cool-off below — a 65%+ loss is
-            # unrecoverable regardless of how much time remains.
-            if pnl_pct <= -self.cfg.emergency_stop_pct:
+            # Emergency stop — phase-aware floor.
+            # Early-window dips often reverse; late-window dips usually don't.
+            # Tape data (tools/friday_market_tape.py --dynamics over 737
+            # markets) shows ~25% of YES<20 dips in 0-6min settle YES, vs ~10%
+            # in the 9-15min window. Loosening the threshold in early windows
+            # preserves optionality on the recoverable dips while keeping the
+            # decisive cut in the late window where dips are real.
+            # config emergency_stop_pct is the late-window floor.
+            if secs > 540:           # 0-6 min from open
+                em_stop_pct = 0.75
+            elif secs > 300:         # 6-10 min remaining
+                em_stop_pct = 0.70
+            else:                    # last 5 min: tight, use config default
+                em_stop_pct = self.cfg.emergency_stop_pct
+            if pnl_pct <= -em_stop_pct:
                 self._stop_cooldown[ticker] = time.time()
                 self._pending_loss_cut.pop(ticker, None)
                 log.warning(
                     f"{self.tag} EMERGENCY STOP: {ticker} {side.upper()} | "
-                    f"pnl={pnl_pct:+.1%} (threshold={-self.cfg.emergency_stop_pct:.0%}) | "
+                    f"pnl={pnl_pct:+.1%} (threshold={-em_stop_pct:.0%}) | "
                     f"{secs:.0f}s left"
                 )
                 actions.append(Action(
@@ -375,16 +386,22 @@ class AutoTrader:
                     ))
                     continue
 
-            # Rule 2.5: Time-adaptive profit-take.
-            # Near settlement, the risk/reward of holding flips: upside shrinks
-            # but gamma risk from thin-book BTC ticks grows. Take profits more
-            # aggressively as time runs down.
-            if secs > 300:
-                pt_bid_thresh, pt_pnl_thresh = 90, 0.30   # >5 min: original rule
-            elif secs > 180:
-                pt_bid_thresh, pt_pnl_thresh = 85, 0.25   # 3-5 min: slightly tighter
-            else:
-                pt_bid_thresh, pt_pnl_thresh = 80, 0.20   # <3 min: bank it
+            # Rule 2.5: Phase-aware profit-take.
+            # Tape data (tools/friday_market_tape.py --dynamics over 737 markets)
+            # showed early-window markets rarely reach 90¢ (p90 in 0-3min is
+            # 79¢) — so the old "wait for 90¢" rule never fired in the first
+            # half of a market's life. Conditional settlement probs say
+            # selling at 70¢ in 0-3min is +12¢/contract better than holding;
+            # the crossover where holding beats selling is around 6-9min.
+            # New schedule banks early profits where they're reachable.
+            if secs > 720:           # 0-3 min from open: bank 70¢+ aggressively
+                pt_bid_thresh, pt_pnl_thresh = 70, 0.30
+            elif secs > 540:         # 3-6 min: 80¢+ still positive sell-EV
+                pt_bid_thresh, pt_pnl_thresh = 80, 0.30
+            elif secs > 180:         # 6-12 min: 85¢ — closer to equilibrium
+                pt_bid_thresh, pt_pnl_thresh = 85, 0.25
+            else:                    # <3 min: gamma protection, bank it
+                pt_bid_thresh, pt_pnl_thresh = 80, 0.20
 
             if current_bid >= pt_bid_thresh and secs > 20 and pnl_pct >= pt_pnl_thresh:
                 self._pending_loss_cut.pop(ticker, None)
