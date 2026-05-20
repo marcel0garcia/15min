@@ -210,6 +210,7 @@ class StrategyEngine:
         self._ws.on("ticker", self._market_cache.handle_ticker)
         self._ws.on("orderbook_delta", self._market_cache.handle_orderbook_delta)
         self._ws.on("orderbook_snapshot", self._market_cache.handle_orderbook_snapshot)
+        self._ws.on("trade", self._market_cache.handle_trade)
         self._ws.on("fill", self._handle_fill)
         self._ws.on_reconnect = self._on_ws_reconnect
         # Lets the cache trigger a REST refresh when data goes stale between ticks.
@@ -606,6 +607,15 @@ class StrategyEngine:
                     "ticker": market.ticker,
                     "annual_vol": annual_vol,
                 }
+                # Pull aggressive-taker flow over the configured window. The
+                # personas entry gate uses this to reject entries that disagree
+                # with the prevailing tape direction. Cheap in-memory aggregation.
+                flow_window = getattr(
+                    self.cfg.trader, "trade_flow_window_seconds", 30.0
+                )
+                flow_info = await self._market_cache.get_recent_flow(
+                    market.ticker, window_sec=flow_window
+                )
                 try:
                     actions = self.autotrader.evaluate(
                         ticker=market.ticker,
@@ -613,6 +623,7 @@ class StrategyEngine:
                         orderbook=ob_info,
                         output=output,
                         bankroll_usd=bankroll,
+                        flow_info=flow_info,
                     )
                     for action in actions:
                         await self._execute_action(action)

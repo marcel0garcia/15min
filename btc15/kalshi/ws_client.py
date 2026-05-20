@@ -5,7 +5,14 @@ import asyncio
 import json
 import logging
 import time
+from collections import deque
 from typing import Any, Callable, Coroutine, Optional
+
+# Per-ticker trade buffer caps. Keep ~60s of trades — long enough for any
+# realistic flow-alignment window the strategy might query, short enough
+# that memory stays bounded on quiet markets.
+_TRADE_BUFFER_SEC = 60.0
+_TRADE_BUFFER_MAX = 500       # hard cap per ticker (defensive)
 
 import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatus
@@ -54,7 +61,7 @@ class KalshiWebSocket:
 
     async def subscribe(self, tickers: list[str], channels: Optional[list[str]] = None):
         """Subscribe to channels for given market tickers."""
-        channels = channels or ["orderbook_delta", "ticker"]
+        channels = channels or ["orderbook_delta", "ticker", "trade"]
         self._subscribed_tickers.update(tickers)
         if self._ws:
             await self._send_subscribe(tickers, channels)
@@ -148,7 +155,7 @@ class KalshiWebSocket:
                 if self._subscribed_tickers:
                     await self._send_subscribe(
                         list(self._subscribed_tickers),
-                        ["orderbook_delta", "ticker", "fill"],
+                        ["orderbook_delta", "ticker", "trade", "fill"],
                     )
 
                 async for raw in ws:
@@ -197,6 +204,10 @@ class MarketDataCache:
     def __init__(self):
         self._tickers: dict[str, dict] = {}      # ticker → {yes_bid, yes_ask, volume, ...}
         self._orderbooks: dict[str, dict] = {}   # ticker → {yes_bids: [...], yes_asks: [...]}
+        # Per-ticker rolling trade tape: deque of (ts, taker_side, count, yes_cents).
+        # Populated by handle_trade; consumed by get_recent_flow for the entry
+        # flow-alignment gate. Bounded by both time and a hard maxlen.
+        self._trades: dict[str, deque] = {}
         self._lock = asyncio.Lock()
         # Injected by the engine: fire-and-forget REST refresh when cache looks stale.
         # Signature: async def refresh(ticker: str) -> None
@@ -346,6 +357,97 @@ class MarketDataCache:
 
         if gap_detected and self.rest_refresh is not None:
             asyncio.create_task(self.rest_refresh(ticker))
+
+    async def handle_trade(self, msg: dict):
+        """Append a public trade to the per-ticker rolling tape.
+
+        V2 trade message fields:
+          market_ticker, count_fp, yes_price_dollars, no_price_dollars,
+          taker_outcome_side ("yes"|"no") — the outcome the taker bought,
+          taker_book_side ("bid"|"ask") — which book side they crossed,
+          ts (epoch seconds).
+
+        We store taker_outcome_side as the directional signal: a "yes"
+        taker is aggressive YES demand (bullish), "no" is aggressive NO
+        demand (bearish). Consumed by get_recent_flow() for the entry
+        flow-alignment gate in strategy/personas.py.
+        """
+        data = msg.get("msg", {})
+        ticker = data.get("market_ticker")
+        if not ticker:
+            return
+        # Prefer outcome_side (per V2 trade schema); fall back to taker_side
+        # for forward-compat. Either should be "yes"|"no" — anything else
+        # (e.g., legacy "bid"/"ask" book-side phrasing) is treated as unknown
+        # and dropped from the tape.
+        side = (data.get("taker_outcome_side") or data.get("taker_side") or "").lower()
+        if side not in ("yes", "no"):
+            return
+        try:
+            count = float(data.get("count_fp") or 0)
+            if count <= 0:
+                return
+            yes_cents = int(round(float(data.get("yes_price_dollars") or 0) * 100))
+        except (TypeError, ValueError):
+            return
+        # Use the WS-provided ts if present, otherwise our local clock.
+        ts = float(data.get("ts") or time.time())
+
+        async with self._lock:
+            buf = self._trades.get(ticker)
+            if buf is None:
+                buf = deque(maxlen=_TRADE_BUFFER_MAX)
+                self._trades[ticker] = buf
+            buf.append((ts, side, count, yes_cents))
+            # Trim by age — drop entries older than _TRADE_BUFFER_SEC.
+            cutoff = ts - _TRADE_BUFFER_SEC
+            while buf and buf[0][0] < cutoff:
+                buf.popleft()
+
+    async def get_recent_flow(
+        self, ticker: str, window_sec: float = 30.0
+    ) -> dict:
+        """Aggregate per-side taker volume over the last `window_sec`.
+
+        Returns a dict:
+          {
+            "yes_volume":  float  — contracts taken on the YES side
+            "no_volume":   float  — contracts taken on the NO side
+            "total_volume": float — yes + no
+            "net_flow":    float  — (yes - no) / total, in [-1, +1], or 0 if no trades
+            "yes_share":   float  — yes / total, in [0, 1], or 0.5 if no trades
+            "trade_count": int    — distinct trades in window
+            "window_sec":  float
+          }
+        """
+        cutoff = time.time() - window_sec
+        yes_vol = 0.0
+        no_vol = 0.0
+        n = 0
+        async with self._lock:
+            buf = self._trades.get(ticker)
+            if buf:
+                for ts, side, count, _ in buf:
+                    if ts < cutoff:
+                        continue
+                    n += 1
+                    if side == "yes":
+                        yes_vol += count
+                    else:
+                        no_vol += count
+        total = yes_vol + no_vol
+        if total > 0:
+            net = (yes_vol - no_vol) / total
+            yes_share = yes_vol / total
+        else:
+            net = 0.0
+            yes_share = 0.5
+        return {
+            "yes_volume": yes_vol, "no_volume": no_vol,
+            "total_volume": total, "net_flow": net,
+            "yes_share": yes_share, "trade_count": n,
+            "window_sec": window_sec,
+        }
 
     async def get_ticker(self, ticker: str) -> Optional[dict]:
         async with self._lock:

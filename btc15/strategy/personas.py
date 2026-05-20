@@ -156,6 +156,7 @@ class AutoTrader:
         orderbook: dict,        # {yes_bid, yes_ask}
         output: ModelOutput,
         bankroll_usd: float,
+        flow_info: Optional[dict] = None,   # rolling taker-tape snapshot
     ) -> list[Action]:
         if not self.cfg.enabled:
             return []
@@ -286,6 +287,7 @@ class AutoTrader:
             entry = self._check_directional_entry(
                 ticker, orderbook, output, bankroll_usd, secs, annual_vol,
                 is_reversal=reversal_exit,
+                flow_info=flow_info,
             )
             if entry:
                 actions.append(entry)
@@ -857,6 +859,7 @@ class AutoTrader:
         secs: float,
         annual_vol: float = 0.80,
         is_reversal: bool = False,
+        flow_info: Optional[dict] = None,
     ) -> Optional[Action]:
         """
         Phase-aware directional entry:
@@ -910,6 +913,34 @@ class AutoTrader:
                 f"conf={output.confidence:.0%} edge={edge:+.1%} — high-edge/low-conf skip"
             )
             return None
+
+        # Trade-tape flow-alignment gate.
+        # The aggressive taker side over the last `trade_flow_window_seconds`
+        # is the strongest near-term directional signal we have access to.
+        # If our intended side is taking less than `trade_flow_required_alignment`
+        # of recent volume, the tape is going the other way — skip the entry.
+        # Reversals bypass this gate (they have their own orderbook-confirm
+        # check just below). The gate is also skipped when total volume is
+        # below `trade_flow_min_volume` (no signal worth acting on).
+        if not is_reversal and flow_info is not None:
+            required = getattr(self.cfg, "trade_flow_required_alignment", 0.0)
+            min_vol = getattr(self.cfg, "trade_flow_min_volume", 0.0)
+            total_vol = float(flow_info.get("total_volume", 0.0))
+            if required > 0 and total_vol >= min_vol:
+                our_share = (
+                    flow_info.get("yes_share", 0.5) if side == "yes"
+                    else (1.0 - flow_info.get("yes_share", 0.5))
+                )
+                if our_share < required:
+                    log.info(
+                        f"{self.tag} FLOW MISALIGNMENT: {ticker} {side.upper()} | "
+                        f"our_share={our_share:.0%} < required={required:.0%} | "
+                        f"yes={flow_info.get('yes_volume', 0):.1f} "
+                        f"no={flow_info.get('no_volume', 0):.1f} "
+                        f"net={flow_info.get('net_flow', 0):+.2f} | "
+                        f"window={flow_info.get('window_sec', 0):.0f}s"
+                    )
+                    return None
 
         # Reversal re-entry orderbook confirmation.
         # Post-mortem: reversals exited at strong model edge but re-entries lost
@@ -1066,10 +1097,17 @@ class AutoTrader:
                     )
                     return None
 
+        flow_tag = ""
+        if flow_info is not None and flow_info.get("total_volume", 0) > 0:
+            flow_tag = (
+                f" flow=yes:{flow_info['yes_volume']:.0f}/"
+                f"no:{flow_info['no_volume']:.0f} "
+                f"net={flow_info['net_flow']:+.2f}"
+            )
         log.info(
             f"{self.tag} SIGNAL [{phase}|{order_mode}]: {ticker} {side.upper()} | "
             f"conf={output.confidence:.0%} edge={edge:+.1%} "
-            f"×{contracts} @ {raw_price}¢ mid={signal_mid:.1f}¢"
+            f"×{contracts} @ {raw_price}¢ mid={signal_mid:.1f}¢{flow_tag}"
         )
 
         return Action(

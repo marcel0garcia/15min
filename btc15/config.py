@@ -187,6 +187,18 @@ class TraderConfig:
     # it would be rejected as a fading signal. Set to 1.0 to disable.
     entry_conf_fade_max: float = 0.05  # 5 percentage points
 
+    # ── Trade-tape flow alignment gate (aggressive-taker direction) ───────
+    # On every directional entry, sample the last `trade_flow_window_seconds`
+    # of public trades for the ticker. The taker side of those trades
+    # represents aggressive demand — if our intended side is taking less than
+    # `trade_flow_required_alignment` of the recent volume, reject the entry
+    # as misaligned with the prevailing tape. Skipped entirely when the
+    # window has fewer than `trade_flow_min_volume` total contracts (no signal).
+    # Set required_alignment to 0.0 to disable the gate (A/B testing).
+    trade_flow_window_seconds: float = 30.0
+    trade_flow_required_alignment: float = 0.30
+    trade_flow_min_volume: float = 5.0
+
     # ── Arb ───────────────────────────────────────────────────────────────
     arb_enabled: bool = True             # master switch; disable for clean first-live debut
     min_arb_cents: int = 2               # YES+NO must cost ≤98¢ for guaranteed arb
