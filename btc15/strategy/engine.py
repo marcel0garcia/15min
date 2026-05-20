@@ -39,7 +39,7 @@ from btc15.kalshi.ws_client import KalshiWebSocket, MarketDataCache
 from btc15.models.ensemble import EnsembleModel
 from btc15.models.ml_model import collect_sample
 from btc15.risk.manager import RiskManager
-from btc15.strategy.personas import Action, AutoTrader
+from btc15.strategy.personas import Action, AutoTrader, phase_min_confidence
 
 
 log = logging.getLogger(__name__)
@@ -578,7 +578,7 @@ class StrategyEngine:
                 orderbook_bid_depth=bid_depth,
                 orderbook_ask_depth=ask_depth,
                 min_edge=self.cfg.trader.min_edge,
-                min_confidence=self.cfg.trader.min_confidence,
+                min_confidence=phase_min_confidence(secs, self.cfg.trader),
             )
 
             signals_snapshot[market.ticker] = {

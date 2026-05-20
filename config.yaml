@@ -133,6 +133,21 @@ trader:
   #   3 = ~3s — matches the OLD implicit gate before scan tightening
   entry_confirmation_ticks: 3
 
+  # Confidence-trend filter: on top of the K-tick gate, require the fire-tick
+  # confidence to be at least (peak_in_window - this) so we don't fire on
+  # signals that spiked then faded. Set to 1.0 to disable.
+  entry_conf_fade_max: 0.05
+
+  # Phase-conditional min_confidence floor. Overrides the flat
+  # trader.min_confidence on a per-phase basis. Empty dict {} falls back to
+  # flat. Tightening "early" + "late" reflects the noisy open / thin-book
+  # close; loosening "mid" reflects the cleanest-WR window in our data.
+  min_confidence_by_phase:
+    early: 0.55    # >540s remaining (first 6 min of market)
+    mid:   0.48    # 300-540s (6-10 min — best-WR per dynamics analysis)
+    prime: 0.50    # 180-300s (10-12 min — matches flat default)
+    late:  0.55    # <180s (decisive but thin-book risk)
+
   # Position sizing (tuned for $100 starting balance)
   # Early window (GTC): quarter-Kelly — patient entries, time uncertainty higher
   # Prime window (IOC): half-Kelly — high conviction, short window

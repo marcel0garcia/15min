@@ -164,6 +164,29 @@ class TraderConfig:
     reversal_orderbook_min_dev: float = 0.10  # |prob_orderbook - 0.5| must exceed this
                                               # in the flip direction to allow re-entry
 
+    # ── Phase-conditional entry confidence floor ──────────────────────────
+    # Empirical settlement-conditional probabilities (tools/friday_market_tape.py
+    # --dynamics over 737 markets) suggest signal quality varies by phase:
+    # the 6-10min window has the cleanest directional moves, while 0-6min is
+    # noisier and the final 3 min is decisive but thin-book-risky.
+    # Defaults are conservative tightenings vs. flat 0.50; lower individual
+    # values to "loosen" a phase or set the dict to {} to fall back to the
+    # flat trader.min_confidence floor.
+    min_confidence_by_phase: dict = field(default_factory=lambda: {
+        "early": 0.55,    # secs > 540  (0-6 min from open: noisier)
+        "mid":   0.48,    # secs 300-540 (6-10 min: best-WR window per dynamics data)
+        "prime": 0.50,    # secs 180-300 (10-12 min: current flat default)
+        "late":  0.55,    # secs < 180  (decisive but thin-book — tighten)
+    })
+
+    # ── Confidence-trend filter (denoise the 3-tick gate) ─────────────────
+    # Beyond requiring K consecutive scans of clearance, also require the
+    # confidence to NOT deteriorate by more than this many points from the
+    # pending-window peak. Catches the "spiked then faded" pattern where
+    # tick1=75, tick2=83, tick3 (fire)=57 — currently fires; with this gate
+    # it would be rejected as a fading signal. Set to 1.0 to disable.
+    entry_conf_fade_max: float = 0.05  # 5 percentage points
+
     # ── Arb ───────────────────────────────────────────────────────────────
     arb_enabled: bool = True             # master switch; disable for clean first-live debut
     min_arb_cents: int = 2               # YES+NO must cost ≤98¢ for guaranteed arb

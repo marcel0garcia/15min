@@ -28,6 +28,28 @@ from __future__ import annotations
 
 import logging
 import time
+
+
+def phase_min_confidence(secs: float, trader_cfg) -> float:
+    """Return the phase-conditional min_confidence floor.
+
+    Falls back to the flat ``trader.min_confidence`` if
+    ``trader.min_confidence_by_phase`` is missing or empty. The four phase
+    keys map to the same secs_remaining boundaries used elsewhere in the
+    strategy (emergency_stop, profit_take). Shared between engine.predict()
+    and personas' directional-entry gate so both stay in sync.
+    """
+    by_phase = getattr(trader_cfg, "min_confidence_by_phase", None) or {}
+    if not by_phase:
+        return trader_cfg.min_confidence
+    if secs > 540:
+        return by_phase.get("early", trader_cfg.min_confidence)
+    elif secs > 300:
+        return by_phase.get("mid", trader_cfg.min_confidence)
+    elif secs > 180:
+        return by_phase.get("prime", trader_cfg.min_confidence)
+    else:
+        return by_phase.get("late", trader_cfg.min_confidence)
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -862,9 +884,13 @@ class AutoTrader:
             return None
 
         # Confidence gate: skip for reversal re-entries (edge already validated
-        # at 0.10 — twice the normal bar). For normal entries, require min_confidence.
-        if not is_reversal and output.confidence < self.cfg.min_confidence:
-            return None
+        # at 0.10 — twice the normal bar). For normal entries, require the
+        # phase-conditional floor (falls back to flat min_confidence when the
+        # by-phase dict is empty / not configured).
+        if not is_reversal:
+            min_conf_floor = phase_min_confidence(secs, self.cfg)
+            if output.confidence < min_conf_floor:
+                return None
         if not output.recommended_side:
             return None
 
@@ -1013,17 +1039,32 @@ class AutoTrader:
                 prev = self._pending_entry_signal.get(key)
                 if prev and (now - prev["last_seen"]) <= STALE_AFTER:
                     ticks = prev["ticks"] + 1
+                    max_conf = max(prev.get("max_conf", 0.0), output.confidence)
                 else:
                     ticks = 1
+                    max_conf = output.confidence
                 if ticks < K:
-                    self._pending_entry_signal[key] = {"ticks": ticks, "last_seen": now}
+                    self._pending_entry_signal[key] = {
+                        "ticks": ticks, "last_seen": now, "max_conf": max_conf,
+                    }
                     log.info(
                         f"{self.tag} SIGNAL PENDING [{ticks}/{K}]: {ticker} {side.upper()} | "
                         f"conf={output.confidence:.0%} edge={edge:+.1%} — confirming"
                     )
                     return None
-                # Confirmation complete — fire and clear pending.
+                # Confirmation tick count met — apply the confidence-trend filter
+                # before firing. If the fire-tick confidence has faded more than
+                # fade_max points below the in-window peak, reject as a fading
+                # signal (the spiked-then-faded pattern). Clears pending either way.
+                fade_max = getattr(self.cfg, "entry_conf_fade_max", 0.05)
                 self._pending_entry_signal.pop(key, None)
+                if output.confidence < max_conf - fade_max:
+                    log.info(
+                        f"{self.tag} SIGNAL FADED: {ticker} {side.upper()} | "
+                        f"conf={output.confidence:.0%} dropped from peak "
+                        f"{max_conf:.0%} (>{fade_max:.0%} fade) — rejecting"
+                    )
+                    return None
 
         log.info(
             f"{self.tag} SIGNAL [{phase}|{order_mode}]: {ticker} {side.upper()} | "
