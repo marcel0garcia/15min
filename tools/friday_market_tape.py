@@ -422,34 +422,56 @@ SEGMENTS = [
 ]
 
 
-def analyze_dynamics(session_tag: str, refresh: bool = False) -> None:
+def analyze_dynamics(
+    session_tag: str | None = None,
+    refresh: bool = False,
+    all_sessions: bool = False,
+) -> None:
     """Cross-tape view: how do prices actually move during a 15-min market?
     Aggregates over every ticker the bot touched and answers:
       - How often does YES touch extreme zones in each segment?
       - Given an extreme touch at segment S, what's P(settle in that direction)?
       - What's the typical drawdown / range by segment?
+      - What's the distribution of peak YES per segment (for profit-take tuning)?
     """
     if not CROSS_VALIDATE_JSON.exists():
         print(f"  ! {CROSS_VALIDATE_JSON} missing — run friday_cross_validate.py first")
         return
     cv = json.loads(CROSS_VALIDATE_JSON.read_text())
-    if session_tag not in cv:
-        print(f"  ! session {session_tag} not in cross_validate.json")
+
+    positions: list[dict] = []
+    if all_sessions:
+        for tag, s in cv.items():
+            positions.extend(s.get("positions", []))
+        label_str = f"ALL sessions ({len(cv)} sessions)"
+    elif session_tag and session_tag in cv:
+        positions = cv[session_tag]["positions"]
+        label_str = f"session {session_tag}"
+    else:
+        print(f"  ! provide --session TAG or --all")
         return
 
-    positions = cv[session_tag]["positions"]
     tickers = sorted(set(p["ticker"] for p in positions))
     # Settlement lookup
     settle = {}
     for p in positions:
         settle[p["ticker"]] = p.get("result")
 
-    print(f"\nMarket dynamics — session {session_tag}, {len(tickers)} unique markets\n")
+    print(f"\nMarket dynamics — {label_str}, {len(tickers)} unique markets\n")
 
     # Per-ticker segment stats
     per_segment_stats = {label: [] for (label, _, _) in SEGMENTS}
-    for tk in tickers:
+    n_total = len(tickers)
+    t0 = time.time()
+    for i, tk in enumerate(tickers, 1):
+        cache_path = TAPE_DIR / f"{tk}.json"
+        was_cached = cache_path.exists() and not refresh
         trades = fetch_tape(tk, refresh=refresh)
+        if i % 50 == 0 or i == n_total:
+            rate = i / max(time.time() - t0, 1)
+            eta = (n_total - i) / max(rate, 0.01)
+            print(f"    [{i}/{n_total}] last={tk} cached={was_cached} "
+                  f"rate={rate:.1f}/s eta={eta:.0f}s")
         close_utc = parse_close_time_utc(tk)
         if not close_utc or not trades:
             continue
@@ -529,6 +551,29 @@ def analyze_dynamics(session_tag: str, refresh: bool = False) -> None:
               f"{cond_settle(lambda r: r['max_yes'] > 80, 'yes'):<14} "
               f"{cond_settle(lambda r: r['max_yes'] > 90, 'yes'):<14}")
 
+    # ── Question B': milder thresholds for profit-take calibration ──
+    print()
+    print("=" * 78)
+    print(" B'. Settlement probability at MILDER thresholds (profit-take zone)")
+    print("=" * 78)
+    print(f"  {'segment':22}  {'YES<30 → NO':<14} {'YES<40 → NO':<14} "
+          f"{'YES>60 → YES':<14} {'YES>70 → YES':<14}")
+    for (label, _, _) in SEGMENTS:
+        rows = [r for r in per_segment_stats[label] if r["settle"] in ("yes", "no")]
+        if not rows:
+            continue
+        def cond_settle(touch_cond, target):
+            hit = [r for r in rows if touch_cond(r)]
+            if not hit:
+                return "n=0"
+            won = sum(1 for r in hit if r["settle"] == target)
+            return f"{won}/{len(hit)} ({won/len(hit)*100:.0f}%)"
+        print(f"  {label:22}  "
+              f"{cond_settle(lambda r: r['min_yes'] < 30, 'no'):<14} "
+              f"{cond_settle(lambda r: r['min_yes'] < 40, 'no'):<14} "
+              f"{cond_settle(lambda r: r['max_yes'] > 60, 'yes'):<14} "
+              f"{cond_settle(lambda r: r['max_yes'] > 70, 'yes'):<14}")
+
     # ── Question C: Range / volatility per segment ──
     print()
     print("=" * 78)
@@ -546,6 +591,42 @@ def analyze_dynamics(session_tag: str, refresh: bool = False) -> None:
         avg = sum(ranges) / n
         print(f"  {label:22} {n:>3}  {avg:>9.1f}¢ {pctile(0.5):>4.0f}¢ "
               f"{pctile(0.75):>4.0f}¢ {pctile(0.90):>4.0f}¢ {max(ranges):>4.0f}¢")
+
+    # ── Question C': peak distribution per segment (profit-take ceiling) ──
+    print()
+    print("=" * 78)
+    print(" C'. Peak YES distribution per segment (max YES touched in segment)")
+    print("     — what's actually achievable as a profit-take target")
+    print("=" * 78)
+    print(f"  {'segment':22} {'n':>3}  {'p25':>5} {'p50':>5} {'p75':>5} {'p90':>5} {'max':>5}")
+    for (label, _, _) in SEGMENTS:
+        rows = per_segment_stats[label]
+        if not rows:
+            continue
+        peaks = sorted(r["max_yes"] for r in rows)
+        n = len(peaks)
+        def pctile(p):
+            return peaks[int(p * (n-1))]
+        print(f"  {label:22} {n:>3}  {pctile(0.25):>4.0f}¢ {pctile(0.5):>4.0f}¢ "
+              f"{pctile(0.75):>4.0f}¢ {pctile(0.90):>4.0f}¢ {max(peaks):>4.0f}¢")
+
+    # ── Question C'': trough distribution per segment ──
+    print()
+    print("=" * 78)
+    print(" C''. Trough YES distribution per segment (min YES touched in segment)")
+    print("     — what's actually achievable as a NO-side profit-take target")
+    print("=" * 78)
+    print(f"  {'segment':22} {'n':>3}  {'p10':>5} {'p25':>5} {'p50':>5} {'p75':>5} {'min':>5}")
+    for (label, _, _) in SEGMENTS:
+        rows = per_segment_stats[label]
+        if not rows:
+            continue
+        troughs = sorted(r["min_yes"] for r in rows)
+        n = len(troughs)
+        def pctile(p):
+            return troughs[int(p * (n-1))]
+        print(f"  {label:22} {n:>3}  {pctile(0.10):>4.0f}¢ {pctile(0.25):>4.0f}¢ "
+              f"{pctile(0.5):>4.0f}¢ {pctile(0.75):>4.0f}¢ {min(troughs):>4.0f}¢")
 
     # ── Question D: Phase of MAX drawdown for shaken-out trades ──
     print()
@@ -607,6 +688,9 @@ def main():
     ap.add_argument("--dynamics", action="store_true",
                     help="Aggregate market-dynamics view (touch frequency, "
                          "conditional settlement, range distributions)")
+    ap.add_argument("--all", action="store_true",
+                    help="With --dynamics: aggregate over ALL sessions in "
+                         "cross_validate.json (not just one)")
     ap.add_argument("--refresh", action="store_true",
                     help="Force re-fetch even if cache exists")
     args = ap.parse_args()
@@ -625,6 +709,8 @@ def main():
                         break
                 if result: break
         print(render_timeline(args.ticker, trades, bot_events, result))
+    elif args.dynamics and args.all:
+        analyze_dynamics(None, refresh=args.refresh, all_sessions=True)
     elif args.session and args.dynamics:
         analyze_dynamics(args.session, refresh=args.refresh)
     elif args.session:
