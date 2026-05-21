@@ -430,7 +430,10 @@ class StrategyEngine:
 
         new_tickers = [m.ticker for m in markets if m.ticker not in self._watched_markets]
         if new_tickers:
-            await self._ws.subscribe(new_tickers, ["orderbook_delta", "ticker", "fill"])
+            await self._ws.subscribe(
+                new_tickers,
+                ["orderbook_delta", "ticker", "trade", "fill"],
+            )
             # Immediately seed the cache with REST snapshots for new tickers.
             # The WS will also deliver a snapshot on subscription but may take
             # a few seconds — without this the terminal shows "--" until the
