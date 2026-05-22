@@ -103,8 +103,6 @@ class TraderConfig:
     mm_quote_offset_cents: int = 2       # quote this many cents inside the best bid/ask
 
     # ── Exit rules ────────────────────────────────────────────────────────
-    stop_loss_pct: float = 0.40          # cut if losing >40% AND inside stop_loss_min_seconds
-    stop_loss_min_seconds: int = 240     # only cut if <4 min left (let positions breathe)
     emergency_stop_pct: float = 0.65    # cut IMMEDIATELY (any time) if losing >65%
     reversal_min_edge: float = 0.10      # edge required to flip sides
     reversal_min_seconds: int = 300      # only flip with >5 min left

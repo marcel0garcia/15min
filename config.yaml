@@ -107,11 +107,13 @@ trader:
   # Exit rules (simplified — no trailing stop, no profit decay)
   #   Rule 1: Pure arb pairs always hold to settlement ($1.00 guaranteed — never cut)
   #   Rule 2: Flip if model reverses with strong edge AND enough time remains
-  #   Rule 3: Cut losses only when close to settlement (don't get trapped near zero)
+  #   Rule 3: Phase-aware loss_cut tiers (hardcoded in personas.py, see Rule 3)
   #   Rule 4: Everything else → hold to $1.00 settlement
-  stop_loss_pct: 0.40             # cut if losing >40% AND <stop_loss_min_seconds left
-  stop_loss_min_seconds: 240      # 4 min: only cut losses inside last 4 minutes
-  emergency_stop_pct: 0.65        # cut IMMEDIATELY (any time) if losing >65%
+  # NOTE: stop_loss_pct / stop_loss_min_seconds were dead config fields (defined
+  # but never read by the strategy code). Removed. The actual loss_cut behavior
+  # is the phase-tiered thresholds in personas.py: early=-65%, mid=-55%,
+  # prime=-40%, late=-25%. Tweak there if you want to change thresholds.
+  emergency_stop_pct: 0.65        # late-window backstop (any time, any phase)
   reversal_min_edge: 0.10         # 10% edge required to flip sides
   reversal_min_seconds: 300       # only flip with >5 min left
 

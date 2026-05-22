@@ -9,10 +9,13 @@ Three time phases drive all decisions based on seconds remaining in the
   Prime  (3–8 min left) — IOC directional entry; escalates unfilled GTC orders
   Late   (<3 min left)  — No new entries; position management only
 
-Exit policy (3 rules — no trailing stop, no profit decay):
+Exit policy (4 rules — no trailing stop, no profit decay):
   Rule 1: Pure arb pairs always hold to settlement ($1.00 guaranteed)
   Rule 2: Flip sides if model reversal edge > reversal_min_edge AND >5 min left
-  Rule 3: Cut losses if pnl < -stop_loss_pct AND <4 min left
+  Rule 3: Phase-aware loss_cut (boundaries 540/300/180, thresholds
+          -65/-55/-40/-25). When the model still agrees with our side, the
+          cut is replaced by STOP SUPPRESSED (logged, position held).
+          Emergency_stop tiers (-75/-70/-65/-65) remain the absolute backstop.
   Rule 4: Everything else → hold to settlement
 
 Market making:
@@ -487,17 +490,33 @@ class AutoTrader:
             ctx = (f"rec={rec} conf={output.confidence:.0%} "
                    f"edge_our={our_side_edge:+.1%} legs={adds + 1}")
 
+            # Phase-aware loss_cut thresholds (and matching suppression
+            # "would_thresh" so STOP SUPPRESSED logs the same number that
+            # loss_cut would have used). Boundaries 540/300/180 align with
+            # min_confidence_by_phase and emergency_stop tiers — symmetric
+            # phase structure across all entry/exit gates.
+            #
+            # Empirical justification (943 closed positions across 16 sessions
+            # with tape data): WL trades only 1.4% reach max-drawdown in
+            # early/mid windows; 100% of right-side trades that hit >40%
+            # drawdown in any phase settled in our favor. The looser early/mid
+            # thresholds catch SO recoveries without pulling WL into the cut
+            # window. emergency_stop tiers (-75/-70/-65/-65) remain the
+            # absolute backstop.
+            if secs > 540:           # early (0-6 min from open)
+                base_thresh = -0.65  # was -0.55 — loosen to let SO recoveries play out
+            elif secs > 300:         # mid (6-10 min from open)
+                base_thresh = -0.55  # was -0.40 — substantial runway still
+            elif secs > 180:         # prime (10-12 min)
+                base_thresh = -0.40  # tighten back up; approaching settlement
+            else:                    # late (last 3 min)
+                base_thresh = -0.25  # decisive cut near settle
+
             if model_agrees:
                 # Suppression: model still likes our side. Clear any pending cut
                 # — it would only have been there from a brief disagreement window.
                 self._pending_loss_cut.pop(ticker, None)
-                if secs > 480:
-                    would_thresh = -0.55
-                elif secs > 240:
-                    would_thresh = -0.40
-                else:
-                    would_thresh = -0.25
-                would_thresh = max(would_thresh - pyramid_rope, -0.60)
+                would_thresh = max(base_thresh - pyramid_rope, -0.60)
                 if pnl_pct <= would_thresh:
                     log.info(
                         f"{self.tag} STOP SUPPRESSED: {ticker} {side.upper()} | "
@@ -505,15 +524,9 @@ class AutoTrader:
                         f"{ctx} — holding"
                     )
             else:
-                if secs > 480:
-                    stop_thresh = -0.55  # >8min: lots of recovery time
-                elif secs > 240:
-                    stop_thresh = -0.40  # 4-8min: standard
-                else:
-                    stop_thresh = -0.25  # <4min: cut anything decisively underwater
                 # Pyramid rope: deeper conviction → wider tolerance. Floor at -60%
-                # so emergency_stop (-65%) stays the absolute backstop.
-                stop_thresh = max(stop_thresh - pyramid_rope, -0.60)
+                # so emergency_stop (-65% late) stays the absolute backstop.
+                stop_thresh = max(base_thresh - pyramid_rope, -0.60)
 
                 if pnl_pct <= stop_thresh:
                     # Cool-off: more runway → more confirmation required.
