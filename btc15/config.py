@@ -51,6 +51,25 @@ class ModelsConfig:
     macd_signal: int = 9
     bb_period: int = 20
     bb_std: float = 2.0
+
+    # ── EWMA signal smoothing ─────────────────────────────────────────────
+    # Per-ticker exponentially-weighted average of confidence and edge
+    # across consecutive 1s scans. Filters sub-second/sub-tick noise while
+    # preserving genuine regime shifts. Applied inside EnsembleModel.predict()
+    # so all downstream gates (min_confidence_by_phase, edge floor,
+    # ENTRY SUPPRESSED, FLOW MISALIGNMENT, 3-tick gate, reversal, loss_cut,
+    # STOP SUPPRESSED) operate on smoothed values transparently.
+    #
+    # Half-life ≈ ln(2) / -ln(1-α) seconds at 1s scan interval:
+    #   α=0.20 → half-life 3.1s (recommended; matches 3-tick gate memory)
+    #   α=0.10 → half-life 6.6s (heavier smoothing, slower response)
+    #   α=0.30 → half-life 2.0s (lighter smoothing, faster response)
+    #   α=0.00 → disable (use raw values; backward-compatible escape hatch)
+    signal_smoothing_alpha: float = 0.20
+    # If we haven't seen this ticker for this many seconds, treat as cold
+    # start and reset smoothed = raw. Prevents blending stale state across
+    # WS gaps / disconnects.
+    signal_smoothing_stale_sec: float = 5.0
     default_annual_vol: float = 0.80
 
 

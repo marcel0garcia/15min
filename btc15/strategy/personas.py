@@ -1117,9 +1117,16 @@ class AutoTrader:
                 f"no:{flow_info['no_volume']:.0f} "
                 f"net={flow_info['net_flow']:+.2f}"
             )
+        # Raw (pre-smoothing) confidence/edge tag — populated only when
+        # signal_smoothing_alpha > 0 in models config. Lets us verify
+        # smoothing is doing what we expect on a per-fire basis.
+        raw_tag = ""
+        if getattr(output, "raw_confidence", None) is not None:
+            raw_e = (output.raw_edge_yes if side == "yes" else output.raw_edge_no) or 0.0
+            raw_tag = f" (raw {output.raw_confidence:.0%}/{raw_e:+.1%})"
         log.info(
             f"{self.tag} SIGNAL [{phase}|{order_mode}]: {ticker} {side.upper()} | "
-            f"conf={output.confidence:.0%} edge={edge:+.1%} "
+            f"conf={output.confidence:.0%} edge={edge:+.1%}{raw_tag} "
             f"×{contracts} @ {raw_price}¢ mid={signal_mid:.1f}¢{flow_tag}"
         )
 

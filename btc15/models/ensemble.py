@@ -62,6 +62,13 @@ class ModelOutput:
     edge_no: Optional[float] = None            # prob_no  - (1 - kalshi_yes_price/100)
     recommended_side: Optional[str] = None    # "yes" | "no" | None
 
+    # Pre-smoothing values, captured before EWMA replaces confidence/edge.
+    # Populated only when signal_smoothing_alpha > 0. Used for log lines so
+    # we can see what raw values fed the smoother.
+    raw_confidence: Optional[float] = None
+    raw_edge_yes: Optional[float] = None
+    raw_edge_no: Optional[float] = None
+
     @property
     def best_edge(self) -> Optional[float]:
         edges = []
@@ -93,6 +100,17 @@ class EnsembleModel:
         self.cfg = config
         self._ml_model = None
         self._try_load_ml_model()
+        # EWMA signal-smoothing state. Per-ticker dict of
+        # {"conf": float, "edge_yes": float, "edge_no": float, "last_ts": float}.
+        # Populated lazily on first observation of each ticker; reset on stale
+        # gaps. See _apply_signal_smoothing for the smoothing logic.
+        self._signal_smoothing_alpha = getattr(
+            config, "signal_smoothing_alpha", 0.20
+        ) if config is not None else 0.20
+        self._signal_smoothing_stale_sec = getattr(
+            config, "signal_smoothing_stale_sec", 5.0
+        ) if config is not None else 5.0
+        self._smoothed: dict[str, dict] = {}
 
     def _try_load_ml_model(self):
         try:
@@ -292,14 +310,78 @@ class EnsembleModel:
             out.edge_yes = out.prob_yes - out.kalshi_yes_price
             out.edge_no = out.prob_no - (1.0 - out.kalshi_yes_price)
 
-            # Recommend side if edge AND confidence meet thresholds
+        # ── EWMA signal smoothing (in-place: out.confidence/edge replaced) ────
+        # Applied AFTER raw computation but BEFORE recommended_side derivation
+        # so all downstream gates see smoothed values. Raw values preserved
+        # on out.raw_* for logging/debugging.
+        self._apply_signal_smoothing(out, ticker)
+
+        # ── Recommend side based on (possibly-smoothed) confidence + edge ─────
+        if out.kalshi_yes_price is not None:
             if out.confidence >= min_confidence:
-                if out.edge_yes >= min_edge:
+                if (out.edge_yes or 0) >= min_edge:
                     out.recommended_side = "yes"
-                elif out.edge_no >= min_edge:
+                elif (out.edge_no or 0) >= min_edge:
                     out.recommended_side = "no"
 
         return out
+
+    def _apply_signal_smoothing(self, out: "ModelOutput", ticker: str) -> None:
+        """Apply per-ticker EWMA to confidence and edge.
+
+        smoothed = α · current + (1 − α) · prev_smoothed
+
+        With α=0.20 at 1s scan interval, half-life is ~3.1s — sub-second
+        noise is filtered while genuine 30s+ regime shifts pass through.
+        On cold start (no prior observation) or stale gaps (>stale_sec),
+        smoothed = raw (no warmup bias).
+
+        No-op when α ≤ 0 or α ≥ 1 (disable knob).
+        """
+        α = self._signal_smoothing_alpha
+        if α <= 0 or α >= 1:
+            return
+
+        # Always populate raw fields for log visibility, even when smoothing
+        # produces near-identical output.
+        out.raw_confidence = out.confidence
+        out.raw_edge_yes = out.edge_yes
+        out.raw_edge_no = out.edge_no
+
+        import time as _time
+        now = _time.time()
+        prev = self._smoothed.get(ticker)
+        if prev is None or (now - prev["last_ts"]) > self._signal_smoothing_stale_sec:
+            # Cold start or stale gap — initialize smoothed = raw, no blending
+            sm_conf = out.confidence
+            sm_edge_yes = out.edge_yes if out.edge_yes is not None else None
+            sm_edge_no = out.edge_no if out.edge_no is not None else None
+        else:
+            sm_conf = α * out.confidence + (1 - α) * prev["conf"]
+            # edge_yes / edge_no may be None when kalshi_yes_price is missing.
+            # Blend whichever side has a numeric value; preserve None for the other.
+            if out.edge_yes is not None and prev["edge_yes"] is not None:
+                sm_edge_yes = α * out.edge_yes + (1 - α) * prev["edge_yes"]
+            else:
+                sm_edge_yes = out.edge_yes
+            if out.edge_no is not None and prev["edge_no"] is not None:
+                sm_edge_no = α * out.edge_no + (1 - α) * prev["edge_no"]
+            else:
+                sm_edge_no = out.edge_no
+
+        # Replace with smoothed values — downstream consumers (recommended_side
+        # derivation just below, plus all strategy gates in personas) see these.
+        out.confidence = sm_conf
+        out.edge_yes = sm_edge_yes
+        out.edge_no = sm_edge_no
+
+        # Persist state for next scan
+        self._smoothed[ticker] = {
+            "conf": sm_conf,
+            "edge_yes": sm_edge_yes,
+            "edge_no": sm_edge_no,
+            "last_ts": now,
+        }
 
     def _orderbook_imbalance_prob(
         self,

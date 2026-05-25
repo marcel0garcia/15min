@@ -41,6 +41,15 @@ models:
   bb_std: 2.0
   default_annual_vol: 0.80
 
+  # EWMA signal smoothing — denoises confidence/edge across 1s scans.
+  # Half-life ≈ ln(2)/-ln(1-α) at 1s scan:
+  #   0.20 → 3.1s (recommended; matches old 3-tick gate memory)
+  #   0.10 → 6.6s (heavier smoothing, slower response)
+  #   0.30 → 2.0s (lighter smoothing, faster response)
+  #   0.00 → disable, use raw values (A/B escape hatch)
+  signal_smoothing_alpha: 0.20
+  signal_smoothing_stale_sec: 5.0  # reset smoothing after WS gaps this long
+
 strategy:
   min_seconds_remaining: 60
   max_seconds_remaining: 840
