@@ -87,6 +87,42 @@ class BinanceFeed:
     def bars(self) -> list[OHLCBar]:
         return list(self._bars)
 
+    def partial_bar(
+        self,
+        min_age_sec: float = 5.0,
+        min_ticks: int = 5,
+    ) -> Optional[OHLCBar]:
+        """Snapshot of the in-progress (unclosed) bar from the accumulator.
+
+        Returns the partial bar as a regular OHLCBar (open/high/low/close
+        reflect what's happened so far in the current bar interval), or None
+        when the partial is too young to be informative (< min_age_sec or
+        < min_ticks).
+
+        Used by the ensemble's technical_momentum component so RSI/MACD/BB
+        update once per scan instead of once per bar interval — the slow
+        minute-scale signal becomes responsive at the second timescale.
+        """
+        acc = self._current_bar
+        if acc is None or acc._open is None:
+            return None
+        age = time.time() - acc.ts_ms / 1000
+        if age < min_age_sec or acc._count < min_ticks:
+            return None
+        return acc.to_ohlc()
+
+    @property
+    def bars_with_partial(self) -> list[OHLCBar]:
+        """Closed bars plus the live partial bar (when sufficient).
+
+        Drop-in replacement for `bars` when callers want per-scan freshness
+        on indicators that read bar series (RSI, MACD, BB, trend regression).
+        """
+        partial = self.partial_bar()
+        if partial is None:
+            return list(self._bars)
+        return list(self._bars) + [partial]
+
     @property
     def close_prices(self) -> list[float]:
         return [b.close for b in self._bars]

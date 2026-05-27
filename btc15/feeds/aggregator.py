@@ -167,6 +167,16 @@ class PriceAggregator:
         return self.feed.bars
 
     @property
+    def bars_with_partial(self) -> list[OHLCBar]:
+        """Closed bars + in-progress partial bar from the live accumulator.
+
+        Used by the strategy engine so technical indicators (RSI/MACD/BB,
+        trend regression) update every scan instead of every bar close.
+        Falls back to closed bars only when the partial is too young.
+        """
+        return self.feed.bars_with_partial
+
+    @property
     def close_prices(self) -> list[float]:
         return self.feed.close_prices
 

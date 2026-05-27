@@ -459,7 +459,10 @@ class StrategyEngine:
             log.debug("Skipping scan — no price data yet")
             return
         annual_vol = self.price_feed.realized_vol()
-        bars = self.price_feed.bars
+        # Use bars-with-partial so RSI/MACD/BB/trend recompute against an
+        # in-progress current bar each scan rather than being frozen between
+        # bar closes. Falls back to closed-only when the partial is too young.
+        bars = self.price_feed.bars_with_partial
         now_utc = datetime.now(timezone.utc)
 
         # Fetch balance once for the whole scan cycle
