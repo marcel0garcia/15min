@@ -149,6 +149,15 @@ trader:
   # signals that spiked then faded. Set to 1.0 to disable.
   entry_conf_fade_max: 0.05
 
+  # Raw-floor guard against EWMA dip-buoying. EWMA smoothing is symmetric
+  # (pulls toward the moving average in BOTH directions), so a recently-strong
+  # signal that has now decayed can still clear the smoothed floor even when
+  # the current RAW value is weak. This guard rejects such fires.
+  #   raw_conf >= (phase_min_confidence - smoothing_raw_margin)
+  # 0.10 = raw can drop 10pp below the floor before we drop the entry.
+  # Set to 1.0 to disable the guard; 0.0 = strictest (raw must clear floor).
+  smoothing_raw_margin: 0.10
+
   # Phase-conditional min_confidence floor. Overrides the flat
   # trader.min_confidence on a per-phase basis. Empty dict {} falls back to
   # flat. Tightening "early" + "late" reflects the noisy open / thin-book

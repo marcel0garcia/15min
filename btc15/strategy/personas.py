@@ -907,6 +907,25 @@ class AutoTrader:
             min_conf_floor = phase_min_confidence(secs, self.cfg)
             if output.confidence < min_conf_floor:
                 return None
+
+            # Raw-floor guard against EWMA dip-buoying. When the ensemble
+            # has been smoothing conf/edge (output.raw_confidence populated),
+            # the smoothed value clearing the floor isn't enough on its own —
+            # require the CURRENT raw value to also be within `margin` of
+            # the floor. Otherwise we're firing on a fading signal that was
+            # only strong in the past. See 25MAY22:07 post-mortem (fires #6
+            # and #10) for the empirical case this addresses.
+            raw_conf = getattr(output, "raw_confidence", None)
+            if raw_conf is not None:
+                margin = getattr(self.cfg, "smoothing_raw_margin", 0.10)
+                raw_floor = min_conf_floor - margin
+                if raw_conf < raw_floor:
+                    log.info(
+                        f"{self.tag} RAW FADED: {ticker} | "
+                        f"smoothed conf={output.confidence:.0%} (cleared {min_conf_floor:.0%}) "
+                        f"but raw={raw_conf:.0%} < floor−margin ({raw_floor:.0%}) — rejecting"
+                    )
+                    return None
         if not output.recommended_side:
             return None
 

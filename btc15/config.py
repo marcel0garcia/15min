@@ -204,6 +204,24 @@ class TraderConfig:
     # it would be rejected as a fading signal. Set to 1.0 to disable.
     entry_conf_fade_max: float = 0.05  # 5 percentage points
 
+    # ── Raw-floor guard against EWMA dip-buoying ──────────────────────────
+    # EWMA smoothing is symmetric — it pulls toward the moving average in
+    # BOTH directions. That's intended for filtering brief noise SPIKES
+    # (raw 80 % smoothed 60 → blocked). It's NOT intended for buoying
+    # fading signals (raw 40 % smoothed 59 → fires anyway). The 25MAY22:07
+    # session showed 2 of 14 fires came from this dip-buoying mode and
+    # both lost. This guard rejects entries where smoothed cleared the
+    # floor only because of stale-strong prior observations.
+    #
+    # Gate: when smoothing is active, also require
+    #   raw_confidence >= (phase_min_confidence - smoothing_raw_margin)
+    # Default margin of 0.10 means raw can drop 10pp below the smoothed
+    # floor and we'll still trust it; further than that, we treat the
+    # signal as dead even if smoothed says otherwise.
+    # Set to 1.0 to disable (allow any raw value).
+    # Set to 0.0 for the strictest version (raw must also clear floor).
+    smoothing_raw_margin: float = 0.10
+
     # ── Trade-tape flow alignment gate (aggressive-taker direction) ───────
     # On every directional entry, sample the last `trade_flow_window_seconds`
     # of public trades for the ticker. The taker side of those trades
