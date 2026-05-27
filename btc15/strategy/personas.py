@@ -934,17 +934,28 @@ class AutoTrader:
         if edge is None or edge < self.cfg.min_edge:
             return None
 
-        # Suppress high-edge, low-confidence entries: when the model shows extreme
-        # edge (>25%) but confidence is near-neutral (<52%), Kalshi's market makers
-        # are pricing a strong directional move our model can't confirm. This exact
-        # pattern (e.g. edge=37.7%, conf=50%) was the largest single-session loss
-        # driver in 21APR09:02 — the market knew; the model was late/wrong.
-        if not is_reversal and edge > 0.25 and output.confidence < 0.52:
-            log.info(
-                f"{self.tag} ENTRY SUPPRESSED: {ticker} {side.upper()} "
-                f"conf={output.confidence:.0%} edge={edge:+.1%} — high-edge/low-conf skip"
-            )
-            return None
+        # Suppress high-edge, low-confidence entries — informed-flow trap.
+        # Two tiers, both rejecting when the market is pricing a strong move
+        # our model can't fully confirm:
+        #   Tier 1 (original): edge > 25% AND conf < 52% — extreme edge / weak conf
+        #     was the largest single-session loss driver in 21APR09:02.
+        #   Tier 2 (Phase A audit): edge >= 35% AND conf < 65% — wider conf
+        #     bracket because the 30%+ edge bucket showed 51% side-acc across
+        #     2,631 fires (just coinflip), even when conf >= 52%. The deep
+        #     edges in this zone are mostly adverse selection.
+        if not is_reversal:
+            if edge > 0.25 and output.confidence < 0.52:
+                log.info(
+                    f"{self.tag} ENTRY SUPPRESSED: {ticker} {side.upper()} "
+                    f"conf={output.confidence:.0%} edge={edge:+.1%} — high-edge/low-conf skip"
+                )
+                return None
+            if edge >= 0.35 and output.confidence < 0.65:
+                log.info(
+                    f"{self.tag} ENTRY SUPPRESSED: {ticker} {side.upper()} "
+                    f"conf={output.confidence:.0%} edge={edge:+.1%} — deep-edge/mid-conf trap"
+                )
+                return None
 
         # Trade-tape flow-alignment gate.
         # The aggressive taker side over the last `trade_flow_window_seconds`
