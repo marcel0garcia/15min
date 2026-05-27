@@ -168,13 +168,15 @@ trader:
     prime: 0.50    # 180-300s (10-12 min — matches flat default)
     late:  0.55    # <180s (decisive but thin-book risk)
 
-  # Trade-tape flow-alignment gate. Pulls the last N seconds of public
-  # trades for the ticker and requires our intended side to be at least
-  # `required_alignment` of the aggressive-taker volume. Trades smaller
-  # than `min_volume` total contracts are treated as no-signal and skip
-  # the gate. Set required_alignment to 0.0 to disable.
+  # Trade-tape flow-alignment gate — DISABLED.
+  # Phase A audit (tools/friday_audit_backtest.py over 16 sessions, 2,631
+  # fires, 380 settled rejections) showed FLOW MISALIGNMENT rejected 65%
+  # WINS — the filter was actively costing us money. The tape feed itself
+  # stays alive (flow=... tag on SIGNAL lines is still useful diagnostic
+  # info); only the gate is disabled. Re-enable by setting required_alignment
+  # back to a positive value if a future analysis suggests it.
   trade_flow_window_seconds: 30.0
-  trade_flow_required_alignment: 0.30
+  trade_flow_required_alignment: 0.0   # was 0.30 — see Phase A audit findings
   trade_flow_min_volume: 5.0
 
   # Position sizing (tuned for $100 starting balance)
