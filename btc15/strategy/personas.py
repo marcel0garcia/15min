@@ -779,14 +779,19 @@ class AutoTrader:
         if spread < self.cfg.mm_min_spread_cents:
             return []
 
-        # Inventory: count YES vs NO contracts held from MM mode
+        # Inventory: count YES vs NO contracts held from MM mode.
+        # NOTE: previously this filter checked `mode in ("mm_yes", "mm")` and
+        # `mode in ("mm_no", "mm")` — but record_fill only ever stores mode="mm"
+        # (no per-side suffixes). The old filter therefore double-counted: a
+        # YES-mode position got tallied into BOTH inv_yes and inv_no, defeating
+        # the per-side inventory caps. Filter by SIDE explicitly.
         inv_yes = sum(
             p["contracts"] for p in self.positions.get(ticker, [])
-            if p.get("mode") in ("mm_yes", "mm")
+            if p.get("mode") == "mm" and p.get("side") == "yes"
         )
         inv_no = sum(
             p["contracts"] for p in self.positions.get(ticker, [])
-            if p.get("mode") in ("mm_no", "mm")
+            if p.get("mode") == "mm" and p.get("side") == "no"
         )
 
         # Quote inside the spread
