@@ -43,11 +43,11 @@ models:
 
   # EWMA signal smoothing — denoises confidence/edge across 1s scans.
   # Half-life ≈ ln(2)/-ln(1-α) at 1s scan:
-  #   0.20 → 3.1s (recommended; matches old 3-tick gate memory)
-  #   0.10 → 6.6s (heavier smoothing, slower response)
-  #   0.30 → 2.0s (lighter smoothing, faster response)
+  #   0.20 → 3.1s (heavier smoothing — was choking fire rate post-Phase-B)
+  #   0.30 → 1.9s (lighter smoothing — current; more current-tick influence)
+  #   0.10 → 6.6s (heavy smoothing, slow response)
   #   0.00 → disable, use raw values (A/B escape hatch)
-  signal_smoothing_alpha: 0.20
+  signal_smoothing_alpha: 0.30
   signal_smoothing_stale_sec: 5.0  # reset smoothing after WS gaps this long
 
 strategy:
@@ -138,11 +138,14 @@ trader:
 
   # Entry signal persistence: fresh entries (not reversal, not pyramid) must
   # see the conf+edge gate clear for this many consecutive 1s scans before
-  # firing. Filters out single-tick spikes that resolve in <1s.
-  #   1 = fire immediately on first tick (old 3s-scan behavior)
-  #   2 = ~2s of confirmation (conservative default)
-  #   3 = ~3s — matches the OLD implicit gate before scan tightening
-  entry_confirmation_ticks: 3
+  # firing.
+  #   1 = fire immediately on first tick (current — EWMA does the denoising)
+  #   2 = ~2s of confirmation
+  #   3 = ~3s — was choking fire rate when combined with EWMA at α=0.20
+  # With K=1, SIGNAL PENDING log lines no longer appear (nothing to "pend")
+  # and SIGNAL FADED becomes inert (needs ≥2 observations to detect fade).
+  # EWMA + raw-floor guard + ENTRY SUPPRESSED tiers carry the noise rejection.
+  entry_confirmation_ticks: 1
 
   # Confidence-trend filter: on top of the K-tick gate, require the fire-tick
   # confidence to be at least (peak_in_window - this) so we don't fire on
