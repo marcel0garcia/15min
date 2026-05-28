@@ -674,7 +674,9 @@ class StrategyEngine:
                         "value": value,
                         "pnl": round(value - cost, 2),
                         "mode": entry.get("mode", "directional"),
-                        "source": "auto",
+                        # Dashboard source label: "mm" → MM column shows "MM",
+                        # "dir" → "DIR". (terminal.py renders src[:3].upper())
+                        "source": "mm" if entry.get("mode") == "mm" else "dir",
                     })
             if refreshed:
                 self.state["open_positions"] = refreshed
@@ -1691,7 +1693,8 @@ class StrategyEngine:
                     "value": value,
                     "pnl": round(value - cost, 2),
                     "mode": entry.get("mode", "directional"),
-                    "source": "auto",
+                    # "mm" → dashboard shows "MM"; "dir" → shows "DIR".
+                    "source": "mm" if entry.get("mode") == "mm" else "dir",
                 })
 
         # Orphan detection (live mode only)

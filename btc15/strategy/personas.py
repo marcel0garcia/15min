@@ -266,12 +266,27 @@ class AutoTrader:
                 actions.append(arb)
                 return actions
 
-        # ── Step 7: Market making in early window ─────────────────────────────
-        if secs > self.cfg.early_window_min_seconds:
+        # ── Step 7: Market making ─────────────────────────────────────────────
+        # Two modes:
+        #   - Conservative (default): MM only fires in early window AND is mutually
+        #     exclusive with directional entry on the same scan (returns immediately
+        #     after posting MM, blocking the directional path below).
+        #   - Aggressive (mm_aggressive=true): MM eligible all the way into mid window
+        #     (down to mm_window_min_seconds) AND runs in PARALLEL with directional.
+        #     Both an MM quote and a directional entry can fire on the same scan;
+        #     each is tracked independently via the `mode` field on positions.
+        mm_aggressive = getattr(self.cfg, "mm_aggressive", False)
+        mm_window = (
+            getattr(self.cfg, "mm_window_min_seconds", 240) if mm_aggressive
+            else self.cfg.early_window_min_seconds
+        )
+        if secs > mm_window:
             mm = self._check_market_making(ticker, orderbook)
             if mm:
                 actions.extend(mm)
-                return actions
+                if not mm_aggressive:
+                    # Conservative mode preserves the legacy short-circuit.
+                    return actions
 
         # ── Step 7b: Block directional entry if one is already resting ───────
         # GTC fills arrive via WS *after* the order is placed, so positions is
@@ -767,16 +782,30 @@ class AutoTrader:
     ) -> list[Action]:
         """
         Post both sides inside the spread with GTC post_only (0% maker fee).
-        Only when spread ≥ mm_min_spread_cents.
-        Inventory tracking prevents runaway directional exposure.
+        Only when spread ≥ effective minimum (mm_min_spread_cents or
+        mm_aggressive_min_spread_cents under aggressive mode).
+        Inventory tracking prevents runaway directional exposure via:
+          - mm_per_side_max_inventory: hard cap per side per ticker (aggressive mode)
+          - mm_max_inventory: legacy NET cap (conservative mode)
         """
         yes_bid = orderbook.get("yes_bid")
         yes_ask = orderbook.get("yes_ask")
         if yes_bid is None or yes_ask is None:
             return []
 
+        # Pick aggressive-vs-conservative parameters once
+        mm_aggressive = getattr(self.cfg, "mm_aggressive", False)
+        eff_min_spread = (
+            getattr(self.cfg, "mm_aggressive_min_spread_cents", 3) if mm_aggressive
+            else self.cfg.mm_min_spread_cents
+        )
+        eff_contracts = (
+            getattr(self.cfg, "mm_aggressive_contracts_per_side", 4) if mm_aggressive
+            else self.cfg.mm_contracts_per_side
+        )
+
         spread = float(yes_ask) - float(yes_bid)
-        if spread < self.cfg.mm_min_spread_cents:
+        if spread < eff_min_spread:
             return []
 
         # Inventory: count YES vs NO contracts held from MM mode.
@@ -814,10 +843,22 @@ class AutoTrader:
         if ticker in existing:
             return self._amend_mm_orders(ticker, yes_buy, no_buy)
 
-        contracts = self.cfg.mm_contracts_per_side
+        contracts = eff_contracts
         actions = []
 
-        if inv_yes - inv_no < self.cfg.mm_max_inventory:
+        # Inventory gating:
+        #   conservative: NET skew check only (mm_max_inventory)
+        #   aggressive:   PER-SIDE hard cap AND net cap
+        if mm_aggressive:
+            per_side_max = getattr(self.cfg, "mm_per_side_max_inventory", 10)
+            net_max = getattr(self.cfg, "mm_max_inventory_net", 15)
+            yes_allowed = (inv_yes < per_side_max) and ((inv_yes - inv_no) < net_max)
+            no_allowed = (inv_no < per_side_max) and ((inv_no - inv_yes) < net_max)
+        else:
+            yes_allowed = (inv_yes - inv_no) < self.cfg.mm_max_inventory
+            no_allowed = (inv_no - inv_yes) < self.cfg.mm_max_inventory
+
+        if yes_allowed:
             actions.append(Action(
                 action_type="buy", ticker=ticker, side="yes",
                 contracts=contracts, price_cents=yes_buy,
@@ -826,7 +867,7 @@ class AutoTrader:
                 reason=f"mm_quote spread={spread:.0f}¢",
             ))
 
-        if inv_no - inv_yes < self.cfg.mm_max_inventory:
+        if no_allowed:
             actions.append(Action(
                 action_type="buy", ticker=ticker, side="no",
                 contracts=contracts, price_cents=no_buy,

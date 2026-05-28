@@ -233,7 +233,15 @@ def build_positions_panel(state: dict) -> Panel:
     if not positions:
         return Panel("[dim]No open positions[/dim]", title="Positions", border_style="dim")
 
-    persona_colors = {"sniper": "bright_magenta", "scalper": "bright_cyan", "arb": "bright_yellow", "auto": "white"}
+    persona_colors = {
+        # Current modes:
+        "dir": "bright_cyan",        # directional (model-driven) entries
+        "mm":  "bright_yellow",      # market-maker quote fills
+        # Legacy / fallback:
+        "auto": "white",
+        "adopted": "dim",
+        "sniper": "bright_magenta", "scalper": "bright_cyan", "arb": "bright_yellow",
+    }
     table = Table(box=box.SIMPLE, show_header=True, header_style="bold dim", padding=(0, 1))
     table.add_column("Ticker", style="cyan", no_wrap=True)
     table.add_column("Src", justify="center")

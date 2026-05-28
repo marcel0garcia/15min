@@ -115,11 +115,30 @@ class TraderConfig:
     slippage_cents: int = 2              # IOC slippage above current ask
 
     # ── Market making ─────────────────────────────────────────────────────
-    mm_min_spread_cents: int = 5         # minimum spread to post both sides
-    mm_contracts_per_side: int = 2       # contracts per MM quote
-    mm_max_inventory: int = 8            # max net directional inventory before pausing one side
+    # Existing (conservative) knobs:
+    mm_min_spread_cents: int = 5         # minimum spread to post both sides (used when mm_aggressive=false)
+    mm_contracts_per_side: int = 2       # contracts per MM quote (used when mm_aggressive=false)
+    mm_max_inventory: int = 8            # legacy NET inventory cap (still honored when mm_aggressive=false)
     mm_cancel_before_seconds: int = 120  # cancel all MM orders with <2 min left
     mm_quote_offset_cents: int = 2       # quote this many cents inside the best bid/ask
+
+    # Aggressive-mode knobs (only active when mm_aggressive=true):
+    # When true, MM uses the aggressive thresholds below INSTEAD OF the conservative
+    # defaults above. Also enables concurrent firing with directional entry (the
+    # mutual-exclusivity short-circuit in evaluate() is bypassed).
+    # Default is false — pulling code is safe; flip in config.yaml to start
+    # the experiment.
+    mm_aggressive: bool = False
+    mm_aggressive_min_spread_cents: int = 3      # was 5 — loosen to catch more markets
+    mm_aggressive_contracts_per_side: int = 4    # was 2 — bigger quote, more spread captured per fill
+    mm_window_min_seconds: int = 240             # was 480 (early_window) — extend to mid window too
+    # Hard inventory caps. Per-side guards against single-side runaway during
+    # persistent directional moves; net keeps overall exposure bounded.
+    mm_per_side_max_inventory: int = 10
+    mm_max_inventory_net: int = 15
+    # Pre-emptive cancel when BTC moves > this many cents/sec — adverse-selection
+    # insurance. Computed from the price_feed tick stream.
+    mm_volatility_cancel_threshold_cents_per_sec: float = 5.0
 
     # ── Exit rules ────────────────────────────────────────────────────────
     emergency_stop_pct: float = 0.65    # cut IMMEDIATELY (any time) if losing >65%

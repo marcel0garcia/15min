@@ -108,10 +108,25 @@ trader:
   # Market making — runs in early window when spread ≥ mm_min_spread_cents
   # Posts both YES and NO sides with GTC post_only; earns spread at 0% fee.
   mm_min_spread_cents: 5
-  mm_contracts_per_side: 2        # start small; raise after validating edge
-  mm_max_inventory: 8             # stop posting overloaded side above this (~$4 one-sided)
+  mm_contracts_per_side: 2        # used when mm_aggressive=false
+  mm_max_inventory: 8             # legacy NET cap (used when mm_aggressive=false)
   mm_cancel_before_seconds: 120   # cancel all MM orders with <2 min to settlement
   mm_quote_offset_cents: 2        # post this many cents inside best bid/ask
+
+  # Aggressive MM mode — flip to true to activate the parallel maker strategy.
+  # When true: lower spread threshold (3¢), bigger size (4/side), wider
+  # window (down to 240s remaining instead of 480s), and MM fires CONCURRENT
+  # with directional entries (not mutually exclusive). Per-side hard caps
+  # prevent runaway inventory on either side.
+  # Default: false. Pull the code, then flip this knob when ready to start
+  # the experiment. Flip back to false to halt MM immediately; no code revert.
+  mm_aggressive: false
+  mm_aggressive_min_spread_cents: 3
+  mm_aggressive_contracts_per_side: 4
+  mm_window_min_seconds: 240               # eligibility floor (secs remaining)
+  mm_per_side_max_inventory: 10            # hard cap per side per ticker
+  mm_max_inventory_net: 15                 # bumped from 8 to accommodate wider per-side
+  mm_volatility_cancel_threshold_cents_per_sec: 5.0   # reserved for future use
 
   # Exit rules (simplified — no trailing stop, no profit decay)
   #   Rule 1: Pure arb pairs always hold to settlement ($1.00 guaranteed — never cut)
