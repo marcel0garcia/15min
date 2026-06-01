@@ -109,9 +109,21 @@ class TraderConfig:
     # ── Entry thresholds ──────────────────────────────────────────────────
     min_confidence: float = 0.55         # minimum model confidence for any entry
     min_edge: float = 0.05               # minimum edge over market price (5%)
-    min_entry_price_cents: int = 10      # skip contracts priced below 10¢
-    max_entry_price_cents: int = 72      # skip deep-ITM contracts — post-mortem showed
-                                         # 67-82¢ entries dominated losses; 72¢ drops the tail
+    min_entry_price_cents: int = 10      # skip contracts priced below this (fallback when by_phase empty)
+    max_entry_price_cents: int = 72      # skip contracts priced above this (fallback when by_phase empty)
+
+    # Phase-aware entry-price gates. Overrides the flat min/max above on a
+    # per-phase basis. Empty dict {} falls back to the flat values.
+    # Derived from 1,314-position tape audit (May 28). Early window keeps a
+    # tight 10-60¢ band per user trader-intuition input; mid/late open up as
+    # market crystallizes and prices become more informative.
+    # Keys map to the same secs_remaining boundaries as min_confidence_by_phase.
+    entry_price_by_phase: dict = field(default_factory=lambda: {
+        "early": {"min": 10, "max": 60},   # >540s — first 6 min, market hasn't crystallized
+        "mid":   {"min": 35, "max": 80},   # 300-540s — directional consensus forming
+        "prime": {"min": 20, "max": 85},   # 180-300s — late but pre-settle
+        "late":  {"min": 10, "max": 95},   # <180s — settlement near-certain at extremes
+    })
 
     # ── Settlement lock (late-window near-certainty entries) ──────────────
     settlement_lock_enabled: bool = True

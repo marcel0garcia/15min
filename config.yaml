@@ -83,10 +83,23 @@ trader:
   # but is harder to clear — old 0.55 admitted near-neutral signals.
   min_confidence: 0.50            # minimum model confidence
   min_edge: 0.10                  # minimum edge over Kalshi mid-price
-  min_entry_price_cents: 15       # skip contracts already priced below 10¢
-  max_entry_price_cents: 72       # skip deep-ITM contracts. Tightened from 85:
-                                  # post-mortem on 12APR06:15 showed 67-82¢ entries
-                                  # accounted for most losses in chop.
+  min_entry_price_cents: 10       # fallback floor (used when by-phase empty)
+  max_entry_price_cents: 72       # fallback ceiling (used when by-phase empty)
+
+  # Phase-aware entry-price gates. Overrides the flat min/max above by phase.
+  # Derived from 1,314-position audit on the trade history:
+  #   - 0-3min (early): tighter band (10-60¢) — market hasn't crystallized,
+  #     high prices have asymmetric loss profile per audit; user-set per trader intuition
+  #   - 3-6min (mid):   wider (35-80¢) — directional consensus forming
+  #   - 6-9min (prime): wider (20-85¢) — late but pre-settle
+  #   - 9-12min (late, alt): (10-85¢)
+  #   - 12-15min:       widest (10-95¢) — settlement near-certain at extremes
+  # Set the entire dict to {} to fall back to the flat min/max above.
+  entry_price_by_phase:
+    early: {min: 10, max: 60}
+    mid:   {min: 35, max: 80}
+    prime: {min: 20, max: 85}
+    late:  {min: 10, max: 95}
 
   # Settlement lock — allow late-window entries when outcome is near-certain
   # BRTI settles on 60s trailing average; with 30s left, half is locked in.

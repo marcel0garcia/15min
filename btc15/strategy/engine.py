@@ -39,7 +39,9 @@ from btc15.kalshi.ws_client import KalshiWebSocket, MarketDataCache
 from btc15.models.ensemble import EnsembleModel
 from btc15.models.ml_model import collect_sample
 from btc15.risk.manager import RiskManager
-from btc15.strategy.personas import Action, AutoTrader, phase_min_confidence
+from btc15.strategy.personas import (
+    Action, AutoTrader, phase_min_confidence, phase_entry_price_range,
+)
 
 
 log = logging.getLogger(__name__)
@@ -561,11 +563,14 @@ class StrategyEngine:
                 mid_price = yes_bid
             elif yes_ask:
                 mid_price = yes_ask
-            max_entry = getattr(self.cfg.trader, "max_entry_price_cents", 85)
+            # Phase-aware entry-price gate. Bounds the contract price (in
+            # cents) at which we'll consider an entry; outside the window we
+            # don't even compute the model for this market.
+            ph_min, ph_max = phase_entry_price_range(secs, self.cfg.trader)
             in_entry_window = (
                 mid_price is None
                 or has_position
-                or self.cfg.trader.min_entry_price_cents <= mid_price <= max_entry
+                or ph_min <= mid_price <= ph_max
             )
 
             # Orderbook depth for imbalance signal

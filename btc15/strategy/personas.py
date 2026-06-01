@@ -56,6 +56,30 @@ def phase_min_confidence(secs: float, trader_cfg) -> float:
         return by_phase.get("prime", trader_cfg.min_confidence)
     else:
         return by_phase.get("late", trader_cfg.min_confidence)
+
+
+def phase_entry_price_range(secs: float, trader_cfg) -> tuple[int, int]:
+    """Return (min_entry_price, max_entry_price) for the given seconds_remaining.
+
+    Falls back to the flat ``min_entry_price_cents`` / ``max_entry_price_cents``
+    when ``trader.entry_price_by_phase`` is missing or empty. Uses the same
+    540/300/180 boundaries as the other phase-aware gates.
+
+    Returned values bound the contract price we'd actually buy at, regardless
+    of side — a NO entry at 65¢ (when YES is at 35¢) is bounded by these limits
+    just like a YES entry at 65¢ would be.
+    """
+    by_phase = getattr(trader_cfg, "entry_price_by_phase", None) or {}
+    flat_min = trader_cfg.min_entry_price_cents
+    flat_max = trader_cfg.max_entry_price_cents
+    if not by_phase:
+        return flat_min, flat_max
+    if secs > 540:    key = "early"
+    elif secs > 300:  key = "mid"
+    elif secs > 180:  key = "prime"
+    else:             key = "late"
+    p = by_phase.get(key, {})
+    return p.get("min", flat_min), p.get("max", flat_max)
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -1101,7 +1125,12 @@ class AutoTrader:
 
         raw_price = max(1, min(99, raw_price))
 
-        if raw_price < self.cfg.min_entry_price_cents:
+        # Phase-aware entry-price gate. Bound the bid price we'd actually
+        # submit. The engine pre-filters by mid-price but our raw_price may
+        # drift inside/outside the band depending on side, slippage, and
+        # GTC/IOC mode — the personas check is authoritative.
+        ph_min, ph_max = phase_entry_price_range(secs, self.cfg)
+        if raw_price < ph_min or raw_price > ph_max:
             return None
 
         # Three-tier Kelly: strong signals get 0.75x to capitalize on
