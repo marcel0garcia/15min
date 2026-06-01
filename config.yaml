@@ -31,8 +31,8 @@ models:
     orderbook_imbalance:  0.35
     technical_momentum:   0.35
     trend_regression:     0.20
-    binary_options_model: 0.10
-    ml_model:             0.00
+    binary_options_model: 0.00       # BSM information already encoded by ml_model at finer resolution
+    ml_model:             0.10       # trained LightGBM (data/ml_model.pkl)
   rsi_period: 14
   macd_fast: 12
   macd_slow: 26
@@ -41,13 +41,15 @@ models:
   bb_std: 2.0
   default_annual_vol: 0.80
 
-  # EWMA signal smoothing — denoises confidence/edge across 1s scans.
+  # EWMA signal smoothing — DISABLED BY DEFAULT.
+  # Per-second technical indicators (live partial bar) provide natural
+  # smoothing via component diversity; EWMA's denoising became redundant.
+  # Flip to a positive value if a session shows excessive tick-to-tick noise.
   # Half-life ≈ ln(2)/-ln(1-α) at 1s scan:
-  #   0.20 → 3.1s (heavier smoothing — was choking fire rate post-Phase-B)
-  #   0.30 → 1.9s (lighter smoothing — current; more current-tick influence)
-  #   0.10 → 6.6s (heavy smoothing, slow response)
-  #   0.00 → disable, use raw values (A/B escape hatch)
-  signal_smoothing_alpha: 0.30
+  #   0.00 → disable (current default)
+  #   0.20 → 3.1s smoothing
+  #   0.30 → 1.9s smoothing
+  signal_smoothing_alpha: 0.00
   signal_smoothing_stale_sec: 5.0  # reset smoothing after WS gaps this long
 
 strategy:

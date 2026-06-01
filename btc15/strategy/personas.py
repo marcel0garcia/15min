@@ -29,8 +29,11 @@ Arb:
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
+from pathlib import Path
 
 
 def phase_min_confidence(secs: float, trader_cfg) -> float:
@@ -1206,6 +1209,17 @@ class AutoTrader:
             f"×{contracts} @ {raw_price}¢ mid={signal_mid:.1f}¢{flow_tag}"
         )
 
+        # Per-component instrumentation. Append one JSON record per fire to
+        # logs/fires.jsonl with all sub-model probs + context so we can answer
+        # "which component carried the signal on this trade?" post-hoc.
+        # Schema-safe sidecar — doesn't touch trades.csv.
+        self._log_fire_instrumentation(
+            ticker=ticker, side=side, phase=phase, order_mode=order_mode,
+            output=output, edge=edge, contracts=contracts,
+            raw_price=raw_price, signal_mid=signal_mid,
+            secs=secs, flow_info=flow_info,
+        )
+
         return Action(
             action_type="buy",
             ticker=ticker,
@@ -1397,6 +1411,101 @@ class AutoTrader:
             ))
 
         return actions
+
+    # ── Instrumentation — per-fire JSONL sidecar ──────────────────────────────
+
+    _FIRE_INSTRUMENTATION_PATH = Path("logs/fires.jsonl")
+
+    def _log_fire_instrumentation(
+        self,
+        ticker: str,
+        side: str,
+        phase: str,
+        order_mode: str,
+        output: ModelOutput,
+        edge: float,
+        contracts: int,
+        raw_price: int,
+        signal_mid: float,
+        secs: float,
+        flow_info: Optional[dict] = None,
+    ) -> None:
+        """Append one record per SIGNAL fire to logs/fires.jsonl.
+
+        Captures all per-component probabilities + context so we can answer
+        post-hoc: 'which sub-model carried the signal on this trade?' and
+        'when the ensemble said 70%, what did each component say individually?'
+
+        Sidecar JSONL — trades.csv schema unchanged.
+        Best-effort: any I/O exception is logged at debug and swallowed; we
+        never want instrumentation to block a fire.
+        """
+        try:
+            record = {
+                "ts": time.time(),
+                "ticker": ticker, "side": side,
+                "phase": phase, "order_mode": order_mode,
+                "secs_remaining": round(secs, 1),
+                "contracts": contracts,
+                "entry_price_cents": raw_price,
+                "kalshi_mid_cents": signal_mid,
+                # Combined ensemble outputs
+                "prob_yes": round(output.prob_yes, 4),
+                "prob_no": round(output.prob_no, 4),
+                "confidence": round(output.confidence, 4),
+                "edge_yes": round(output.edge_yes, 4) if output.edge_yes is not None else None,
+                "edge_no": round(output.edge_no, 4) if output.edge_no is not None else None,
+                "edge_our_side": round(edge, 4),
+                # Pre-smoothing values when EWMA is active (None otherwise)
+                "raw_confidence": (
+                    round(output.raw_confidence, 4)
+                    if getattr(output, "raw_confidence", None) is not None else None
+                ),
+                "raw_edge_yes": (
+                    round(output.raw_edge_yes, 4)
+                    if getattr(output, "raw_edge_yes", None) is not None else None
+                ),
+                "raw_edge_no": (
+                    round(output.raw_edge_no, 4)
+                    if getattr(output, "raw_edge_no", None) is not None else None
+                ),
+                # Per-component prob_yes — the headline data for calibration
+                # per component analysis. None when component didn't contribute
+                # (e.g. ml_model not loaded, bars too few for technical, etc).
+                "prob_orderbook_imbalance": (
+                    round(output.prob_orderbook, 4)
+                    if output.prob_orderbook is not None else None
+                ),
+                "prob_technical_momentum": (
+                    round(output.prob_technical, 4)
+                    if output.prob_technical is not None else None
+                ),
+                "prob_trend_regression": (
+                    round(output.prob_trend, 4)
+                    if output.prob_trend is not None else None
+                ),
+                "prob_binary_options_model": (
+                    round(output.prob_binary_options, 4)
+                    if output.prob_binary_options is not None else None
+                ),
+                "prob_ml_model": (
+                    round(output.prob_ml, 4)
+                    if output.prob_ml is not None else None
+                ),
+                # Recent tape flow snapshot at fire time
+                "flow_yes_volume": (
+                    flow_info.get("yes_volume") if flow_info else None
+                ),
+                "flow_no_volume": (
+                    flow_info.get("no_volume") if flow_info else None
+                ),
+                "flow_net": flow_info.get("net_flow") if flow_info else None,
+            }
+            self._FIRE_INSTRUMENTATION_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._FIRE_INSTRUMENTATION_PATH, "a") as f:
+                f.write(json.dumps(record, default=str) + "\n")
+        except Exception as e:
+            log.debug(f"fire instrumentation write failed (non-fatal): {e}")
 
     # ── Fill / exit recording ─────────────────────────────────────────────────
 

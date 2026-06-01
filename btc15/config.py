@@ -38,11 +38,16 @@ class FeedsConfig:
 @dataclass
 class ModelsConfig:
     min_confidence: float = 0.55
+    # Ensemble weights — sum to 1.0. ml_model carries the trained LightGBM
+    # prediction at 0.10; binary_options_model (BSM) was downweighted to
+    # 0.00 because ML's training data already encodes Black-Scholes-style
+    # information at a much finer resolution than the analytic BSM call.
+    # The 0.10 freed up here is reallocated to ml_model.
     ensemble_weights: dict = field(default_factory=lambda: {
         "orderbook_imbalance": 0.25,
         "technical_momentum": 0.35,
         "trend_regression": 0.20,
-        "binary_options_model": 0.10,
+        "binary_options_model": 0.00,
         "ml_model": 0.10,
     })
     rsi_period: int = 14
@@ -52,20 +57,25 @@ class ModelsConfig:
     bb_period: int = 20
     bb_std: float = 2.0
 
-    # ── EWMA signal smoothing ─────────────────────────────────────────────
-    # Per-ticker exponentially-weighted average of confidence and edge
-    # across consecutive 1s scans. Filters sub-second/sub-tick noise while
-    # preserving genuine regime shifts. Applied inside EnsembleModel.predict()
-    # so all downstream gates (min_confidence_by_phase, edge floor,
-    # ENTRY SUPPRESSED, FLOW MISALIGNMENT, 3-tick gate, reversal, loss_cut,
-    # STOP SUPPRESSED) operate on smoothed values transparently.
+    # ── EWMA signal smoothing — DISABLED BY DEFAULT ──────────────────────
+    # EWMA was originally added to filter the per-tick noise from the fast
+    # ensemble components (orderbook, BSM) when the slow components
+    # (RSI/MACD/BB, trend, ML) were frozen between 1-min bar closes.
+    #
+    # After commit 4b69aa8 (per-second technical indicators via live
+    # partial bar) the slow components also update every scan, providing
+    # natural smoothing through component diversity. EWMA's denoising job
+    # became redundant — empirically (May 28 sessions, EWMA off) the
+    # ensemble output was stable enough without it.
     #
     # Half-life ≈ ln(2) / -ln(1-α) seconds at 1s scan interval:
-    #   α=0.20 → half-life 3.1s (recommended; matches 3-tick gate memory)
-    #   α=0.10 → half-life 6.6s (heavier smoothing, slower response)
-    #   α=0.30 → half-life 2.0s (lighter smoothing, faster response)
-    #   α=0.00 → disable (use raw values; backward-compatible escape hatch)
-    signal_smoothing_alpha: float = 0.20
+    #   α=0.00 → disable (recommended; smoothed = raw passthrough)
+    #   α=0.10 → half-life 6.6s
+    #   α=0.20 → half-life 3.1s
+    #   α=0.30 → half-life 2.0s
+    # Flip back to a positive value if a future session shows excessive
+    # tick-to-tick noise in conf/edge.
+    signal_smoothing_alpha: float = 0.00
     # If we haven't seen this ticker for this many seconds, treat as cold
     # start and reset smoothed = raw. Prevents blending stale state across
     # WS gaps / disconnects.
