@@ -18,6 +18,7 @@ import json
 import logging
 import statistics
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -220,6 +221,95 @@ def _load_results_cache(path: Path) -> dict[str, str]:
             if result in ("yes", "no"):
                 out[ticker] = result
     return out
+
+
+# ── Settlement enrichment (cmd_enrich) ───────────────────────────────────────
+# Populates market_results_cache.json with settlement outcomes for every
+# ticker observed in decisions.jsonl. The engine's _check_settlements loop
+# only fetches results for markets the bot held positions in; counterfactual
+# analysis on `action='none'` rows needs results for the SUPERSET of tickers
+# the bot saw but skipped.
+
+async def cmd_enrich_results(
+    session_id: str,
+    recordings_root: Path,
+    cache_path: Path,
+    cfg,
+) -> dict:
+    """Fetch Kalshi settlement results for any tickers in decisions.jsonl
+    that aren't already finalized in the cache. Updates cache_path in place.
+    """
+    from btc15.kalshi.client import KalshiClient
+
+    session_dir = recordings_root / session_id
+    if not session_dir.exists():
+        raise FileNotFoundError(f"Session not found: {session_dir}")
+
+    log.info(f"[REPLAY-ENRICH] {session_id}")
+
+    # Load existing cache (defensive — missing/corrupt → empty).
+    if cache_path.exists():
+        try:
+            cache = json.loads(cache_path.read_text())
+            if not isinstance(cache, dict):
+                cache = {}
+        except json.JSONDecodeError:
+            cache = {}
+    else:
+        cache = {}
+
+    # Collect unique tickers from decisions.
+    tickers: set[str] = set()
+    for d in _iter_jsonl(session_dir / "decisions.jsonl"):
+        t = d.get("ticker")
+        if t:
+            tickers.add(t)
+
+    to_fetch = sorted(
+        t for t in tickers
+        if cache.get(t, {}).get("status") != "finalized"
+    )
+
+    fetched = 0
+    finalized = 0
+    failed = 0
+
+    async with KalshiClient(cfg.kalshi) as client:
+        for ticker in to_fetch:
+            try:
+                m = await client.get_market(ticker)
+            except Exception as e:
+                log.debug(f"enrich: get_market({ticker}) failed: {e}")
+                failed += 1
+                continue
+            fetched += 1
+            status = m.status.value if hasattr(m.status, "value") else str(m.status)
+            close_time = (
+                m.close_time.isoformat()
+                if hasattr(m.close_time, "isoformat") else None
+            )
+            cache[ticker] = {
+                "result": m.result if isinstance(m.result, str) else None,
+                "status": status,
+                "close_time": close_time,
+                "fetched_at": datetime.now().isoformat(),
+            }
+            if status == "finalized":
+                finalized += 1
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(cache, indent=2))
+
+    return {
+        "session_id": session_id,
+        "unique_tickers_in_decisions": len(tickers),
+        "already_finalized_in_cache": len(tickers) - len(to_fetch),
+        "fetched": fetched,
+        "newly_finalized": finalized,
+        "failed": failed,
+        "cache_size_total": len(cache),
+        "cache_path": str(cache_path),
+    }
 
 
 def cmd_analyze(

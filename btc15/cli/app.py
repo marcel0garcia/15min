@@ -675,6 +675,28 @@ def replay_grid(session_id: str, config_path: str, interval: float,
     console.print(f"[dim]report → {session_dir}/stability_report.json[/dim]")
 
 
+@replay.command("enrich")
+@click.argument("session_id")
+@click.option("--config", "config_path", default=None)
+@click.option(
+    "--cache",
+    default="data/market_results_cache.json",
+    help="Settlement results cache to update.",
+)
+def replay_enrich(session_id: str, config_path: str, cache: str):
+    """Fetch Kalshi settlement results for every ticker in decisions.jsonl
+    that isn't already finalized in the cache (counterfactual prep)."""
+    from btc15.config import load_config
+    from btc15.recording.replay import cmd_enrich_results
+    cfg = load_config(Path(config_path) if config_path else None)
+    setup_logging("INFO", cfg.logging.log_file)
+    summary = asyncio.run(cmd_enrich_results(
+        session_id, Path(cfg.recording.path), Path(cache), cfg,
+    ))
+    import json as _json
+    console.print(_json.dumps(summary, indent=2))
+
+
 @replay.command("analyze")
 @click.argument("session_id")
 @click.option("--config", "config_path", default=None)
