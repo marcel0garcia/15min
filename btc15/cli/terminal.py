@@ -552,15 +552,180 @@ def build_event_log_panel(state: dict) -> Panel:
     return Panel("\n".join(lines), title="[bold]Engine Log[/bold]", border_style="dim")
 
 
-def build_layout(state: dict) -> Layout:
+# ── v2 Phase 1.5 panels: BTC tape, Kalshi tape, BRTI status, venues ──────
+
+_VOL_BLOCKS = "▁▂▃▄▅▆▇█"
+
+
+def _vol_glyph(qty: float, scale: float) -> str:
+    """Map a volume value to one of 8 block glyphs by ratio to a scale."""
+    if scale <= 0 or qty <= 0:
+        return _VOL_BLOCKS[0]
+    idx = min(len(_VOL_BLOCKS) - 1, int((qty / scale) * len(_VOL_BLOCKS)))
+    return _VOL_BLOCKS[idx]
+
+
+def build_btc_tape_panel(state: dict) -> Panel:
+    """Binance tick tape — newest right, scrolls left. Color by direction
+    (uptick green / downtick red), height by volume. Header line shows
+    the latest Binance price and its delta vs recon_brti."""
+    tape = list(state.get("btc_tape") or ())
+    recon = state.get("recon_brti") or {}
+    recon_mid = recon.get("mid")
+    last_price = tape[-1][1] if tape else None
+
+    header = Text()
+    if last_price is not None:
+        header.append(f"Binance ${last_price:,.2f}", style="bold")
+    else:
+        header.append("Binance —", style="dim")
+    if last_price is not None and recon_mid is not None:
+        delta = last_price - recon_mid
+        col = "bright_green" if abs(delta) < 5 else "yellow" if abs(delta) < 20 else "bright_red"
+        header.append(f"   Δvs BRTI ${delta:+.2f}", style=col)
+
+    if not tape:
+        body = Text("\n(no ticks yet)", style="dim")
+    else:
+        max_qty = max(q for _, _, q in tape) or 1.0
+        cells = Text()
+        prev = None
+        for _, price, qty in tape:
+            glyph = _vol_glyph(qty, max_qty)
+            if prev is None or price == prev:
+                col = "dim white"
+            elif price > prev:
+                col = "bright_green"
+            else:
+                col = "bright_red"
+            cells.append(glyph, style=col)
+            prev = price
+        body = cells
+
+    # Phase 3 KPI placeholder row
+    fv = state.get("fair_value")
+    z = state.get("z_score")
+    sig = state.get("sigma_nowcast")
+    kpis = Text()
+    kpis.append("\nfair_value ", style="dim")
+    kpis.append(f"{fv:.4f}" if isinstance(fv, (int, float)) else "—", style="cyan" if fv is not None else "dim")
+    kpis.append("   z ", style="dim")
+    kpis.append(f"{z:+.2f}" if isinstance(z, (int, float)) else "—", style="cyan" if z is not None else "dim")
+    kpis.append("   σ ", style="dim")
+    kpis.append(f"{sig:.3f}" if isinstance(sig, (int, float)) else "—", style="cyan" if sig is not None else "dim")
+
+    composed = Text()
+    composed.append_text(header)
+    composed.append("\n")
+    composed.append_text(body)
+    composed.append_text(kpis)
+    return Panel(composed, title="BTC TAPE", border_style="cyan", padding=(0, 1))
+
+
+def build_kalshi_tape_panel(state: dict, market_cache=None) -> Panel:
+    """Per-contract trade tape — colored by taker outcome side (yes-taker
+    green, no-taker red). Picks the most recently traded ticker."""
+    tape_data = []
+    chosen_ticker: Optional[str] = None
+    if market_cache is not None and hasattr(market_cache, "_trades"):
+        # Pick the ticker with the most recent trade.
+        latest_per_ticker = []
+        for ticker, dq in market_cache._trades.items():
+            if dq:
+                latest_per_ticker.append((dq[-1][0], ticker, list(dq)))
+        if latest_per_ticker:
+            latest_per_ticker.sort(key=lambda x: -x[0])
+            _, chosen_ticker, tape_data = latest_per_ticker[0]
+            tape_data = tape_data[-60:]
+
+    header = Text()
+    if chosen_ticker:
+        header.append("Active: ", style="dim")
+        header.append(chosen_ticker[-15:], style="bold cyan")
+        header.append(f"  ({len(tape_data)} prints)", style="dim")
+    else:
+        header.append("No active Kalshi trades yet", style="dim")
+
+    if not tape_data:
+        body = Text("\n(awaiting trades)", style="dim")
+    else:
+        max_count = max((t[2] for t in tape_data), default=1.0) or 1.0
+        cells = Text()
+        for ts, taker_side, count, yes_cents in tape_data:
+            glyph = _vol_glyph(count, max_count)
+            if taker_side == "yes":
+                col = "bright_green"
+            elif taker_side == "no":
+                col = "bright_red"
+            else:
+                col = "dim white"
+            cells.append(glyph, style=col)
+        body = cells
+
+    composed = Text()
+    composed.append_text(header)
+    composed.append("\n")
+    composed.append_text(body)
+    return Panel(composed, title="KALSHI TAPE", border_style="magenta", padding=(0, 1))
+
+
+def build_brti_panel(state: dict) -> Panel:
+    """Live consolidated mid + venue contributions. Phase 3 will read this
+    same recon_brti.mid as the engine's price input."""
+    recon = state.get("recon_brti") or {}
+    venues = state.get("venue_status") or {}
+
+    mid = recon.get("mid")
+    healthy = recon.get("healthy", False)
+    n_venues = recon.get("n_venues", 0)
+    spread = recon.get("spread", 0)
+    outliers = recon.get("outliers") or []
+    reason = recon.get("reason") or "—"
+
+    composed = Text()
+    if mid is not None:
+        composed.append(f"BRTI ${mid:,.2f}", style="bold bright_white")
+    else:
+        composed.append("BRTI —", style="dim")
+    composed.append("   ")
+    if healthy:
+        composed.append("✓ healthy", style="bright_green")
+    else:
+        composed.append(f"⚠ {reason}", style="yellow")
+    composed.append(f"  {n_venues}v", style="dim")
+    if spread:
+        col = "dim" if spread < 10 else "yellow" if spread < 30 else "bright_red"
+        composed.append(f"  spread ${spread:.2f}", style=col)
+    if outliers:
+        composed.append(f"  outlier:{','.join(outliers)}", style="yellow")
+
+    # Per-venue row
+    composed.append("\n")
+    for v in ("coinbase", "kraken", "bitstamp"):
+        vs = venues.get(v) or {}
+        composed.append(f"\n{v[:2]} ", style="dim")
+        if vs.get("connected") and vs.get("fresh"):
+            composed.append(f"${vs.get('mid', 0):,.2f}", style="white")
+            composed.append(f" ✓{vs.get('age_sec', 0):.1f}s", style="dim green")
+        elif vs.get("connected"):
+            composed.append(f"${vs.get('mid', 0):,.2f}", style="dim")
+            composed.append(f" ⚠{vs.get('age_sec', 0):.1f}s", style="yellow")
+        else:
+            composed.append("offline", style="dim red")
+
+    return Panel(composed, title="BRTI", border_style="yellow", padding=(0, 1))
+
+
+def build_layout(state: dict, market_cache=None) -> Layout:
     layout = Layout()
-    # Three rows: header / top / bottom
+    # Four rows: header / top / TAPES / bottom
     layout.split_column(
         Layout(name="header", size=3),
         Layout(name="top", size=12),
+        Layout(name="tapes", size=7),
         Layout(name="bottom"),
     )
-    # Top row unchanged: signals | markets | risk+personas
+    # Top row: signals | markets | risk
     layout["top"].split_row(
         Layout(name="signals"),
         Layout(name="markets"),
@@ -569,7 +734,13 @@ def build_layout(state: dict) -> Layout:
     layout["right_col"].split_column(
         Layout(name="risk"),
     )
-    # Bottom row: positions+trades stacked on left | chart+event_log stacked on right
+    # v2 Phase 1.5 tapes row: BTC tape | Kalshi tape | BRTI status
+    layout["tapes"].split_row(
+        Layout(name="btc_tape"),
+        Layout(name="kalshi_tape"),
+        Layout(name="brti", size=32),
+    )
+    # Bottom: positions+trades stacked on left | chart+event_log stacked on right
     layout["bottom"].split_row(
         Layout(name="left_col"),
         Layout(name="right_bottom"),
@@ -586,6 +757,9 @@ def build_layout(state: dict) -> Layout:
     layout["signals"].update(build_signals_panel(state))
     layout["markets"].update(build_markets_panel(state))
     layout["risk"].update(build_risk_panel(state))
+    layout["btc_tape"].update(build_btc_tape_panel(state))
+    layout["kalshi_tape"].update(build_kalshi_tape_panel(state, market_cache=market_cache))
+    layout["brti"].update(build_brti_panel(state))
     layout["positions"].update(build_positions_panel(state))
     layout["trades"].update(build_trades_panel(state))
     layout["chart"].update(build_pnl_chart(state))
@@ -593,14 +767,17 @@ def build_layout(state: dict) -> Layout:
     return layout
 
 
-async def run_dashboard(engine, refresh_rate: float = 1.0):
-    """Run the live Rich dashboard, refreshing every `refresh_rate` seconds."""
+async def run_dashboard(engine, refresh_rate: float = 0.2):
+    """Run the live Rich dashboard. Default 5 Hz — WS data already streams
+    into engine.state continuously between scans, so sub-second refresh
+    surfaces fresh bid/ask/tape without changing the strategy scan rate."""
+    market_cache = getattr(engine, "_market_cache", None)
     with Live(
-        build_layout(engine.state),
+        build_layout(engine.state, market_cache=market_cache),
         console=console,
         refresh_per_second=1 / refresh_rate,
         screen=True,
     ) as live:
         while engine.running:
-            live.update(build_layout(engine.state))
+            live.update(build_layout(engine.state, market_cache=market_cache))
             await asyncio.sleep(refresh_rate)

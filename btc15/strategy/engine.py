@@ -24,6 +24,7 @@ import csv
 import logging
 import time
 import uuid
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -46,6 +47,7 @@ from btc15.recording import SessionRecorder, BRAIN_VERSION
 from btc15.recording.kalshi_tap import KalshiRawTap
 from btc15.recording.decision_log import DecisionLog, _classify_action
 from btc15.recording.venues import build_venue_tasks
+from btc15.recording.brti import reconstruct as _brti_reconstruct
 
 
 log = logging.getLogger(__name__)
@@ -147,6 +149,20 @@ class StrategyEngine:
             "session_start": datetime.now(timezone.utc).isoformat(),
             "pnl_history": [],
             "event_log": [],
+            # ── v2 Phase 1.5 live displays ────────────────────────────────
+            # BTC tick tape — populated by the Binance feed handler.
+            # Bounded so the dashboard render cost stays O(1) per frame.
+            "btc_tape": deque(maxlen=80),
+            # Live BRTI reconstruction (Phase 2 brti.reconstruct, run live
+            # off venue WS state). Phase 3 will swap the engine's price
+            # source from Binance to this; the dashboard already displays it.
+            "recon_brti": None,
+            "venue_status": {},
+            # Phase 3 brain KPIs — populated as fields land. Placeholders
+            # render as "—" in the dashboard until Phase 3 wires them.
+            "fair_value": None,
+            "z_score": None,
+            "sigma_nowcast": None,
         }
 
         _now = datetime.now(timezone.utc)
@@ -218,6 +234,10 @@ class StrategyEngine:
 
         await self.price_feed.start()
 
+        # BTC tick tape — read-only subscriber for the dashboard's live BTC
+        # tape panel. Cheap append to a bounded deque per tick.
+        self.price_feed.feed.on_tick(self._on_btc_tick)
+
         self._kalshi = KalshiClient(self.cfg.kalshi)
         await self._kalshi.connect()
 
@@ -238,11 +258,13 @@ class StrategyEngine:
         self._market_cache.rest_refresh = self._refresh_ticker_orderbook
         self._tasks.append(asyncio.create_task(self._ws.run(), name="kalshi-ws"))
 
-        # Venue WS connectors for BRTI placeholder reconstruction.
-        if self.cfg.recording.enabled:
-            self._venue_ws_list = build_venue_tasks(self.cfg, self._recorder)
-            for name, ws in self._venue_ws_list:
-                self._tasks.append(asyncio.create_task(ws.run(), name=name))
+        # Venue WS connectors for BRTI reconstruction. Run regardless of
+        # recording.enabled — the live BRTI loop needs them. Disk writes
+        # are gated separately inside the recorder.
+        self._venue_ws_list = build_venue_tasks(self.cfg, self._recorder)
+        for name, ws in self._venue_ws_list:
+            self._tasks.append(asyncio.create_task(ws.run(), name=name))
+        self._tasks.append(asyncio.create_task(self._live_brti_loop(), name="brti-live"))
 
         try:
             _start_bal = await self._kalshi.get_balance()
@@ -389,6 +411,74 @@ class StrategyEngine:
             except Exception as e:
                 log.error(f"Scan loop error: {e}", exc_info=True)
             await asyncio.sleep(SCAN_INTERVAL)
+
+    # ── v2 Phase 1.5: live BTC tape + BRTI reconstruction ──────────────────
+
+    async def _on_btc_tick(self, price: float, qty: float, ts_ms: int) -> None:
+        """Binance tick handler — appends to the bounded BTC tape buffer.
+        Read-only subscriber; never affects price_feed's existing consumers.
+        """
+        self.state["btc_tape"].append((ts_ms / 1000.0, price, qty))
+
+    async def _live_brti_loop(self) -> None:
+        """Recompute the consolidated mid + venue status snapshot for the
+        dashboard. Pulls each venue's last bid/ask from the WS connectors'
+        in-memory state (always fresh, even when disk-write rate-limited)
+        and runs the same brti.reconstruct() that replay.py uses offline.
+        """
+        STALENESS_SEC = 5.0
+        UPDATE_HZ = 4.0  # 250ms — well under dashboard refresh rate
+        while self.running:
+            try:
+                await asyncio.sleep(1.0 / UPDATE_HZ)
+                now = time.time()
+                venue_mids: dict[str, float] = {}
+                venue_status: dict = {}
+                for name, ws in self._venue_ws_list:
+                    if ws.last_bid is None or ws.last_ask is None:
+                        venue_status[name] = {"connected": False, "age_sec": None}
+                        continue
+                    age = now - ws.last_ts if ws.last_ts > 0 else None
+                    fresh = age is not None and age <= STALENESS_SEC
+                    mid = (ws.last_bid + ws.last_ask) / 2.0
+                    venue_status[name] = {
+                        "connected": True,
+                        "bid": ws.last_bid,
+                        "ask": ws.last_ask,
+                        "mid": round(mid, 2),
+                        "age_sec": round(age, 2) if age is not None else None,
+                        "fresh": fresh,
+                    }
+                    if fresh:
+                        venue_mids[name] = mid
+
+                if venue_mids:
+                    mid, outliers, healthy, reason = _brti_reconstruct(venue_mids)
+                    spread = (
+                        round(max(venue_mids.values()) - min(venue_mids.values()), 2)
+                        if len(venue_mids) > 1 else 0.0
+                    )
+                    self.state["recon_brti"] = {
+                        "mid": mid,
+                        "healthy": healthy,
+                        "reason": reason,
+                        "n_venues": len(venue_mids),
+                        "venues": sorted(venue_mids.keys()),
+                        "outliers": outliers,
+                        "spread": spread,
+                        "ts": now,
+                    }
+                else:
+                    self.state["recon_brti"] = {
+                        "mid": None, "healthy": False, "reason": "no_venues",
+                        "n_venues": 0, "venues": [], "outliers": [],
+                        "spread": 0.0, "ts": now,
+                    }
+                self.state["venue_status"] = venue_status
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.debug(f"live BRTI loop error: {e}")
 
     async def _on_ws_reconnect(self):
         """

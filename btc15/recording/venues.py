@@ -37,6 +37,14 @@ class _BaseVenueWS:
         self._last_emit_ts = 0.0
         self._reconnect_delay = 2.0
         self._msg_count = 0
+        # Live state — always updated on every emit, even when disk write
+        # is rate-limited. Consumers (live BRTI loop, dashboard) read these
+        # directly without touching files.
+        self.last_bid: Optional[float] = None
+        self.last_ask: Optional[float] = None
+        self.last_bid_sz: Optional[float] = None
+        self.last_ask_sz: Optional[float] = None
+        self.last_ts: float = 0.0
 
     async def _subscribe(self, ws):
         raise NotImplementedError
@@ -95,15 +103,23 @@ class _BaseVenueWS:
     ) -> None:
         if bid is None or ask is None:
             return
+        now = time.time()
+        # Always update live state — independent of rate limit so live
+        # consumers (BRTI loop, dashboard) see fresh prices.
+        self.last_bid = bid
+        self.last_ask = ask
+        self.last_bid_sz = bid_sz
+        self.last_ask_sz = ask_sz
+        self.last_ts = now
+
         if self.max_msg_per_sec > 0:
-            now = time.time()
             min_interval = 1.0 / self.max_msg_per_sec
             if now - self._last_emit_ts < min_interval:
                 return
             self._last_emit_ts = now
         self._msg_count += 1
         self.recorder.write_venue({
-            "recv_ts": time.time(),
+            "recv_ts": now,
             "venue": self.name,
             "bid": bid,
             "ask": ask,
