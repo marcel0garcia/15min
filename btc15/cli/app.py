@@ -611,6 +611,70 @@ def replay_convert(session_id: str, config_path: str):
     console.print(_json.dumps(summary, indent=2))
 
 
+@replay.command("grid")
+@click.argument("session_id")
+@click.option("--config", "config_path", default=None)
+@click.option("--interval", default=1.0, help="Grid cadence in seconds (default 1.0).")
+@click.option("--staleness", default=5.0, help="Max age (sec) before a venue tick is treated as stale.")
+@click.option("--n-min", default=2, help="Minimum healthy venues required to emit a mid.")
+@click.option("--k-mad", default=3.0, help="MAD outlier rejection threshold.")
+def replay_grid(session_id: str, config_path: str, interval: float,
+                staleness: float, n_min: int, k_mad: float):
+    """Phase 2: Build BRTI reconstruction grid + print stability report."""
+    from btc15.config import load_config
+    from btc15.recording.replay import build_index_grid
+    cfg = load_config(Path(config_path) if config_path else None)
+    setup_logging("INFO", cfg.logging.log_file)
+
+    session_dir = Path(cfg.recording.path) / session_id
+    if not session_dir.exists():
+        console.print(f"[red]Session not found: {session_dir}[/red]")
+        return
+
+    grid = build_index_grid(
+        session_dir,
+        interval_sec=interval,
+        staleness_sec=staleness,
+        n_min=n_min,
+        k_mad=k_mad,
+    )
+    import json as _json
+    report = _json.loads((session_dir / "stability_report.json").read_text())
+
+    table = Table(title=f"BRTI stability — {session_id}", box=box.SIMPLE)
+    table.add_column("metric")
+    table.add_column("value", justify="right")
+    table.add_row("grid rows", f"{report['n_rows']:,}")
+    table.add_row("healthy rows", f"{report['n_healthy']:,}")
+    table.add_row("health %", f"{report['health_pct']:.2f}%")
+    table.add_row("inter-venue spread p50", f"${report['spread_p50']:.2f}")
+    table.add_row("inter-venue spread p95", f"${report['spread_p95']:.2f}")
+    table.add_row("inter-venue spread max", f"${report['spread_max']:.2f}")
+    table.add_row("outlier-flag events", f"{report['n_outlier_events']:,}")
+    console.print(table)
+
+    if report["venue_uptime_pct"]:
+        ut = Table(title="Venue uptime", box=box.SIMPLE)
+        ut.add_column("venue")
+        ut.add_column("uptime %", justify="right")
+        for v, pct in sorted(report["venue_uptime_pct"].items(), key=lambda x: -x[1]):
+            ut.add_row(v, f"{pct:.1f}%")
+        console.print(ut)
+
+    if report["reason_breakdown"]:
+        rb = Table(title="Reason breakdown", box=box.SIMPLE)
+        rb.add_column("reason")
+        rb.add_column("count", justify="right")
+        rb.add_column("%", justify="right")
+        total = report["n_rows"]
+        for reason, count in sorted(report["reason_breakdown"].items(), key=lambda x: -x[1]):
+            rb.add_row(reason, f"{count:,}", f"{count/total*100:.1f}%")
+        console.print(rb)
+
+    console.print(f"\n[dim]grid → {session_dir}/index_grid.jsonl  ({len(grid):,} rows)[/dim]")
+    console.print(f"[dim]report → {session_dir}/stability_report.json[/dim]")
+
+
 @replay.command("analyze")
 @click.argument("session_id")
 @click.option("--config", "config_path", default=None)

@@ -140,83 +140,38 @@ class CoinbaseWS(_BaseVenueWS):
 
 
 # ── Kraken v2 ────────────────────────────────────────────────────────────────
-# wss://ws.kraken.com/v2 — `book` channel emits a snapshot then delta updates.
-# An update's qty=0 removes that price level; otherwise the level is set to qty.
-# We maintain a small per-side dict so we can emit the post-update top-of-book.
-# Chosen over `ticker` (which only fires on quote change) so BRTI reconstruction
-# stays responsive when BTC is calm.
+# wss://ws.kraken.com/v2 — `ticker` channel; emits bid/ask/qty on quote change.
+#
+# Phase 2 note: the `book` channel was tried for higher throughput but its
+# checksum-validated state machine is more involved than we want to ship
+# right now (a naive accumulator drifts and produces crossed-book reads).
+# Ticker is correct-but-sparse; brti.py handles sparse venues gracefully via
+# its staleness window and n_min gate. Revisit book channel in Phase 2.5+.
 class KrakenWS(_BaseVenueWS):
     name = "kraken"
     url = "wss://ws.kraken.com/v2"
 
-    def __init__(self, recorder, max_msg_per_sec: int = 0, depth: int = 10):
-        super().__init__(recorder, max_msg_per_sec)
-        self._depth = depth
-        self._bids: dict[float, float] = {}
-        self._asks: dict[float, float] = {}
-
     async def _subscribe(self, ws):
         await ws.send(json.dumps({
             "method": "subscribe",
-            "params": {
-                "channel": "book",
-                "symbol": ["BTC/USD"],
-                "depth": self._depth,
-            },
+            "params": {"channel": "ticker", "symbol": ["BTC/USD"]},
         }))
 
     async def _handle_message(self, msg: dict) -> None:
-        if msg.get("channel") != "book":
+        if msg.get("channel") != "ticker":
             return
-        msg_type = msg.get("type")
         data = msg.get("data")
         if not data or not isinstance(data, list):
             return
         row = data[0]
-        if msg_type == "snapshot":
-            self._bids = {}
-            self._asks = {}
-            for lvl in row.get("bids") or []:
-                p = _safe_float(lvl.get("price"))
-                q = _safe_float(lvl.get("qty"))
-                if p is not None and q is not None and q > 0:
-                    self._bids[p] = q
-            for lvl in row.get("asks") or []:
-                p = _safe_float(lvl.get("price"))
-                q = _safe_float(lvl.get("qty"))
-                if p is not None and q is not None and q > 0:
-                    self._asks[p] = q
-        elif msg_type == "update":
-            for lvl in row.get("bids") or []:
-                p = _safe_float(lvl.get("price"))
-                q = _safe_float(lvl.get("qty"))
-                if p is None or q is None:
-                    continue
-                if q <= 0:
-                    self._bids.pop(p, None)
-                else:
-                    self._bids[p] = q
-            for lvl in row.get("asks") or []:
-                p = _safe_float(lvl.get("price"))
-                q = _safe_float(lvl.get("qty"))
-                if p is None or q is None:
-                    continue
-                if q <= 0:
-                    self._asks.pop(p, None)
-                else:
-                    self._asks[p] = q
-        else:
+        try:
+            bid = float(row["bid"])
+            ask = float(row["ask"])
+        except (KeyError, ValueError, TypeError):
             return
-
-        if not self._bids or not self._asks:
-            return
-        best_bid = max(self._bids.keys())
-        best_ask = min(self._asks.keys())
-        self._emit(
-            best_bid, best_ask,
-            self._bids[best_bid], self._asks[best_ask],
-            exch_ts=row.get("timestamp"),
-        )
+        bid_sz = _safe_float(row.get("bid_qty"))
+        ask_sz = _safe_float(row.get("ask_qty"))
+        self._emit(bid, ask, bid_sz, ask_sz, exch_ts=msg.get("timestamp"))
 
 
 # ── Bitstamp v2 ──────────────────────────────────────────────────────────────

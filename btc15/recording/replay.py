@@ -114,51 +114,48 @@ def top_of_book(book: dict) -> tuple[Optional[int], Optional[int]]:
     return bid, ask
 
 
-# ── Index grid (1Hz median-of-venue-mids placeholder) ────────────────────────
+# ── Index grid (Phase 2 BRTI reconstruction) ─────────────────────────────────
 
-def build_index_grid(session_dir: Path, interval_sec: float = 1.0) -> list[dict]:
-    """Bucket venue_ticks into interval_sec windows. Per bucket emit the median
-    of (bid+ask)/2 across venues that reported within the bucket. Sets the
-    foundation Phase 2 will replace with the proper BRTI methodology.
+def build_index_grid(
+    session_dir: Path,
+    interval_sec: float = 1.0,
+    staleness_sec: float = 5.0,
+    n_min: int = 2,
+    k_mad: float = 3.0,
+) -> list[dict]:
+    """Build a 1Hz BRTI reconstruction grid from venue_ticks.jsonl.
+
+    Delegates the algorithm to btc15.recording.brti (CF Benchmarks-style
+    median-of-venue-mids with MAD outlier rejection). Writes both
+    index_grid.jsonl (per-row) and stability_report.json (summary) next to
+    the session.
     """
+    from btc15.recording.brti import build_grid, stability_report
+
     venue_path = session_dir / "venue_ticks.jsonl"
     if not venue_path.exists():
         return []
 
-    # bucket_ts -> venue -> mid (last in bucket wins)
-    buckets: dict[int, dict[str, float]] = defaultdict(dict)
-    for row in _iter_jsonl(venue_path):
-        try:
-            ts = float(row["recv_ts"])
-            venue = row["venue"]
-            bid = float(row["bid"])
-            ask = float(row["ask"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if bid <= 0 or ask <= 0 or ask < bid:
-            continue
-        bucket = int(ts / interval_sec) * interval_sec
-        buckets[int(bucket)][venue] = (bid + ask) / 2.0
-
-    grid: list[dict] = []
-    for bucket_ts in sorted(buckets.keys()):
-        venue_mids = buckets[bucket_ts]
-        if not venue_mids:
-            continue
-        mids = list(venue_mids.values())
-        grid.append({
-            "ts": bucket_ts,
-            "recon_mid": round(statistics.median(mids), 2),
-            "n_venues": len(mids),
-            "venues": sorted(venue_mids.keys()),
-            "spread_min_max": round(max(mids) - min(mids), 2) if len(mids) > 1 else 0.0,
-        })
+    grid_rows = build_grid(
+        _iter_jsonl(venue_path),
+        grid_interval_sec=interval_sec,
+        staleness_sec=staleness_sec,
+        n_min=n_min,
+        k_mad=k_mad,
+    )
 
     out_path = session_dir / "index_grid.jsonl"
     with open(out_path, "w") as f:
-        for row in grid:
-            f.write(json.dumps(row, separators=(",", ":")) + "\n")
-    return grid
+        for row in grid_rows:
+            f.write(json.dumps(row.to_dict(), separators=(",", ":")) + "\n")
+
+    report = stability_report(grid_rows)
+    from dataclasses import asdict
+    (session_dir / "stability_report.json").write_text(
+        json.dumps(asdict(report), indent=2)
+    )
+
+    return [r.to_dict() for r in grid_rows]
 
 
 # ── Convert subcommand ──────────────────────────────────────────────────────
