@@ -512,4 +512,123 @@ async def _run_web(cfg, port: int):
         pass
     finally:
         await engine.stop()
-        console.print("\n[dim]Bot stopped.[/dim]")
+
+
+# ── v2 Phase 1: replay & analyze recorded sessions ───────────────────────────
+
+@cli.group()
+def replay():
+    """Replay & analyze a recorded telemetry session."""
+    pass
+
+
+@replay.command("list")
+@click.option("--config", "config_path", default=None)
+def replay_list(config_path: str):
+    """List recorded sessions under data/recordings/."""
+    from btc15.config import load_config
+    cfg = load_config(Path(config_path) if config_path else None)
+    root = Path(cfg.recording.path)
+    if not root.exists():
+        console.print(f"[yellow]No recordings directory at {root}[/yellow]")
+        return
+    sessions = sorted(d for d in root.iterdir() if d.is_dir())
+    if not sessions:
+        console.print("[yellow]No sessions found[/yellow]")
+        return
+    table = Table(title="Recorded sessions", box=box.SIMPLE)
+    table.add_column("session_id")
+    table.add_column("mode")
+    table.add_column("duration")
+    table.add_column("K (kalshi)", justify="right")
+    table.add_column("V (venue)", justify="right")
+    table.add_column("D (decisions)", justify="right")
+    for s in sessions:
+        meta_path = s / "meta.json"
+        if not meta_path.exists():
+            continue
+        try:
+            meta = __import__("json").loads(meta_path.read_text())
+        except Exception:
+            continue
+        lines = meta.get("lines") or {}
+        dur = meta.get("duration_sec")
+        # Fallbacks for sessions that died ungracefully (SIGHUP, kill -9 etc.)
+        # — the JSONL files are the truth, meta is just a summary that may
+        # never have been finalized.
+        finalized = bool(dur)
+        if not finalized:
+            try:
+                end_ts = max(
+                    (s / f).stat().st_mtime
+                    for f in ("kalshi_frames.jsonl", "venue_ticks.jsonl", "decisions.jsonl")
+                    if (s / f).exists()
+                )
+                dur = end_ts - meta.get("start_ts", end_ts)
+            except Exception:
+                dur = None
+            for name, fname in (
+                ("kalshi", "kalshi_frames.jsonl"),
+                ("venue", "venue_ticks.jsonl"),
+                ("decisions", "decisions.jsonl"),
+            ):
+                p = s / fname
+                if name not in lines and p.exists():
+                    try:
+                        lines[name] = sum(1 for _ in open(p))
+                    except Exception:
+                        pass
+        dur_str = (
+            f"{dur/60:.1f}m" if dur and finalized
+            else f"{dur/60:.1f}m*" if dur
+            else "running"
+        )
+        table.add_row(
+            s.name,
+            meta.get("mode", "?"),
+            dur_str,
+            str(lines.get("kalshi", "-")),
+            str(lines.get("venue", "-")),
+            str(lines.get("decisions", "-")),
+        )
+    # The * suffix on duration marks sessions whose meta.json was never
+    # finalized (process killed ungracefully) — stats are derived from file
+    # mtimes/line-counts, not the recorder's own bookkeeping.
+    console.print(table)
+
+
+@replay.command("convert")
+@click.argument("session_id")
+@click.option("--config", "config_path", default=None)
+def replay_convert(session_id: str, config_path: str):
+    """Reconstruct Kalshi books from raw frames + build index_grid.jsonl."""
+    from btc15.config import load_config
+    from btc15.recording.replay import cmd_convert
+    cfg = load_config(Path(config_path) if config_path else None)
+    setup_logging("INFO", cfg.logging.log_file)
+    summary = cmd_convert(session_id, Path(cfg.recording.path))
+    import json as _json
+    console.print(_json.dumps(summary, indent=2))
+
+
+@replay.command("analyze")
+@click.argument("session_id")
+@click.option("--config", "config_path", default=None)
+@click.option(
+    "--results-cache",
+    default="data/market_results_cache.json",
+    help="Path to settled-market results cache (for counterfactual P&L)",
+)
+def replay_analyze(session_id: str, config_path: str, results_cache: str):
+    """Run the two Phase-1 validation analyses on a recorded session."""
+    from btc15.config import load_config
+    from btc15.recording.replay import cmd_analyze
+    cfg = load_config(Path(config_path) if config_path else None)
+    setup_logging("INFO", cfg.logging.log_file)
+    summary = cmd_analyze(
+        session_id,
+        Path(cfg.recording.path),
+        Path(results_cache),
+    )
+    import json as _json
+    console.print(_json.dumps(summary, indent=2))

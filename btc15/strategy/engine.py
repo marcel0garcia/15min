@@ -42,6 +42,10 @@ from btc15.risk.manager import RiskManager
 from btc15.strategy.personas import (
     Action, AutoTrader, phase_min_confidence, phase_entry_price_range,
 )
+from btc15.recording import SessionRecorder, BRAIN_VERSION
+from btc15.recording.kalshi_tap import KalshiRawTap
+from btc15.recording.decision_log import DecisionLog, _classify_action
+from btc15.recording.venues import build_venue_tasks
 
 
 log = logging.getLogger(__name__)
@@ -148,6 +152,18 @@ class StrategyEngine:
         _now = datetime.now(timezone.utc)
         self._session_label = _now.strftime("%d%b%H:%M").upper()
 
+        # ── v2 Phase 1 telemetry recorder ────────────────────────────────────
+        # Ambient — co-runs with the engine. No-op when recording.enabled=false.
+        self._recorder = SessionRecorder(config, self._session_label)
+        self._kalshi_tap = KalshiRawTap(self._recorder)
+        self._venue_ws_list: list = []  # (name, ws_instance) pairs; built in start()
+        self._decision_log = DecisionLog(
+            recorder=self._recorder,
+            session_label=self._session_label,
+            config_hash=self._recorder.config_hash,
+            brain_version=BRAIN_VERSION,
+        )
+
         self._dash_handler = _DashboardLogHandler(self.state)
         self._dash_handler.setLevel(logging.INFO)
         logging.getLogger().addHandler(self._dash_handler)
@@ -215,9 +231,18 @@ class StrategyEngine:
         self._ws.on("trade", self._market_cache.handle_trade)
         self._ws.on("fill", self._handle_fill)
         self._ws.on_reconnect = self._on_ws_reconnect
+        # Recorder tap — attached AFTER cache handlers so the cache wins dispatch
+        # order, then we get a verbatim copy. Read-only; never affects routing.
+        self._kalshi_tap.attach(self._ws)
         # Lets the cache trigger a REST refresh when data goes stale between ticks.
         self._market_cache.rest_refresh = self._refresh_ticker_orderbook
         self._tasks.append(asyncio.create_task(self._ws.run(), name="kalshi-ws"))
+
+        # Venue WS connectors for BRTI placeholder reconstruction.
+        if self.cfg.recording.enabled:
+            self._venue_ws_list = build_venue_tasks(self.cfg, self._recorder)
+            for name, ws in self._venue_ws_list:
+                self._tasks.append(asyncio.create_task(ws.run(), name=name))
 
         try:
             _start_bal = await self._kalshi.get_balance()
@@ -245,6 +270,15 @@ class StrategyEngine:
         self.running = False
         self.state["status"] = "stopping"
 
+        # Finalize the recorder FIRST so meta.json gets end_ts + line counts
+        # even when later shutdown steps hang (e.g. SIGHUP from "Kill Terminal"
+        # bypasses Ctrl+C, leaving WS closes dangling). Writes are already
+        # flushed at this point — close() is just finalizing meta.
+        try:
+            self._recorder.close()
+        except Exception as e:
+            log.debug(f"recorder close error: {e}")
+
         if not self.cfg.strategy.paper_trade and self._kalshi:
             try:
                 n = await self._kalshi.cancel_all_orders()
@@ -252,6 +286,13 @@ class StrategyEngine:
                     log.info(f"Cancelled {n} open orders on shutdown")
             except Exception as e:
                 log.warning(f"Error cancelling orders on shutdown: {e}")
+
+        # Signal venue WS loops to exit cleanly before we cancel tasks.
+        for _name, ws in self._venue_ws_list:
+            try:
+                await ws.stop()
+            except Exception:
+                pass
 
         for t in self._tasks:
             t.cancel()
@@ -610,6 +651,27 @@ class StrategyEngine:
 
             # Dispatch to AutoTrader only when in the entry price window
             # (or holding a position that needs exit evaluation).
+            decision_ob = {"yes_bid": yes_bid, "yes_ask": yes_ask}
+            if not self.cfg.strategy.auto_trade:
+                self._decision_log.emit(
+                    ticker=market.ticker, secs=secs, output=output,
+                    orderbook=decision_ob, flow_info=None,
+                    action=None, reason_code="AUTO_TRADE_OFF",
+                )
+            elif not tradeable:
+                self._decision_log.emit(
+                    ticker=market.ticker, secs=secs, output=output,
+                    orderbook=decision_ob, flow_info=None,
+                    action=None, reason_code="OUTSIDE_ENTRY_WINDOW",
+                )
+            elif not in_entry_window:
+                self._decision_log.emit(
+                    ticker=market.ticker, secs=secs, output=output,
+                    orderbook=decision_ob, flow_info=None,
+                    action=None, reason_code="OUTSIDE_PRICE_BAND",
+                    extra={"phase_min": ph_min, "phase_max": ph_max,
+                           "mid_price": mid_price},
+                )
             if self.cfg.strategy.auto_trade and in_entry_window:
                 ob_info = {"yes_bid": trade_bid, "yes_ask": trade_ask}
                 mkt_info = {
@@ -636,6 +698,26 @@ class StrategyEngine:
                         bankroll_usd=bankroll,
                         flow_info=flow_info,
                     )
+                    # Decision-log emission BEFORE execution so a downstream
+                    # failure (e.g. Kalshi API error) still leaves a record of
+                    # what was intended.
+                    if not actions:
+                        rcode = (
+                            "ALREADY_HOLDING" if has_position
+                            else "EVALUATED_NO_ACTION"
+                        )
+                        self._decision_log.emit(
+                            ticker=market.ticker, secs=secs, output=output,
+                            orderbook=ob_info, flow_info=flow_info,
+                            action=None, reason_code=rcode,
+                        )
+                    else:
+                        for action in actions:
+                            self._decision_log.emit(
+                                ticker=market.ticker, secs=secs, output=output,
+                                orderbook=ob_info, flow_info=flow_info,
+                                action=action, reason_code=_classify_action(action),
+                            )
                     for action in actions:
                         await self._execute_action(action)
                 except Exception as e:
@@ -1057,8 +1139,11 @@ class StrategyEngine:
             self.risk.record_close(action.ticker, won=(pnl > 0), pnl=pnl)
             # Capture Kalshi fee on the sell side and mark the order_id so the
             # WS fill duplicate (if any) is suppressed by the dedup check.
-            self.risk.record_fee(order.fees_paid_usd)
-            self._handled_fill_orders[order.order_id] = time.time()
+            # Live mode only — `order` is only assigned inside the
+            # `if not paper and self._kalshi:` block above.
+            if not paper and self._kalshi:
+                self.risk.record_fee(order.fees_paid_usd)
+                self._handled_fill_orders[order.order_id] = time.time()
             self._log_trade(
                 action.ticker, f"{action.side}_exit",
                 action.contracts, action.price_cents,

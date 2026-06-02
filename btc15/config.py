@@ -302,6 +302,18 @@ class LoggingConfig:
 
 
 @dataclass
+class RecordingConfig:
+    enabled: bool = True
+    path: str = "data/recordings"
+    venue_coinbase: bool = True
+    venue_kraken: bool = True
+    venue_bitstamp: bool = True
+    venue_gemini: bool = False
+    grid_interval_sec: float = 1.0
+    venue_max_msg_per_sec: int = 10
+
+
+@dataclass
 class AppConfig:
     kalshi: KalshiConfig = field(default_factory=KalshiConfig)
     feeds: FeedsConfig = field(default_factory=FeedsConfig)
@@ -310,6 +322,7 @@ class AppConfig:
     trader: TraderConfig = field(default_factory=TraderConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    recording: RecordingConfig = field(default_factory=RecordingConfig)
     database_path: str = "data/btc15.db"
 
 
@@ -352,6 +365,8 @@ def load_config(config_path: Optional[Path] = None) -> AppConfig:
     Path(cfg.logging.log_file).parent.mkdir(parents=True, exist_ok=True)
     Path(cfg.logging.trade_log_file).parent.mkdir(parents=True, exist_ok=True)
     Path(cfg.database_path).parent.mkdir(parents=True, exist_ok=True)
+    if cfg.recording.enabled:
+        Path(cfg.recording.path).mkdir(parents=True, exist_ok=True)
 
     return cfg
 

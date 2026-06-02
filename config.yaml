@@ -270,5 +270,24 @@ logging:
   trade_log_file: "logs/trades.csv"
   max_log_size_mb: 50
 
+# ── v2 Phase 1: ambient telemetry recorder ────────────────────────────────────
+# Records Kalshi raw WS frames + venue top-of-book + decision log per session.
+# Co-runs with the engine; never places orders. Disabled cleanly via enabled:false.
+# See btc15/recording/ for implementation; `python main.py replay convert <session>`
+# converts the JSONL sidecars into joined Parquet for offline analysis.
+recording:
+  enabled: true
+  path: "data/recordings"
+  # BRTI constituents to capture for the consolidated-mid placeholder. CB +
+  # Kraken + Bitstamp gives a median-of-3; gemini optional.
+  venue_coinbase: true
+  venue_kraken: true
+  venue_bitstamp: true
+  venue_gemini: false
+  # Derived 1Hz grid is rebuilt at convert time from raw venue ticks, not live.
+  grid_interval_sec: 1.0
+  # Bound disk usage on chatty venues; 0 disables rate limiting.
+  venue_max_msg_per_sec: 10
+
 database:
   path: "data/btc15.db"
