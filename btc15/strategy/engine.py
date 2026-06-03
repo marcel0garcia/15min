@@ -415,10 +415,12 @@ class StrategyEngine:
     # ── v2 Phase 1.5: live BTC tape + BRTI reconstruction ──────────────────
 
     async def _on_btc_tick(self, price: float, qty: float, ts_ms: int) -> None:
-        """Binance tick handler — appends to the bounded BTC tape buffer.
-        Read-only subscriber; never affects price_feed's existing consumers.
+        """Binance tick handler — appends to the bounded BTC tape buffer
+        and refreshes state['current_price'] every tick so the dashboard
+        header tracks sub-second instead of the 1Hz _state_updater pulse.
         """
         self.state["btc_tape"].append((ts_ms / 1000.0, price, qty))
+        self.state["current_price"] = price
 
     async def _live_brti_loop(self) -> None:
         """Recompute the consolidated mid + venue status snapshot for the
@@ -434,14 +436,20 @@ class StrategyEngine:
                 now = time.time()
                 venue_mids: dict[str, float] = {}
                 venue_status: dict = {}
-                for name, ws in self._venue_ws_list:
+                for _task_name, ws in self._venue_ws_list:
+                    # Use ws.name ("coinbase" / "kraken" / "bitstamp") for
+                    # dict keys — NOT the asyncio task name which carries a
+                    # "venue-" prefix. That prefix was leaking into the
+                    # outlier labels and breaking the BRTI panel's lookup
+                    # (which keys off the plain venue name).
+                    vname = ws.name
                     if ws.last_bid is None or ws.last_ask is None:
-                        venue_status[name] = {"connected": False, "age_sec": None}
+                        venue_status[vname] = {"connected": False, "age_sec": None}
                         continue
                     age = now - ws.last_ts if ws.last_ts > 0 else None
                     fresh = age is not None and age <= STALENESS_SEC
                     mid = (ws.last_bid + ws.last_ask) / 2.0
-                    venue_status[name] = {
+                    venue_status[vname] = {
                         "connected": True,
                         "bid": ws.last_bid,
                         "ask": ws.last_ask,
@@ -450,7 +458,7 @@ class StrategyEngine:
                         "fresh": fresh,
                     }
                     if fresh:
-                        venue_mids[name] = mid
+                        venue_mids[vname] = mid
 
                 if venue_mids:
                     mid, outliers, healthy, reason = _brti_reconstruct(venue_mids)

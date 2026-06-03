@@ -81,6 +81,7 @@ class _BaseVenueWS:
             self._reconnect_delay = 2.0
             await self._subscribe(ws)
             log.info(f"[REC-{self.name.upper()}] connected")
+            first_msg_logged = False
             async for raw in ws:
                 if not self._running:
                     break
@@ -88,6 +89,13 @@ class _BaseVenueWS:
                     msg = json.loads(raw)
                 except (json.JSONDecodeError, TypeError):
                     continue
+                # Log the first raw message per connection so we can verify
+                # what each venue is actually sending (debug for the
+                # "co offline despite handshake success" pattern).
+                if not first_msg_logged:
+                    snippet = str(msg)[:200]
+                    log.info(f"[REC-{self.name.upper()}] first msg: {snippet}")
+                    first_msg_logged = True
                 try:
                     await self._handle_message(msg)
                 except Exception as e:

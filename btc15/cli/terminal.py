@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from rich.align import Align
-from rich.console import Console
+from rich.console import Console, Group
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
@@ -53,7 +53,12 @@ def _sig_color(signal: str) -> str:
 
 
 def build_header(state: dict) -> Panel:
-    price = state.get("current_price", 0.0)
+    # BTC price displayed in the header reads from the live BRTI mid (what
+    # KXBTC15M settles against), with the venue feed falling back to "—"
+    # when no venues are healthy. Pre-Phase-3 the engine internally still
+    # consumes Binance via state["current_price"]; this is display-only.
+    recon = state.get("recon_brti") or {}
+    price = recon.get("mid")
     feed_age = state.get("feed_age_sec", 0.0)
     status = state.get("status", "idle").upper()
 
@@ -103,9 +108,13 @@ def build_header(state: dict) -> Panel:
     except Exception:
         pass
 
+    price_str = (
+        f"[bold bright_cyan]${price:,.2f}[/bold bright_cyan]"
+        if isinstance(price, (int, float)) else "[dim]—[/dim]"
+    )
     content = (
         f"  [dim]15 MIN OF FAME[/dim]"
-        f"   [bold white]BTC[/bold white] [bold bright_cyan]${price:,.2f}[/bold bright_cyan]"
+        f"   [bold white]BTC[/bold white] {price_str}"
         f"   {mode_str}"
         f"   [dim]{status}[/dim]"
         f"   [{feed_color}]feed: {feed_age:.1f}s[/{feed_color}]"
@@ -163,7 +172,10 @@ def build_signals_panel(state: dict) -> Panel:
     return Panel(table, title="[bold]Signals[/bold]", border_style="blue")
 
 
-def build_markets_panel(state: dict) -> Panel:
+def build_markets_panel(state: dict, market_cache=None) -> Panel:
+    """Open markets table. Strike + T-left come from the 1Hz scan snapshot;
+    yes_ask / yes_bid are read live from market_cache._tickers at render
+    time so the displayed prices refresh at the dashboard's 5Hz cadence."""
     markets = state.get("open_markets", [])
     if not markets:
         return Panel("[dim]No open KXBTC markets[/dim]", title="Markets")
@@ -175,13 +187,17 @@ def build_markets_panel(state: dict) -> Panel:
     table.add_column("Vol", justify="right")
     table.add_column("T-Left", justify="right")
 
+    cache_tickers = getattr(market_cache, "_tickers", {}) if market_cache else {}
+
     for m in markets[:8]:
+        ticker = m.get("ticker", "")
         secs = m.get("seconds_left", 0)
         mins = secs // 60
         sec_r = secs % 60
-        yes_ask = m.get("yes_ask")   # None = no data; 0 is not a valid Kalshi price
-        yes_bid = m.get("yes_bid")
-        # NO ask = 100 − YES bid (what you pay to enter a NO position)
+        # Prefer live cache values; fall back to scan snapshot if cache empty.
+        live = cache_tickers.get(ticker) or {}
+        yes_ask = live.get("yes_ask") if live.get("yes_ask") is not None else m.get("yes_ask")
+        yes_bid = live.get("yes_bid") if live.get("yes_bid") is not None else m.get("yes_bid")
         no_ask = round(100 - yes_bid) if yes_bid is not None else None
         table.add_row(
             f"${m.get('strike', 0):,.0f}",
@@ -556,154 +572,248 @@ def build_event_log_panel(state: dict) -> Panel:
 
 _VOL_BLOCKS = "▁▂▃▄▅▆▇█"
 
+# Cells displayed per tape. Buffer holds up to 80 events; only the last N
+# are rendered. BTC tape is wider (left half of screen) so it gets ~62
+# cells. Kalshi tape lives in the half-minus-32 column to the right of
+# BRTI/Risk so it stays at 44 to avoid wrapping.
+TAPE_CELLS_BTC = 62
+TAPE_CELLS_KALSHI = 44
 
-def _vol_glyph(qty: float, scale: float) -> str:
-    """Map a volume value to one of 8 block glyphs by ratio to a scale."""
+
+def _vol_glyph(qty: float, scale: float) -> tuple[str, bool]:
+    """Map a volume to a single block-char height level (0-7) + a "spike"
+    flag for the upper-half range.
+
+    Single-row tape — eliminates the line-gap seam that plagues two-row
+    block-char rendering in VSCode/most monospace terminals. Spike flag
+    lets the renderer bold high-volume cells so they still stand out
+    without needing the second row.
+    """
     if scale <= 0 or qty <= 0:
-        return _VOL_BLOCKS[0]
-    idx = min(len(_VOL_BLOCKS) - 1, int((qty / scale) * len(_VOL_BLOCKS)))
-    return _VOL_BLOCKS[idx]
+        return " ", False
+    level = min(15, int((qty / scale) * 16))
+    glyph = _VOL_BLOCKS[min(7, level)]
+    spike = level >= 8
+    return glyph, spike
+
+
+def _mute_color(col: str) -> str:
+    """Take a Rich color name and return a slightly muted variant. Used to
+    alternate brightness across adjacent tape cells so runs of identical
+    bars stay visually distinct instead of blending into a solid block."""
+    if col.startswith("bright_"):
+        return col[len("bright_"):]
+    if col == "dim white":
+        return "grey50"
+    if col.startswith("dim "):
+        return col  # already muted
+    return f"dim {col}"
+
+
+def _render_tape(
+    events: list, get_color, get_qty, max_cells: int = TAPE_CELLS_KALSHI,
+) -> Text:
+    """Build a single-row colored block-char tape.
+
+    Scaling uses the p90 of qtys in the rendered window — not max — so a
+    single whale trade doesn't compress every typical tick into invisible
+    level-0 bars. Values above p90 cap at level 7 (full block) and get
+    'spike' styling (bold) so they still stand out without needing a
+    second row.
+
+    Brightness alternates (even = bright, odd = muted) so adjacent
+    same-direction same-height cells stay visually distinct.
+    """
+    if not events:
+        return Text("(no data)", style="dim", justify="center")
+    events = events[-max_cells:]
+    qtys = [get_qty(e) for e in events]
+    if qtys:
+        sorted_q = sorted(qtys)
+        scale = max(sorted_q[int(len(sorted_q) * 0.9)], 1e-9)
+    else:
+        scale = 1.0
+    row = Text(justify="center")
+    for i, e in enumerate(events):
+        glyph, spike = _vol_glyph(qtys[i], scale)
+        col = get_color(i, e, events)
+        if spike:
+            col = f"bold {col}"
+        if i % 2 == 1:
+            col = _mute_color(col)
+        row.append(glyph, style=col)
+    return row
 
 
 def build_btc_tape_panel(state: dict) -> Panel:
-    """Binance tick tape — newest right, scrolls left. Color by direction
-    (uptick green / downtick red), height by volume. Header line shows
-    the latest Binance price and its delta vs recon_brti."""
-    tape = list(state.get("btc_tape") or ())
-    recon = state.get("recon_brti") or {}
-    recon_mid = recon.get("mid")
-    last_price = tape[-1][1] if tape else None
+    """Binance tick tape — two-row colored block chars, newest right.
+    Color by direction (uptick green / downtick red), height by volume.
+    Footer shows price-delta over the window, total volume, then the
+    Phase 3 KPI line (fair_value / z / σ — placeholders until brain swap)."""
+    tape = list(state.get("btc_tape") or ())[-80:]
 
-    header = Text()
-    if last_price is not None:
-        header.append(f"Binance ${last_price:,.2f}", style="bold")
+    def _color(i: int, e, evs) -> str:
+        _, price, _ = e
+        if i == 0:
+            return "dim white"
+        prev = evs[i - 1][1]
+        if price == prev:
+            return "dim white"
+        return "bright_green" if price > prev else "bright_red"
+
+    tape_row = _render_tape(
+        tape, get_color=_color, get_qty=lambda e: e[2],
+        max_cells=TAPE_CELLS_BTC,
+    )
+
+    # Window stats footer.
+    stats = Text(justify="center")
+    if len(tape) >= 2:
+        delta = tape[-1][1] - tape[0][1]
+        total_vol = sum(q for _, _, q in tape)
+        dcol = "bright_green" if delta > 0 else "bright_red" if delta < 0 else "dim white"
+        stats.append(f"Δ ${delta:+.2f}", style=dcol)
+        stats.append("   ·   ", style="dim")
+        stats.append(f"vol {total_vol:.2f} BTC", style="white")
     else:
-        header.append("Binance —", style="dim")
-    if last_price is not None and recon_mid is not None:
-        delta = last_price - recon_mid
-        col = "bright_green" if abs(delta) < 5 else "yellow" if abs(delta) < 20 else "bright_red"
-        header.append(f"   Δvs BRTI ${delta:+.2f}", style=col)
+        stats.append("(awaiting ticks)", style="dim")
 
-    if not tape:
-        body = Text("\n(no ticks yet)", style="dim")
-    else:
-        max_qty = max(q for _, _, q in tape) or 1.0
-        cells = Text()
-        prev = None
-        for _, price, qty in tape:
-            glyph = _vol_glyph(qty, max_qty)
-            if prev is None or price == prev:
-                col = "dim white"
-            elif price > prev:
-                col = "bright_green"
-            else:
-                col = "bright_red"
-            cells.append(glyph, style=col)
-            prev = price
-        body = cells
-
-    # Phase 3 KPI placeholder row
+    # Phase 3 KPI placeholder row — becomes the brain's signals once Phase 3
+    # populates state['fair_value' / 'z_score' / 'sigma_nowcast'].
     fv = state.get("fair_value")
     z = state.get("z_score")
     sig = state.get("sigma_nowcast")
-    kpis = Text()
-    kpis.append("\nfair_value ", style="dim")
-    kpis.append(f"{fv:.4f}" if isinstance(fv, (int, float)) else "—", style="cyan" if fv is not None else "dim")
+    kpis = Text(justify="center")
+    kpis.append("fair_value ", style="dim")
+    kpis.append(
+        f"{fv:.4f}" if isinstance(fv, (int, float)) else "—",
+        style="cyan" if fv is not None else "dim",
+    )
     kpis.append("   z ", style="dim")
-    kpis.append(f"{z:+.2f}" if isinstance(z, (int, float)) else "—", style="cyan" if z is not None else "dim")
+    kpis.append(
+        f"{z:+.2f}" if isinstance(z, (int, float)) else "—",
+        style="cyan" if z is not None else "dim",
+    )
     kpis.append("   σ ", style="dim")
-    kpis.append(f"{sig:.3f}" if isinstance(sig, (int, float)) else "—", style="cyan" if sig is not None else "dim")
+    kpis.append(
+        f"{sig:.3f}" if isinstance(sig, (int, float)) else "—",
+        style="cyan" if sig is not None else "dim",
+    )
 
-    composed = Text()
-    composed.append_text(header)
-    composed.append("\n")
-    composed.append_text(body)
-    composed.append_text(kpis)
-    return Panel(composed, title="BTC TAPE", border_style="cyan", padding=(0, 1))
+    body = Group(
+        Align.center(tape_row),
+        Text(""),  # spacer between tape and footer stats
+        Align.center(stats),
+        Align.center(kpis),
+    )
+    return Panel(
+        Align(body, "center", vertical="middle"),
+        title="BTC Tape", border_style="cyan", padding=(0, 1),
+    )
 
 
 def build_kalshi_tape_panel(state: dict, market_cache=None) -> Panel:
-    """Per-contract trade tape — colored by taker outcome side (yes-taker
-    green, no-taker red). Picks the most recently traded ticker."""
+    """Per-contract trade tape — two-row colored block chars, coloring by
+    taker outcome side (yes-taker green, no-taker red), height by trade
+    count. Footer shows taker volume by side + net bias and throughput."""
     tape_data = []
-    chosen_ticker: Optional[str] = None
     if market_cache is not None and hasattr(market_cache, "_trades"):
-        # Pick the ticker with the most recent trade.
         latest_per_ticker = []
         for ticker, dq in market_cache._trades.items():
             if dq:
                 latest_per_ticker.append((dq[-1][0], ticker, list(dq)))
         if latest_per_ticker:
             latest_per_ticker.sort(key=lambda x: -x[0])
-            _, chosen_ticker, tape_data = latest_per_ticker[0]
-            tape_data = tape_data[-60:]
+            _, _, tape_data = latest_per_ticker[0]
+            tape_data = tape_data[-80:]
 
-    header = Text()
-    if chosen_ticker:
-        header.append("Active: ", style="dim")
-        header.append(chosen_ticker[-15:], style="bold cyan")
-        header.append(f"  ({len(tape_data)} prints)", style="dim")
+    def _color(i: int, e, evs) -> str:
+        taker_side = e[1]
+        if taker_side == "yes":
+            return "bright_green"
+        if taker_side == "no":
+            return "bright_red"
+        return "dim white"
+
+    tape_row = _render_tape(
+        tape_data, get_color=_color, get_qty=lambda e: e[2]
+    )
+
+    # Taker-side volume breakdown — directional pressure at a glance.
+    stats = Text(justify="center")
+    if tape_data:
+        yes_vol = sum(t[2] for t in tape_data if t[1] == "yes")
+        no_vol = sum(t[2] for t in tape_data if t[1] == "no")
+        total = yes_vol + no_vol
+        net_pct = (yes_vol - no_vol) / total * 100 if total > 0 else 0.0
+        stats.append(f"YES {yes_vol:.0f}", style="bright_green")
+        stats.append("   ·   ", style="dim")
+        stats.append(f"NO {no_vol:.0f}", style="bright_red")
+        stats.append("   ·   ", style="dim")
+        net_col = "bright_green" if net_pct > 0 else "bright_red" if net_pct < 0 else "dim white"
+        stats.append(f"net {net_pct:+.1f}%", style=net_col)
     else:
-        header.append("No active Kalshi trades yet", style="dim")
+        stats.append("(awaiting prints)", style="dim")
 
-    if not tape_data:
-        body = Text("\n(awaiting trades)", style="dim")
+    # Second stats line: throughput + total contracts.
+    flow = Text(justify="center")
+    if len(tape_data) >= 2:
+        span_sec = max(tape_data[-1][0] - tape_data[0][0], 1.0)
+        prints_per_sec = len(tape_data) / span_sec
+        total_contracts = sum(t[2] for t in tape_data)
+        flow.append(f"{prints_per_sec:.1f} prints/s", style="dim")
+        flow.append("   ·   ", style="dim")
+        flow.append(f"Σ {total_contracts:.0f} contracts", style="dim")
     else:
-        max_count = max((t[2] for t in tape_data), default=1.0) or 1.0
-        cells = Text()
-        for ts, taker_side, count, yes_cents in tape_data:
-            glyph = _vol_glyph(count, max_count)
-            if taker_side == "yes":
-                col = "bright_green"
-            elif taker_side == "no":
-                col = "bright_red"
-            else:
-                col = "dim white"
-            cells.append(glyph, style=col)
-        body = cells
+        flow.append(" ", style="dim")
 
-    composed = Text()
-    composed.append_text(header)
-    composed.append("\n")
-    composed.append_text(body)
-    return Panel(composed, title="KALSHI TAPE", border_style="magenta", padding=(0, 1))
+    body = Group(
+        Align.center(tape_row),
+        Text(""),  # spacer between tape and footer stats
+        Align.center(stats),
+        Align.center(flow),
+    )
+    return Panel(
+        Align(body, "center", vertical="middle"),
+        title="Kalshi Tape", border_style="magenta", padding=(0, 1),
+    )
 
 
 def build_brti_panel(state: dict) -> Panel:
-    """Live consolidated mid + venue contributions. Phase 3 will read this
-    same recon_brti.mid as the engine's price input."""
+    """Source-health monitor for the consolidated BTC reference. The BRTI
+    price itself lives in the main header; this panel shows status,
+    spread, and per-venue contributions. The two-char venue label
+    (co / kr / bi) is colored yellow when that venue is the current
+    outlier — the mid / age stay neutral so the row reads cleanly."""
     recon = state.get("recon_brti") or {}
     venues = state.get("venue_status") or {}
 
-    mid = recon.get("mid")
     healthy = recon.get("healthy", False)
-    n_venues = recon.get("n_venues", 0)
     spread = recon.get("spread", 0)
-    outliers = recon.get("outliers") or []
+    outliers = set(recon.get("outliers") or [])
     reason = recon.get("reason") or "—"
 
     composed = Text()
-    if mid is not None:
-        composed.append(f"BRTI ${mid:,.2f}", style="bold bright_white")
-    else:
-        composed.append("BRTI —", style="dim")
-    composed.append("   ")
+    # Line 1: status
     if healthy:
         composed.append("✓ healthy", style="bright_green")
     else:
         composed.append(f"⚠ {reason}", style="yellow")
-    composed.append(f"  {n_venues}v", style="dim")
+    # Line 2: spread
+    composed.append("\n")
     if spread:
         col = "dim" if spread < 10 else "yellow" if spread < 30 else "bright_red"
-        composed.append(f"  spread ${spread:.2f}", style=col)
-    if outliers:
-        composed.append(f"  outlier:{','.join(outliers)}", style="yellow")
+        composed.append(f"spread ${spread:.2f}", style=col)
+    else:
+        composed.append("spread —", style="dim")
 
-    # Per-venue row
     composed.append("\n")
     for v in ("coinbase", "kraken", "bitstamp"):
         vs = venues.get(v) or {}
-        composed.append(f"\n{v[:2]} ", style="dim")
+        is_outlier = v in outliers
+        name_style = "yellow" if is_outlier else "dim"
+        composed.append(f"\n{v[:2]}", style=name_style)
+        composed.append(" ", style="dim")
         if vs.get("connected") and vs.get("fresh"):
             composed.append(f"${vs.get('mid', 0):,.2f}", style="white")
             composed.append(f" ✓{vs.get('age_sec', 0):.1f}s", style="dim green")
@@ -717,33 +827,49 @@ def build_brti_panel(state: dict) -> Panel:
 
 
 def build_layout(state: dict, market_cache=None) -> Layout:
+    # Bottom row drives the column geometry: 50/50 split of total width.
+    # Top + tapes mirror it by splitting their LEFT half identically and
+    # carving out RIGHT_W on the far right for Risk / BRTI.
+    #
+    # Result (column boundaries):
+    #   Signals  | Markets       | Risk (32)
+    #   BTC Tape | Kalshi Tape   | BRTI (32)
+    #   Positions+Trades         | Chart + EventLog
+    #
+    # Signals / BTC Tape / Positions all share the same left half.
+    # Markets / Kalshi Tape are narrower than Chart / EventLog by 32 cols
+    # because Risk / BRTI sit to their right.
+    RIGHT_W = 32
+
     layout = Layout()
-    # Four rows: header / top / TAPES / bottom
     layout.split_column(
         Layout(name="header", size=3),
         Layout(name="top", size=12),
-        Layout(name="tapes", size=7),
+        Layout(name="tapes", size=8),
         Layout(name="bottom"),
     )
-    # Top row: signals | markets | risk
     layout["top"].split_row(
-        Layout(name="signals"),
+        Layout(name="signals", ratio=1),
+        Layout(name="top_right", ratio=1),
+    )
+    layout["top_right"].split_row(
         Layout(name="markets"),
-        Layout(name="right_col", size=30),
+        Layout(name="right_col", size=RIGHT_W),
     )
     layout["right_col"].split_column(
         Layout(name="risk"),
     )
-    # v2 Phase 1.5 tapes row: BTC tape | Kalshi tape | BRTI status
     layout["tapes"].split_row(
-        Layout(name="btc_tape"),
-        Layout(name="kalshi_tape"),
-        Layout(name="brti", size=32),
+        Layout(name="btc_tape", ratio=1),
+        Layout(name="tapes_right", ratio=1),
     )
-    # Bottom: positions+trades stacked on left | chart+event_log stacked on right
+    layout["tapes_right"].split_row(
+        Layout(name="kalshi_tape"),
+        Layout(name="brti", size=RIGHT_W),
+    )
     layout["bottom"].split_row(
-        Layout(name="left_col"),
-        Layout(name="right_bottom"),
+        Layout(name="left_col", ratio=1),
+        Layout(name="right_bottom", ratio=1),
     )
     layout["left_col"].split_column(
         Layout(name="positions", size=10),
@@ -755,7 +881,7 @@ def build_layout(state: dict, market_cache=None) -> Layout:
     )
     layout["header"].update(build_header(state))
     layout["signals"].update(build_signals_panel(state))
-    layout["markets"].update(build_markets_panel(state))
+    layout["markets"].update(build_markets_panel(state, market_cache=market_cache))
     layout["risk"].update(build_risk_panel(state))
     layout["btc_tape"].update(build_btc_tape_panel(state))
     layout["kalshi_tape"].update(build_kalshi_tape_panel(state, market_cache=market_cache))
