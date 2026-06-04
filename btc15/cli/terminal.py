@@ -661,20 +661,49 @@ def build_btc_tape_panel(state: dict) -> Panel:
             return "dim white"
         return "bright_green" if price > prev else "bright_red"
 
+    # Bar height: trade qty when available (legacy Coinbase feed), else
+    # |Δprice| between consecutive ticks (BRTI feed, qty=0 by construction
+    # because BRTI is a price index without trade volume). This keeps the
+    # tape readable under either price-source config.
+    use_dprice = bool(tape) and all(q == 0 for _, _, q in tape)
+    if use_dprice:
+        prev_p = None
+        sized = []
+        for ts, p, _ in tape:
+            mag = 0.0 if prev_p is None else abs(p - prev_p)
+            sized.append((ts, p, mag))
+            prev_p = p
+        get_qty_fn = lambda e: e[2]
+        tape_for_render = sized
+    else:
+        tape_for_render = tape
+        get_qty_fn = lambda e: e[2]
+
     tape_row = _render_tape(
-        tape, get_color=_color, get_qty=lambda e: e[2],
+        tape_for_render, get_color=_color, get_qty=get_qty_fn,
         max_cells=TAPE_CELLS_BTC,
     )
 
     # Window stats footer.
+    #   Δ      directional net change across the tape window
+    #   vol    total trade volume — only meaningful with the legacy
+    #          Coinbase trade feed (qty>0). Under BRTI the index has no
+    #          notion of trade volume so we surface `range` (max−min)
+    #          instead — a volatility-flavored complement to Δ.
     stats = Text(justify="center")
     if len(tape) >= 2:
+        prices = [p for _, p, _ in tape]
         delta = tape[-1][1] - tape[0][1]
         total_vol = sum(q for _, _, q in tape)
         dcol = "bright_green" if delta > 0 else "bright_red" if delta < 0 else "dim white"
         stats.append(f"Δ ${delta:+.2f}", style=dcol)
         stats.append("   ·   ", style="dim")
-        stats.append(f"vol {total_vol:.2f} BTC", style="white")
+        if total_vol > 0:
+            stats.append(f"vol {total_vol:.2f} BTC", style="white")
+        else:
+            price_range = max(prices) - min(prices)
+            rcol = "dim" if price_range < 50 else "yellow" if price_range < 200 else "bright_red"
+            stats.append(f"range ${price_range:.2f}", style=rcol)
     else:
         stats.append("(awaiting ticks)", style="dim")
 
