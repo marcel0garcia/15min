@@ -33,6 +33,13 @@ class FeedsConfig:
     kraken_rest_url: str = "https://api.kraken.com/0/public/Ticker?pair=XBTUSD"
     bar_interval_sec: int = 60
     lookback_bars: int = 200
+    # Phase 3: which source feeds the ensemble's current_price + bars.
+    #   "brti"     consolidated median of Coinbase/Kraken/Bitstamp top-of-book
+    #              (same algorithm as recording.brti). Default — what KXBTC
+    #              actually settles against.
+    #   "coinbase" single-venue Coinbase Exchange WS (legacy path; preserved
+    #              as a fallback / A-B comparison option).
+    price_source: str = "brti"
 
 
 @dataclass

@@ -8,7 +8,8 @@ from typing import Optional
 
 import aiohttp
 
-from btc15.feeds.binance import BinanceFeed, OHLCBar
+from btc15.feeds.coinbase import CoinbaseFeed
+from btc15.feeds.types import OHLCBar
 
 log = logging.getLogger(__name__)
 
@@ -29,7 +30,7 @@ class PriceAggregator:
         lookback_bars: int = 200,
         coinbase_rest_url: str = "https://api.coinbase.com/v2/prices/BTC-USD/spot",
     ):
-        self.feed = BinanceFeed(
+        self.feed = CoinbaseFeed(
             bar_interval_sec=bar_interval_sec,
             lookback_bars=lookback_bars,
         )
@@ -89,7 +90,6 @@ class PriceAggregator:
                 # Only emit a heartbeat bar if no real bar arrived in the last interval
                 if bars and (now - bars[-1].ts) < interval * 1.5:
                     continue
-                from btc15.feeds.binance import OHLCBar
                 synthetic = OHLCBar(
                     open=price, high=price, low=price, close=price,
                     volume=0.0, vwap=price,

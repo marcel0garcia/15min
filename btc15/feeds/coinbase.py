@@ -1,11 +1,13 @@
 """
-BTC price feed — Coinbase Exchange WebSocket as primary.
+BTC price feed — Coinbase Exchange WebSocket.
 
-Coinbase is a CF Benchmarks BRTI constituent exchange (same index Kalshi uses
-for KXBTC settlement), requires no auth, and is highly reliable on US IPs.
-Binance is HTTP 451 on US IPs. Kraken WS v2 proved intermittently stale.
+Coinbase is a CF Benchmarks BRTI constituent exchange (same index Kalshi
+uses for KXBTC settlement), requires no auth, and is reliable on US IPs.
 
-Keeps the same public API (BinanceFeed class name preserved for compatibility).
+This is the single-venue price source. The consolidated BRTI feed
+(btc15/feeds/brti_feed.py) wraps the venue connectors used for recording
+into the same interface so the engine can swap between them via
+feeds.price_source config.
 """
 from __future__ import annotations
 
@@ -14,53 +16,17 @@ import json
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Callable, Coroutine, Optional
+from typing import Callable, Optional
 
 import websockets
 
+from btc15.feeds.types import BarAccumulator, OHLCBar, Tick, TickHandler
+
 log = logging.getLogger(__name__)
 
-TickHandler = Callable[[float, float, int], Coroutine]
 
-
-@dataclass
-class Tick:
-    price: float
-    qty: float
-    ts_ms: int
-
-    @property
-    def ts(self) -> float:
-        return self.ts_ms / 1000
-
-
-@dataclass
-class OHLCBar:
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float
-    vwap: float
-    ts: float
-    interval_sec: int
-    trade_count: int = 0
-
-    @property
-    def pct_change(self) -> float:
-        return (self.close - self.open) / self.open if self.open else 0.0
-
-    @property
-    def body_pct(self) -> float:
-        return (self.close - self.open) / self.open if self.open else 0.0
-
-
-class BinanceFeed:
-    """
-    Real-time BTC/USD price feed via Coinbase Exchange WebSocket.
-    Named BinanceFeed for API compatibility with the rest of the codebase.
-    """
+class CoinbaseFeed:
+    """Real-time BTC/USD price feed via Coinbase Exchange WebSocket."""
 
     STREAM_URL = "wss://ws-feed.exchange.coinbase.com"
 
@@ -73,7 +39,7 @@ class BinanceFeed:
 
         self._ticks: deque[Tick] = deque(maxlen=5000)
         self._bars: deque[OHLCBar] = deque(maxlen=lookback_bars)
-        self._current_bar: Optional[_BarAccumulator] = None
+        self._current_bar: Optional[BarAccumulator] = None
 
         self._last_price: float = 0.0
         self._running = False
@@ -221,7 +187,7 @@ class BinanceFeed:
         bar_ts_ms = (tick.ts_ms // (self.bar_interval_sec * 1000)) * (self.bar_interval_sec * 1000)
 
         if self._current_bar is None:
-            self._current_bar = _BarAccumulator(bar_ts_ms, self.bar_interval_sec)
+            self._current_bar = BarAccumulator(bar_ts_ms, self.bar_interval_sec)
 
         if tick.ts_ms >= self._current_bar.ts_ms + self.bar_interval_sec * 1000:
             finished = self._current_bar.to_ohlc()
@@ -233,7 +199,7 @@ class BinanceFeed:
                     await handler(finished)
                 except Exception as e:
                     log.error(f"Bar handler error: {e}")
-            self._current_bar = _BarAccumulator(bar_ts_ms, self.bar_interval_sec)
+            self._current_bar = BarAccumulator(bar_ts_ms, self.bar_interval_sec)
 
         self._current_bar.add(tick)
 
@@ -275,38 +241,4 @@ class BinanceFeed:
             log.warning(f"Failed to seed bars from Coinbase REST: {e}")
 
 
-class _BarAccumulator:
-    def __init__(self, ts_ms: int, interval_sec: int):
-        self.ts_ms = ts_ms
-        self.interval_sec = interval_sec
-        self._open: Optional[float] = None
-        self._high: float = float("-inf")
-        self._low: float = float("inf")
-        self._close: float = 0.0
-        self._vol: float = 0.0
-        self._vol_price: float = 0.0
-        self._count: int = 0
-
-    def add(self, tick: Tick):
-        if self._open is None:
-            self._open = tick.price
-        self._high = max(self._high, tick.price)
-        self._low = min(self._low, tick.price)
-        self._close = tick.price
-        self._vol += tick.qty
-        self._vol_price += tick.qty * tick.price
-        self._count += 1
-
-    def to_ohlc(self) -> OHLCBar:
-        vwap = self._vol_price / self._vol if self._vol > 0 else self._close
-        return OHLCBar(
-            open=self._open or self._close,
-            high=self._high,
-            low=self._low,
-            close=self._close,
-            volume=self._vol,
-            vwap=vwap,
-            ts=self.ts_ms / 1000,
-            interval_sec=self.interval_sec,
-            trade_count=self._count,
-        )
+# BarAccumulator moved to btc15.feeds.types

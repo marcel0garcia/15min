@@ -31,7 +31,7 @@ import numpy as np
 from scipy.stats import norm
 
 from btc15.models.technical import TechnicalSignals, compute_signals
-from btc15.feeds.binance import OHLCBar
+from btc15.feeds.types import OHLCBar
 
 log = logging.getLogger(__name__)
 

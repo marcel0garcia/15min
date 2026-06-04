@@ -31,6 +31,7 @@ from typing import Optional
 
 from btc15.config import AppConfig
 from btc15.feeds.aggregator import PriceAggregator
+from btc15.feeds.brti_feed import BRTIPriceFeed
 from btc15.kalshi.client import KalshiClient, KalshiAPIError
 from btc15.kalshi.models import (
     Market, Order, OrderType, OrderStatus, Side, MarketStatus,
@@ -113,11 +114,21 @@ class StrategyEngine:
     def __init__(self, config: AppConfig):
         self.cfg = config
         self.risk = RiskManager(config.risk)
-        self.price_feed = PriceAggregator(
-            bar_interval_sec=config.feeds.bar_interval_sec,
-            lookback_bars=config.feeds.lookback_bars,
-            coinbase_rest_url=config.feeds.coinbase_rest_url,
-        )
+        # Phase 3: pick the price source. "brti" routes the ensemble to the
+        # consolidated mid (median of CB/Kraken/Bitstamp, MAD outlier reject)
+        # — the same reference KXBTC settles against. "coinbase" preserves
+        # the legacy single-venue WS path for A-B comparison.
+        if config.feeds.price_source == "brti":
+            self.price_feed = BRTIPriceFeed(
+                bar_interval_sec=config.feeds.bar_interval_sec,
+                lookback_bars=config.feeds.lookback_bars,
+            )
+        else:
+            self.price_feed = PriceAggregator(
+                bar_interval_sec=config.feeds.bar_interval_sec,
+                lookback_bars=config.feeds.lookback_bars,
+                coinbase_rest_url=config.feeds.coinbase_rest_url,
+            )
         self.ensemble = EnsembleModel(
             weights=config.models.ensemble_weights,
             config=config.models,
@@ -476,6 +487,16 @@ class StrategyEngine:
                         "spread": spread,
                         "ts": now,
                     }
+                    # Phase 3: push the consolidated mid into the BRTI feed so
+                    # the ensemble brain (and any other consumer of
+                    # self.price_feed) sees BRTI as current_price instead of
+                    # single-venue Coinbase. Only valid when price_source=brti
+                    # AND the reconstruction was healthy enough to emit a mid.
+                    if mid is not None and isinstance(self.price_feed, BRTIPriceFeed):
+                        try:
+                            await self.price_feed.push_brti(mid, now)
+                        except Exception as e:
+                            log.debug(f"BRTI feed push failed: {e}")
                 else:
                     self.state["recon_brti"] = {
                         "mid": None, "healthy": False, "reason": "no_venues",
