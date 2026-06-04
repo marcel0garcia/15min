@@ -127,6 +127,9 @@ def build_header(state: dict) -> Panel:
 
 
 def build_signals_panel(state: dict) -> Panel:
+    """Signals table — DIR (ensemble) and FV (fair-value, Phase 3 shadow)
+    prob_yes shown side by side for at-a-glance brain comparison. Conf +
+    Edge are still DIR's (the production brain during shadow period)."""
     signals = state.get("signals", {})
     if not signals:
         return Panel("[dim]Waiting for markets...[/dim]", title="Signals")
@@ -135,7 +138,8 @@ def build_signals_panel(state: dict) -> Panel:
     table.add_column("Ticker", style="cyan", no_wrap=True)
     table.add_column("Strike", justify="right")
     table.add_column("T-Left", justify="right")
-    table.add_column("P(YES)", justify="right")
+    table.add_column("DIR", justify="right")
+    table.add_column("FV", justify="right")
     table.add_column("Conf", justify="right")
     table.add_column("Edge", justify="right")
     table.add_column("Signal", justify="center")
@@ -160,11 +164,25 @@ def build_signals_panel(state: dict) -> Panel:
         else:
             conf_color = "dim"
         conf_str = f"[{conf_color}]{conf:.0%}[/{conf_color}]"
+
+        dir_p = s.get("prob_yes", 0.5)
+        fv_p = s.get("fv_prob_yes")
+        fv_degenerate = s.get("fv_degenerate", False)
+        if fv_p is None or fv_degenerate:
+            fv_cell = "[dim]—[/dim]"
+        else:
+            # Highlight when DIR and FV disagree significantly (≥10 pp on
+            # opposite sides of 0.5).
+            disagree = (dir_p - 0.5) * (fv_p - 0.5) < 0 and abs(dir_p - fv_p) >= 0.10
+            fv_color = "bright_yellow" if disagree else "white"
+            fv_cell = f"[{fv_color}]{fv_p:.1%}[/{fv_color}]"
+
         table.add_row(
             ticker[-15:],
             f"${s.get('strike', 0):,.0f}",
             f"{mins}m{sec_r:02d}s",
-            f"{s.get('prob_yes', 0.5):.1%}",
+            f"{dir_p:.1%}",
+            fv_cell,
             conf_str,
             f"[{edge_color}]{best_edge:+.1%}[/{edge_color}]",
             f"[{_sig_color(sig_str)}]{sig_str}[/{_sig_color(sig_str)}]",

@@ -99,6 +99,14 @@ class StrategyConfig:
     paper_trade: bool = True
     max_open_positions: int = 4
     allowed_sides: str = "both"
+    # Phase 3: which brain's prob_yes drives AutoTrader.evaluate firing.
+    #   "ensemble"    legacy 5-component model — current production (shadow
+    #                 period default while we collect fair-value comparison)
+    #   "fair_value"  N(ln(S/K)/(σ√τ)) using BRTI + vol_nowcast — Phase 3 target
+    # The non-production brain still computes per scan; its output is logged
+    # alongside the production one for Brier/agreement comparison and rendered
+    # in the dashboard, but it never fires trades.
+    production_brain: str = "ensemble"
 
 
 @dataclass

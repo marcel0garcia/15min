@@ -32,6 +32,8 @@ from typing import Optional
 from btc15.config import AppConfig
 from btc15.feeds.aggregator import PriceAggregator
 from btc15.feeds.brti_feed import BRTIPriceFeed
+from btc15.models.fair_value import fair_value as _fair_value
+from btc15.models.vol_nowcast import close_to_close as _vol_nowcast
 from btc15.kalshi.client import KalshiClient, KalshiAPIError
 from btc15.kalshi.models import (
     Market, Order, OrderType, OrderStatus, Side, MarketStatus,
@@ -627,6 +629,19 @@ class StrategyEngine:
         bars = self.price_feed.bars_with_partial
         now_utc = datetime.now(timezone.utc)
 
+        # Phase 3 shadow brain: short-horizon realized vol from the most
+        # recent BRTI ticks (trailing 60s by default). Same σ feeds the
+        # fair_value computation for every market in this scan.
+        try:
+            recent = self.price_feed.recent_ticks(seconds=60.0)
+            vol_pairs = [(t.ts, t.price) for t in recent if t.price > 0]
+            vol_est = _vol_nowcast(vol_pairs, lookback_sec=60.0)
+            sigma_nowcast = vol_est.sigma
+        except Exception:
+            sigma_nowcast = 0.80  # safe annualized-vol fallback
+            vol_est = None
+        self.state["sigma_nowcast"] = round(sigma_nowcast, 4)
+
         # Fetch balance once for the whole scan cycle
         bankroll = await self._get_cached_balance()
 
@@ -753,6 +768,30 @@ class StrategyEngine:
                 min_confidence=phase_min_confidence(secs, self.cfg.trader),
             )
 
+            # Phase 3 shadow brain — fair value priced directly from
+            # BRTI/strike/σ/τ. Pure read-only here: outputs are logged and
+            # surfaced in the dashboard, never drive AutoTrader yet. When
+            # production_brain flips to "fair_value" the existing personas
+            # path consumes this output instead of the ensemble's.
+            fv = _fair_value(
+                spot=current_price,
+                strike=market.strike_price,
+                sigma=sigma_nowcast,
+                tau_seconds=secs,
+            )
+            # First market in the scan iteration (soonest-to-settle per
+            # Kalshi's natural ordering) drives the BTC tape footer's
+            # fair_value / z readout. Per-market values still go into the
+            # Signals panel via signals_snapshot.
+            if "fair_value" not in self.state or self.state.get("_fv_scan_ts") != now_utc.timestamp():
+                self.state["fair_value"] = round(fv.prob_yes, 4) if not fv.degenerate else None
+                self.state["z_score"] = (
+                    round(fv.z_score, 3)
+                    if fv.z_score not in (float("inf"), float("-inf"))
+                    else None
+                )
+                self.state["_fv_scan_ts"] = now_utc.timestamp()
+
             signals_snapshot[market.ticker] = {
                 "strike": market.strike_price,
                 "seconds_left": round(secs),
@@ -766,30 +805,51 @@ class StrategyEngine:
                 "tradeable": tradeable and in_entry_window,
                 "ob_bid_depth": round(bid_depth, 1),
                 "ob_ask_depth": round(ask_depth, 1),
+                # Shadow brain fields — fair-value engine output for this market
+                "fv_prob_yes": round(fv.prob_yes, 3),
+                "fv_confidence": round(fv.confidence, 3),
+                "fv_z": round(fv.z_score, 3) if fv.z_score not in (float("inf"), float("-inf")) else None,
+                "fv_degenerate": fv.degenerate,
             }
 
             # Dispatch to AutoTrader only when in the entry price window
             # (or holding a position that needs exit evaluation).
             decision_ob = {"yes_bid": yes_bid, "yes_ask": yes_ask}
+            # Phase 3 shadow-brain extras — strike (was missing from
+            # decision rows), sigma_nowcast, and the fair-value output
+            # alongside the ensemble's prob_yes. Lets post-session Brier
+            # and counterfactual analysis compare brains row-by-row.
+            shadow_extra = {
+                "strike": market.strike_price,
+                "sigma_nowcast": round(sigma_nowcast, 4),
+                "fv_prob_yes": round(fv.prob_yes, 4),
+                "fv_confidence": round(fv.confidence, 4),
+                "fv_z": (round(fv.z_score, 3)
+                         if fv.z_score not in (float("inf"), float("-inf"))
+                         else None),
+                "fv_degenerate": fv.degenerate,
+            }
             if not self.cfg.strategy.auto_trade:
                 self._decision_log.emit(
                     ticker=market.ticker, secs=secs, output=output,
                     orderbook=decision_ob, flow_info=None,
                     action=None, reason_code="AUTO_TRADE_OFF",
+                    extra=shadow_extra,
                 )
             elif not tradeable:
                 self._decision_log.emit(
                     ticker=market.ticker, secs=secs, output=output,
                     orderbook=decision_ob, flow_info=None,
                     action=None, reason_code="OUTSIDE_ENTRY_WINDOW",
+                    extra=shadow_extra,
                 )
             elif not in_entry_window:
                 self._decision_log.emit(
                     ticker=market.ticker, secs=secs, output=output,
                     orderbook=decision_ob, flow_info=None,
                     action=None, reason_code="OUTSIDE_PRICE_BAND",
-                    extra={"phase_min": ph_min, "phase_max": ph_max,
-                           "mid_price": mid_price},
+                    extra={**shadow_extra, "phase_min": ph_min,
+                           "phase_max": ph_max, "mid_price": mid_price},
                 )
             if self.cfg.strategy.auto_trade and in_entry_window:
                 ob_info = {"yes_bid": trade_bid, "yes_ask": trade_ask}
@@ -829,6 +889,7 @@ class StrategyEngine:
                             ticker=market.ticker, secs=secs, output=output,
                             orderbook=ob_info, flow_info=flow_info,
                             action=None, reason_code=rcode,
+                            extra=shadow_extra,
                         )
                     else:
                         for action in actions:
@@ -836,6 +897,7 @@ class StrategyEngine:
                                 ticker=market.ticker, secs=secs, output=output,
                                 orderbook=ob_info, flow_info=flow_info,
                                 action=action, reason_code=_classify_action(action),
+                                extra=shadow_extra,
                             )
                     for action in actions:
                         await self._execute_action(action)
