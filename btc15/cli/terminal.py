@@ -153,15 +153,23 @@ def build_signals_panel(state: dict) -> Panel:
     MIN_CONF = 0.50  # must match config.yaml min_confidence
 
     for ticker, s in list(signals.items())[:8]:
-        sig_str = s.get("signal", "NEUTRAL")
-        edge_yes = s.get("edge_yes", 0)
-        edge_no = s.get("edge_no", 0)
+        # Conf / Edge / Signal columns track the PRODUCTION brain so the
+        # operator sees what's actually driving (or gating) entries.
+        if fv_is_production:
+            sig_str = s.get("fv_signal", "NEUTRAL")
+            edge_yes = s.get("fv_edge_yes", 0)
+            edge_no = s.get("fv_edge_no", 0)
+            conf = s.get("fv_confidence", 0.0)
+        else:
+            sig_str = s.get("signal", "NEUTRAL")
+            edge_yes = s.get("edge_yes", 0)
+            edge_no = s.get("edge_no", 0)
+            conf = s.get("confidence", 0.0)
         best_edge = max(edge_yes, edge_no)
         edge_color = "bright_green" if best_edge > 0.04 else ("yellow" if best_edge > 0.01 else "dim")
         secs = s.get("seconds_left", 0)
         mins = secs // 60
         sec_r = secs % 60
-        conf = s.get("confidence", 0.0)
         gap = conf - MIN_CONF
         if conf >= MIN_CONF:
             conf_color = "bright_green"

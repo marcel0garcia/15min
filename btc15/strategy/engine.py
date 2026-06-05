@@ -845,9 +845,35 @@ class StrategyEngine:
                 )
                 self.state["_fv_scan_ts"] = now_utc.timestamp()
 
+            # Pre-compute FV's edge / recommended side / signal_str on the
+            # same Kalshi mid the ensemble uses, so the Signals panel can
+            # show whichever brain is production driving the Conf/Edge/
+            # Signal columns. Both brains' values flow into the snapshot;
+            # the dashboard picks which to surface per cfg.production_brain.
+            kalshi_yes_frac = None
+            if yes_bid and yes_ask:
+                kalshi_yes_frac = (float(yes_bid) + float(yes_ask)) / 200.0
+            if kalshi_yes_frac is not None and not fv.degenerate:
+                fv_edge_yes = fv.prob_yes - kalshi_yes_frac
+                fv_edge_no = fv.prob_no - (1.0 - kalshi_yes_frac)
+            else:
+                fv_edge_yes = 0.0
+                fv_edge_no = 0.0
+            if fv.degenerate or fv.prob_yes == 0.5:
+                fv_recommended = None
+                fv_signal_str = "NEUTRAL"
+            else:
+                fv_recommended = "yes" if fv.prob_yes > 0.5 else "no"
+                fv_best_edge = max(fv_edge_yes, fv_edge_no)
+                fv_signal_str = (
+                    f"STRONG {fv_recommended.upper()}" if fv_best_edge > 0.10
+                    else f"WEAK {fv_recommended.upper()}"
+                )
+
             signals_snapshot[market.ticker] = {
                 "strike": market.strike_price,
                 "seconds_left": round(secs),
+                # DIR (ensemble) fields — kept as the analyzer's contract
                 "prob_yes": round(output.prob_yes, 3),
                 "prob_no": round(output.prob_no, 3),
                 "confidence": round(output.confidence, 3),
@@ -858,11 +884,14 @@ class StrategyEngine:
                 "tradeable": tradeable and in_entry_window,
                 "ob_bid_depth": round(bid_depth, 1),
                 "ob_ask_depth": round(ask_depth, 1),
-                # Shadow brain fields — fair-value engine output for this market
+                # FV (fair-value) per-market fields
                 "fv_prob_yes": round(fv.prob_yes, 3),
                 "fv_confidence": round(fv.confidence, 3),
                 "fv_z": round(fv.z_score, 3) if fv.z_score not in (float("inf"), float("-inf")) else None,
                 "fv_degenerate": fv.degenerate,
+                "fv_edge_yes": round(fv_edge_yes, 3),
+                "fv_edge_no": round(fv_edge_no, 3),
+                "fv_signal": fv_signal_str,
             }
 
             # Dispatch to AutoTrader only when in the entry price window
