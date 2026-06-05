@@ -697,6 +697,158 @@ def replay_enrich(session_id: str, config_path: str, cache: str):
     console.print(_json.dumps(summary, indent=2))
 
 
+@replay.command("brier")
+@click.argument("session_id", required=False)
+@click.option("--all", "all_sessions", is_flag=True, default=False,
+              help="Aggregate across every session under data/recordings/")
+@click.option("--config", "config_path", default=None)
+@click.option(
+    "--results-cache",
+    default="data/market_results_cache.json",
+    help="Path to settled-market results cache",
+)
+def replay_brier(session_id: str, all_sessions: bool, config_path: str, results_cache: str):
+    """Phase 3: DIR vs FV Brier comparison on settled markets.
+
+    Uses the dual-brain decision rows (Phase 3 step 3+) joined to the
+    market settlement cache. Lower Brier = better calibrated. Baseline
+    is 0.25 (constant-50% predictor); the legacy ensemble's audit
+    measured 0.283.
+    """
+    from btc15.config import load_config
+    from btc15.recording.shadow_analysis import (
+        analyze_session, analyze_all_sessions, merge_results,
+    )
+    cfg = load_config(Path(config_path) if config_path else None)
+    setup_logging("INFO", cfg.logging.log_file)
+
+    recordings_root = Path(cfg.recording.path)
+    cache_path = Path(results_cache)
+
+    if all_sessions:
+        per_session = analyze_all_sessions(recordings_root, cache_path)
+        result = merge_results(per_session)
+        sub_count = len(per_session)
+    elif session_id:
+        session_dir = recordings_root / session_id
+        if not session_dir.exists():
+            console.print(f"[red]Session not found: {session_dir}[/red]")
+            return
+        result = analyze_session(session_dir, cache_path)
+        sub_count = None
+    else:
+        sessions = sorted(d for d in recordings_root.iterdir() if d.is_dir())
+        if not sessions:
+            console.print("[yellow]No sessions found[/yellow]")
+            return
+        result = analyze_session(sessions[-1], cache_path)
+        sub_count = None
+
+    # ── Summary table
+    title = result.session_id
+    if sub_count is not None:
+        title = f"{title}  [dim]({sub_count} sessions)[/dim]"
+    summary = Table(title=f"DIR vs FV — {title}", box=box.SIMPLE)
+    summary.add_column("metric")
+    summary.add_column("DIR", justify="right")
+    summary.add_column("FV", justify="right")
+    summary.add_column("baseline", justify="right", style="dim")
+    db = result.dir_scores.mean_brier
+    fb = result.fv_scores.mean_brier
+    da = result.dir_scores.directional_accuracy
+    fa = result.fv_scores.directional_accuracy
+    summary.add_row(
+        "Brier (lower = better)",
+        f"{db:.4f}" if db is not None else "—",
+        f"{fb:.4f}" if fb is not None else "—",
+        "0.2500",
+    )
+    summary.add_row(
+        "directional accuracy",
+        f"{da:.1%}" if da is not None else "—",
+        f"{fa:.1%}" if fa is not None else "—",
+        "50.0%",
+    )
+    summary.add_row(
+        "n predictions",
+        f"{result.dir_scores.n_rows:,}",
+        f"{result.fv_scores.n_rows:,}",
+        "",
+    )
+    console.print(summary)
+    console.print(
+        f"[dim]Settled markets: {result.settled_tickers}  ·  "
+        f"settled rows: {result.n_settled_rows:,} / {result.n_total_rows:,} total  ·  "
+        f"FV-eligible rows: {result.n_with_fv:,}[/dim]"
+    )
+
+    # ── Per-phase breakdown
+    if result.dir_scores.per_phase:
+        phase_t = Table(title="Brier by phase", box=box.SIMPLE)
+        phase_t.add_column("phase")
+        phase_t.add_column("n", justify="right")
+        phase_t.add_column("DIR Brier", justify="right")
+        phase_t.add_column("FV Brier", justify="right")
+        for phase in ("early", "mid", "prime", "late"):
+            d_cell = result.dir_scores.per_phase.get(phase, {"n": 0, "brier": 0.0})
+            f_cell = result.fv_scores.per_phase.get(phase, {"n": 0, "brier": 0.0})
+            if d_cell["n"] == 0 and f_cell["n"] == 0:
+                continue
+            phase_t.add_row(
+                phase,
+                f"{d_cell['n']:,}",
+                f"{d_cell['brier']/d_cell['n']:.4f}" if d_cell["n"] else "—",
+                f"{f_cell['brier']/f_cell['n']:.4f}" if f_cell["n"] else "—",
+            )
+        console.print(phase_t)
+
+    # ── Confidence-band breakdown
+    if result.dir_scores.per_conf_band:
+        cb_t = Table(title="By confidence band (does higher confidence predict better?)", box=box.SIMPLE)
+        cb_t.add_column("conf")
+        cb_t.add_column("DIR n", justify="right")
+        cb_t.add_column("DIR Brier", justify="right")
+        cb_t.add_column("DIR WR", justify="right")
+        cb_t.add_column("FV n", justify="right")
+        cb_t.add_column("FV Brier", justify="right")
+        cb_t.add_column("FV WR", justify="right")
+        for band in ("0.0–0.2", "0.2–0.4", "0.4–0.6", "0.6–0.8", "0.8–1.0"):
+            d_cell = result.dir_scores.per_conf_band.get(band, {"n": 0, "brier": 0.0, "won": 0})
+            f_cell = result.fv_scores.per_conf_band.get(band, {"n": 0, "brier": 0.0, "won": 0})
+            if d_cell["n"] == 0 and f_cell["n"] == 0:
+                continue
+            cb_t.add_row(
+                band,
+                f"{d_cell['n']:,}",
+                f"{d_cell['brier']/d_cell['n']:.4f}" if d_cell["n"] else "—",
+                f"{d_cell['won']/d_cell['n']:.1%}" if d_cell["n"] else "—",
+                f"{f_cell['n']:,}",
+                f"{f_cell['brier']/f_cell['n']:.4f}" if f_cell["n"] else "—",
+                f"{f_cell['won']/f_cell['n']:.1%}" if f_cell["n"] else "—",
+            )
+        console.print(cb_t)
+
+    # ── Agreement matrix
+    if result.agreement:
+        ag_t = Table(title="Agreement / disagreement (who's right?)", box=box.SIMPLE)
+        ag_t.add_column("case")
+        ag_t.add_column("n", justify="right")
+        ag_t.add_column("DIR correct", justify="right")
+        ag_t.add_column("FV correct", justify="right")
+        ordered = ["agree_yes", "agree_no", "dir_yes_fv_no", "dir_no_fv_yes"]
+        for key in ordered:
+            cell = result.agreement.get(key)
+            if not cell or cell["n"] == 0:
+                continue
+            ag_t.add_row(
+                key,
+                f"{cell['n']:,}",
+                f"{cell['dir_correct']/cell['n']:.1%}",
+                f"{cell['fv_correct']/cell['n']:.1%}",
+            )
+        console.print(ag_t)
+
+
 @replay.command("analyze")
 @click.argument("session_id")
 @click.option("--config", "config_path", default=None)
