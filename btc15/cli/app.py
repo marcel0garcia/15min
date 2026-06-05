@@ -697,6 +697,158 @@ def replay_enrich(session_id: str, config_path: str, cache: str):
     console.print(_json.dumps(summary, indent=2))
 
 
+@replay.command("pnl")
+@click.argument("session_id", required=False)
+@click.option("--config", "config_path", default=None)
+@click.option(
+    "--results-cache",
+    default="data/market_results_cache.json",
+    help="Path to settled-market results cache",
+)
+@click.option(
+    "--trades-csv",
+    default="logs/trades.csv",
+    help="Path to the actual trade log (for DIR's realized P&L)",
+)
+@click.option("--contracts", default=1, help="Contracts per simulated trade")
+@click.option("--min-edge", default=0.10, help="Min edge to fire a simulated entry")
+def replay_pnl(session_id: str, config_path: str, results_cache: str,
+               trades_csv: str, contracts: int, min_edge: float):
+    """Phase 3 step 4.5: counterfactual P&L (DIR vs FV, hold-to-settle).
+
+    Brier validates calibration; P&L validates execution outcome. This
+    replays the recorded decision log through the production entry gates
+    using each brain's prob_yes + confidence, assumes hold-to-settlement
+    on every fired entry, and compares dollars made.
+    """
+    from btc15.config import load_config
+    from btc15.recording.shadow_pnl import analyze_pnl
+    cfg = load_config(Path(config_path) if config_path else None)
+    setup_logging("INFO", cfg.logging.log_file)
+
+    recordings_root = Path(cfg.recording.path)
+    if session_id:
+        session_dir = recordings_root / session_id
+        if not session_dir.exists():
+            console.print(f"[red]Session not found: {session_dir}[/red]")
+            return
+    else:
+        sessions = sorted(d for d in recordings_root.iterdir() if d.is_dir())
+        if not sessions:
+            console.print("[yellow]No sessions found[/yellow]")
+            return
+        session_dir = sessions[-1]
+
+    result = analyze_pnl(
+        session_dir, Path(results_cache), Path(trades_csv),
+        contracts=contracts, min_edge=min_edge,
+    )
+
+    # ── Headline table
+    summary = Table(title=f"P&L — {result.session_id}  [dim](contracts={contracts}, min_edge={min_edge:.2f})[/dim]", box=box.SIMPLE)
+    summary.add_column("scenario")
+    summary.add_column("n trades", justify="right")
+    summary.add_column("win rate", justify="right")
+    summary.add_column("total P&L ($)", justify="right")
+
+    def _pnl_color(v):
+        return "bright_green" if v > 0 else "bright_red" if v < 0 else "white"
+
+    if result.dir_actual_pnl_dollars is not None:
+        c = _pnl_color(result.dir_actual_pnl_dollars)
+        summary.add_row(
+            "DIR actual (trades.csv)",
+            f"{result.dir_actual_n_fills:,}",
+            "[dim]—[/dim]",
+            f"[{c}]${result.dir_actual_pnl_dollars:+,.2f}[/{c}]",
+        )
+
+    for sim, label in [
+        (result.dir_simulated, "DIR hold-to-settle (sim)"),
+        (result.fv_simulated, "FV hold-to-settle (sim)"),
+    ]:
+        c = _pnl_color(sim.total_pnl_dollars)
+        wr = sim.win_rate
+        summary.add_row(
+            label,
+            f"{sim.n_trades:,}",
+            f"{wr:.1%}" if wr is not None else "[dim]—[/dim]",
+            f"[{c}]${sim.total_pnl_dollars:+,.2f}[/{c}]",
+        )
+    console.print(summary)
+
+    console.print(
+        f"[dim]Decision rows: {result.n_decision_rows:,}  ·  "
+        f"settled rows: {result.n_settled_rows:,}  ·  "
+        f"settled tickers: {result.settled_tickers:,}[/dim]"
+    )
+
+    # ── Per-phase breakdown
+    phase_t = Table(title="Simulated P&L by phase", box=box.SIMPLE)
+    phase_t.add_column("phase")
+    phase_t.add_column("DIR n", justify="right")
+    phase_t.add_column("DIR P&L", justify="right")
+    phase_t.add_column("DIR WR", justify="right")
+    phase_t.add_column("FV n", justify="right")
+    phase_t.add_column("FV P&L", justify="right")
+    phase_t.add_column("FV WR", justify="right")
+    dir_phase = result.dir_simulated.per_phase()
+    fv_phase = result.fv_simulated.per_phase()
+    for phase in ("early", "mid", "prime", "late"):
+        d = dir_phase.get(phase, {"n": 0, "pnl_cents": 0, "wins": 0})
+        f = fv_phase.get(phase, {"n": 0, "pnl_cents": 0, "wins": 0})
+        if d["n"] == 0 and f["n"] == 0:
+            continue
+        d_pnl = d["pnl_cents"] / 100.0
+        f_pnl = f["pnl_cents"] / 100.0
+        d_c = _pnl_color(d_pnl)
+        f_c = _pnl_color(f_pnl)
+        phase_t.add_row(
+            phase,
+            f"{d['n']:,}",
+            f"[{d_c}]${d_pnl:+,.2f}[/{d_c}]",
+            f"{d['wins']/d['n']:.1%}" if d["n"] else "—",
+            f"{f['n']:,}",
+            f"[{f_c}]${f_pnl:+,.2f}[/{f_c}]",
+            f"{f['wins']/f['n']:.1%}" if f["n"] else "—",
+        )
+    console.print(phase_t)
+
+    # ── Disagreement P&L
+    d = result.disagreement_pnl_cents
+    da_t = Table(title="Disagreement-zone P&L (who's making money on signals the other missed?)", box=box.SIMPLE)
+    da_t.add_column("category")
+    da_t.add_column("n trades", justify="right")
+    da_t.add_column("DIR P&L", justify="right")
+    da_t.add_column("FV P&L", justify="right")
+    if d.get("both_n"):
+        both_dir = d["both_dir_pnl_cents"] / 100.0
+        both_fv = d["both_fv_pnl_cents"] / 100.0
+        da_t.add_row(
+            "Both brains entered",
+            f"{d['both_n']:,}",
+            f"[{_pnl_color(both_dir)}]${both_dir:+,.2f}[/{_pnl_color(both_dir)}]",
+            f"[{_pnl_color(both_fv)}]${both_fv:+,.2f}[/{_pnl_color(both_fv)}]",
+        )
+    if d.get("dir_only_n"):
+        do = d["dir_only_pnl_cents"] / 100.0
+        da_t.add_row(
+            "DIR only (FV skipped)",
+            f"{d['dir_only_n']:,}",
+            f"[{_pnl_color(do)}]${do:+,.2f}[/{_pnl_color(do)}]",
+            "[dim]—[/dim]",
+        )
+    if d.get("fv_only_n"):
+        fo = d["fv_only_pnl_cents"] / 100.0
+        da_t.add_row(
+            "FV only (DIR skipped)",
+            f"{d['fv_only_n']:,}",
+            "[dim]—[/dim]",
+            f"[{_pnl_color(fo)}]${fo:+,.2f}[/{_pnl_color(fo)}]",
+        )
+    console.print(da_t)
+
+
 @replay.command("brier")
 @click.argument("session_id", required=False)
 @click.option("--all", "all_sessions", is_flag=True, default=False,

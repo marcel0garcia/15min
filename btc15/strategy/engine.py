@@ -159,6 +159,10 @@ class StrategyEngine:
             "last_scan": None,
             "paper_mode": config.strategy.paper_trade,
             "auto_trade": config.strategy.auto_trade,
+            # Phase 3: which brain currently fires trades (the other shadows).
+            # Drives Signals panel column styling so the production brain
+            # reads bright and the shadow brain reads dim.
+            "production_brain": config.strategy.production_brain,
             "session_start": datetime.now(timezone.utc).isoformat(),
             "pnl_history": [],
             "event_log": [],

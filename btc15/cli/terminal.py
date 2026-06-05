@@ -127,19 +127,25 @@ def build_header(state: dict) -> Panel:
 
 
 def build_signals_panel(state: dict) -> Panel:
-    """Signals table — DIR (ensemble) and FV (fair-value, Phase 3 shadow)
-    prob_yes shown side by side for at-a-glance brain comparison. Conf +
-    Edge are still DIR's (the production brain during shadow period)."""
+    """Signals table — DIR (ensemble) and FV (fair-value) prob_yes side by
+    side. Conf + Edge are still DIR's. The production brain (per
+    state['production_brain']) reads bright; the shadow brain reads dim,
+    so the operator sees at a glance which signal is driving trades."""
     signals = state.get("signals", {})
     if not signals:
         return Panel("[dim]Waiting for markets...[/dim]", title="Signals")
+
+    production_brain = state.get("production_brain", "ensemble")
+    fv_is_production = production_brain == "fair_value"
+    dir_hdr_style = "dim" if fv_is_production else "bold"
+    fv_hdr_style = "bold" if fv_is_production else "dim"
 
     table = Table(box=box.SIMPLE, show_header=True, header_style="bold dim")
     table.add_column("Ticker", style="cyan", no_wrap=True)
     table.add_column("Strike", justify="right")
     table.add_column("T-Left", justify="right")
-    table.add_column("DIR", justify="right")
-    table.add_column("FV", justify="right")
+    table.add_column(f"[{dir_hdr_style}]DIR[/{dir_hdr_style}]", justify="right")
+    table.add_column(f"[{fv_hdr_style}]FV[/{fv_hdr_style}]", justify="right")
     table.add_column("Conf", justify="right")
     table.add_column("Edge", justify="right")
     table.add_column("Signal", justify="center")
@@ -168,20 +174,39 @@ def build_signals_panel(state: dict) -> Panel:
         dir_p = s.get("prob_yes", 0.5)
         fv_p = s.get("fv_prob_yes")
         fv_degenerate = s.get("fv_degenerate", False)
+
+        # Disagreement detection — used for the yellow highlight on the
+        # SHADOW brain (production cell stays at its production styling).
+        if fv_p is not None and not fv_degenerate:
+            disagree = (dir_p - 0.5) * (fv_p - 0.5) < 0 and abs(dir_p - fv_p) >= 0.10
+        else:
+            disagree = False
+
+        # DIR cell
+        if fv_is_production:
+            # DIR is the shadow now — dim it, but tint yellow on disagreement
+            dir_color = "bright_yellow" if disagree else "dim"
+        else:
+            # DIR is production — normal/bright
+            dir_color = "white"
+        dir_cell = f"[{dir_color}]{dir_p:.1%}[/{dir_color}]"
+
+        # FV cell
         if fv_p is None or fv_degenerate:
             fv_cell = "[dim]—[/dim]"
+        elif fv_is_production:
+            # FV is production — bright/normal
+            fv_cell = f"[white]{fv_p:.1%}[/white]"
         else:
-            # Highlight when DIR and FV disagree significantly (≥10 pp on
-            # opposite sides of 0.5).
-            disagree = (dir_p - 0.5) * (fv_p - 0.5) < 0 and abs(dir_p - fv_p) >= 0.10
-            fv_color = "bright_yellow" if disagree else "white"
+            # FV is the shadow — dim, but tint yellow on disagreement
+            fv_color = "bright_yellow" if disagree else "dim"
             fv_cell = f"[{fv_color}]{fv_p:.1%}[/{fv_color}]"
 
         table.add_row(
             ticker[-15:],
             f"${s.get('strike', 0):,.0f}",
             f"{mins}m{sec_r:02d}s",
-            f"{dir_p:.1%}",
+            dir_cell,
             fv_cell,
             conf_str,
             f"[{edge_color}]{best_edge:+.1%}[/{edge_color}]",
