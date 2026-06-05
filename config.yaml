@@ -60,6 +60,12 @@ strategy:
   paper_trade: true       # always start in paper mode
   max_open_positions: 4
   allowed_sides: "both"
+  # Phase 3 step 5: brain that fires trades. "fair_value" is the new
+  # production after the 30h shadow window (FV Brier 0.1204 vs DIR
+  # 0.1539, simulated P&L +$2.75 vs -$5.88). DIR keeps running in
+  # shadow — logged in decision_log + rendered dim in Signals panel.
+  # Flip to "ensemble" to revert to legacy DIR without code change.
+  production_brain: "fair_value"
 
 # ── Unified Auto-Trader ────────────────────────────────────────────────────────
 # Replaces the old Sniper / Scalper / Arb persona trio.

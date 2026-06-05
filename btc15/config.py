@@ -100,13 +100,17 @@ class StrategyConfig:
     max_open_positions: int = 4
     allowed_sides: str = "both"
     # Phase 3: which brain's prob_yes drives AutoTrader.evaluate firing.
-    #   "ensemble"    legacy 5-component model — current production (shadow
-    #                 period default while we collect fair-value comparison)
-    #   "fair_value"  N(ln(S/K)/(σ√τ)) using BRTI + vol_nowcast — Phase 3 target
+    #   "fair_value"  N(ln(S/K)/(σ√τ)) using BRTI + vol_nowcast — default
+    #                 after the Phase 3 step 5 flip. The 30h shadow window
+    #                 showed FV beat DIR on Brier (0.1204 vs 0.1539) and
+    #                 on simulated hold-to-settle P&L (+$2.75 vs -$5.88).
+    #   "ensemble"    legacy 5-component DIR brain (preserved as fallback;
+    #                 still computes every scan and gets logged in
+    #                 decision_log so the comparison continues).
     # The non-production brain still computes per scan; its output is logged
     # alongside the production one for Brier/agreement comparison and rendered
-    # in the dashboard, but it never fires trades.
-    production_brain: str = "ensemble"
+    # (dim) in the Signals panel.
+    production_brain: str = "fair_value"
 
 
 @dataclass

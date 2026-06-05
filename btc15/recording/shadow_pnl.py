@@ -247,8 +247,9 @@ class PnLAnalysisResult:
     settled_tickers: int
     dir_simulated: BrainPnL
     fv_simulated: BrainPnL
-    dir_actual_pnl_dollars: Optional[float]   # from trades.csv if available
-    dir_actual_n_fills: int
+    dir_realized_pnl_dollars: Optional[float]    # round-trip P&L (entries+exits)
+    dir_realized_n_round_trips: int
+    dir_entries_held_pnl_dollars: Optional[float] # actual entries, no-exit-policy
     disagreement_pnl_cents: dict  # {"dir_only": cents, "fv_only": cents, "both": cents}
 
 
@@ -293,63 +294,80 @@ def simulate_brain_trades(
     return trades
 
 
-def _load_actual_pnl_from_trades_csv(
+def _load_realized_pnl(
     trades_csv: Path,
     session_label: str,
     results: dict[str, str],
-) -> tuple[float, int]:
-    """Compute DIR's actual P&L from the trade log, restricted to one session.
+) -> tuple[float, int, float]:
+    """Compute DIR's TRUE realized P&L by matching entry rows to their
+    close rows (exit or settlement) via shared trade_id in trades.csv.
 
-    trades.csv has three schema versions per memory; we branch on column
-    count. We look at entry rows ('source' containing 'auto' or similar)
-    and settle each at market_results_cache outcome (hold-to-settlement
-    on ACTUAL fills — different from simulated entries since these are
-    the prices the bot actually paid).
+    For YES and NO sides alike, round-trip P&L per contract is simply
+    `close_price - entry_price` (in cents). For entries without a close
+    row (rare — open positions or partial fills), fall back to the
+    settlement-cache outcome.
+
+    Returns (realized_pnl_dollars, n_round_trips, held_to_settle_pnl_dollars)
+    so the dashboard can show the realized number alongside the
+    held-to-settle counterfactual on the SAME set of actual entries.
     """
     if not trades_csv.exists():
-        return 0.0, 0
-    total_pnl_cents = 0
-    n_fills = 0
+        return 0.0, 0, 0.0
+
+    from collections import defaultdict
+    groups: dict[str, list[dict]] = defaultdict(list)
     try:
         with open(trades_csv) as f:
             reader = csv.reader(f)
-            header = next(reader, None)
+            next(reader, None)  # header
             for row in reader:
-                if not row:
+                if len(row) < 10:
                     continue
-                # Schema check: current header has 10 cols
-                # trade_id,timestamp,ticker,side,contracts,price_cents,
-                # cost_usd,source,mode,session
                 try:
-                    if len(row) >= 10:
-                        ticker = row[2]
-                        side = row[3].lower()
-                        contracts = int(float(row[4]))
-                        price_cents = int(float(row[5]))
-                        sess = row[9]
-                    else:
+                    sess = row[9]
+                    if sess != session_label:
                         continue
+                    trade_id = row[0]
+                    # Arb-pair settlements use trade_id-Y / trade_id-N
+                    # suffixes; strip so both legs join their entry.
+                    base_id = trade_id[:-2] if trade_id.endswith(("-Y", "-N")) else trade_id
+                    groups[base_id].append({
+                        "ticker": row[2], "side": row[3].lower(),
+                        "contracts": int(float(row[4])),
+                        "price": int(float(row[5])),
+                    })
                 except (ValueError, IndexError):
                     continue
-                if sess != session_label:
-                    continue
-                # Skip exits / partial / settlements — we want entry rows
-                # to hold-to-settle from. Heuristic: side is plain "yes"/"no".
-                if side not in ("yes", "no"):
-                    continue
-                outcome = results.get(ticker)
-                if outcome is None:
-                    continue
-                if side == "yes":
-                    pc = (100 - price_cents) if outcome == "yes" else (-price_cents)
-                else:
-                    # 'no' side: bought NO at price_cents
-                    pc = (100 - price_cents) if outcome == "no" else (-price_cents)
-                total_pnl_cents += pc * contracts
-                n_fills += 1
     except Exception:
-        pass
-    return total_pnl_cents / 100.0, n_fills
+        return 0.0, 0, 0.0
+
+    realized_cents = 0
+    held_cents = 0
+    n_round_trips = 0
+    for base_id, rows in groups.items():
+        for entry in (r for r in rows if r["side"] in ("yes", "no")):
+            side = entry["side"]
+            ep = entry["price"]
+            ec = entry["contracts"]
+            ticker = entry["ticker"]
+            # Find a close row for THIS side (exit or settlement).
+            close = next(
+                (r for r in rows if r["side"].startswith(side) and r["side"] != side),
+                None,
+            )
+            if close is not None:
+                # Real round trip: (close_price - entry_price) × min(contracts).
+                contracts = min(ec, close["contracts"]) or ec
+                realized_cents += (close["price"] - ep) * contracts
+                n_round_trips += 1
+            outcome = results.get(ticker)
+            if outcome is not None:
+                if side == "yes":
+                    settle_pc = (100 - ep) if outcome == "yes" else (-ep)
+                else:
+                    settle_pc = (100 - ep) if outcome == "no" else (-ep)
+                held_cents += settle_pc * ec
+    return realized_cents / 100.0, n_round_trips, held_cents / 100.0
 
 
 def analyze_pnl(
@@ -409,7 +427,7 @@ def analyze_pnl(
         "both_fv_pnl_cents": sum(t.pnl_cents for t in fv_trades if (t.ticker, t.side) in both_keys),
     }
 
-    actual_pnl, actual_n = _load_actual_pnl_from_trades_csv(
+    realized_pnl, n_round_trips, held_pnl = _load_realized_pnl(
         trades_csv, session_label, results,
     )
 
@@ -420,7 +438,8 @@ def analyze_pnl(
         settled_tickers=len(settled_tickers),
         dir_simulated=BrainPnL("DIR (hold-to-settle)", dir_trades),
         fv_simulated=BrainPnL("FV (hold-to-settle)", fv_trades),
-        dir_actual_pnl_dollars=actual_pnl,
-        dir_actual_n_fills=actual_n,
+        dir_realized_pnl_dollars=realized_pnl,
+        dir_realized_n_round_trips=n_round_trips,
+        dir_entries_held_pnl_dollars=held_pnl,
         disagreement_pnl_cents=disagreement,
     )

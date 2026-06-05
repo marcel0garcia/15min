@@ -51,6 +51,7 @@ from btc15.recording.kalshi_tap import KalshiRawTap
 from btc15.recording.decision_log import DecisionLog, _classify_action
 from btc15.recording.venues import build_venue_tasks
 from btc15.recording.brti import reconstruct as _brti_reconstruct
+from btc15.models.ensemble import ModelOutput as _ModelOutput
 
 
 log = logging.getLogger(__name__)
@@ -428,6 +429,54 @@ class StrategyEngine:
             except Exception as e:
                 log.error(f"Scan loop error: {e}", exc_info=True)
             await asyncio.sleep(SCAN_INTERVAL)
+
+    # ── v2 Phase 3 step 5: synthesize a ModelOutput from a FairValueOutput
+    #     so the personas + autotrader stack consumes FV exactly like it
+    #     consumes the ensemble. Per-component prob fields stay None
+    #     (FV has no per-component decomposition). edge_yes / edge_no are
+    #     computed against the current Kalshi price the same way the
+    #     ensemble does. signal_str + recommended_side are derived from the
+    #     FV prob, matching the ensemble's own derivation rules.
+
+    def _fv_to_model_output(
+        self,
+        fv,                       # FairValueOutput
+        market,                   # Market dataclass
+        yes_bid,                  # Optional[float]
+        yes_ask,                  # Optional[float]
+        current_price: float,
+        secs: float,
+    ) -> _ModelOutput:
+        kalshi_yes_price = None
+        if yes_bid and yes_ask:
+            kalshi_yes_price = (float(yes_bid) + float(yes_ask)) / 200.0  # cents → fraction
+        edge_yes = fv.prob_yes - kalshi_yes_price if kalshi_yes_price is not None else None
+        edge_no = fv.prob_no - (1.0 - kalshi_yes_price) if kalshi_yes_price is not None else None
+        if fv.prob_yes > 0.5:
+            recommended = "yes"
+        elif fv.prob_yes < 0.5:
+            recommended = "no"
+        else:
+            recommended = None
+        return _ModelOutput(
+            ticker=market.ticker,
+            strike=market.strike_price,
+            current_price=current_price,
+            seconds_remaining=secs,
+            # No per-component decomposition for the fair-value brain.
+            prob_binary_options=None,
+            prob_technical=None,
+            prob_trend=None,
+            prob_ml=None,
+            prob_orderbook=None,
+            prob_yes=fv.prob_yes,
+            prob_no=fv.prob_no,
+            confidence=fv.confidence,
+            kalshi_yes_price=kalshi_yes_price,
+            edge_yes=edge_yes,
+            edge_no=edge_no,
+            recommended_side=recommended,
+        )
 
     # ── v2 Phase 1.5: live BTC tape + BRTI reconstruction ──────────────────
 
@@ -872,12 +921,26 @@ class StrategyEngine:
                 flow_info = await self._market_cache.get_recent_flow(
                     market.ticker, window_sec=flow_window
                 )
+
+                # Phase 3 step 5: pick the production brain's output. The
+                # shadow brain still computes every scan and is logged via
+                # shadow_extra; only AutoTrader sees the production one.
+                # decision_log's top-level prob fields stay as the
+                # ensemble's so the offline analyzer (replay brier / pnl)
+                # keeps its consistent DIR-vs-FV comparison contract.
+                if self.cfg.strategy.production_brain == "fair_value":
+                    production_output = self._fv_to_model_output(
+                        fv, market, yes_bid, yes_ask, current_price, secs,
+                    )
+                else:
+                    production_output = output
+
                 try:
                     actions = self.autotrader.evaluate(
                         ticker=market.ticker,
                         market_info=mkt_info,
                         orderbook=ob_info,
-                        output=output,
+                        output=production_output,
                         bankroll_usd=bankroll,
                         flow_info=flow_info,
                     )

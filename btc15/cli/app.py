@@ -754,13 +754,21 @@ def replay_pnl(session_id: str, config_path: str, results_cache: str,
     def _pnl_color(v):
         return "bright_green" if v > 0 else "bright_red" if v < 0 else "white"
 
-    if result.dir_actual_pnl_dollars is not None:
-        c = _pnl_color(result.dir_actual_pnl_dollars)
+    if result.dir_realized_pnl_dollars is not None and result.dir_realized_n_round_trips:
+        c = _pnl_color(result.dir_realized_pnl_dollars)
         summary.add_row(
-            "DIR actual (trades.csv)",
-            f"{result.dir_actual_n_fills:,}",
+            "DIR realized (round-trips)",
+            f"{result.dir_realized_n_round_trips:,}",
             "[dim]—[/dim]",
-            f"[{c}]${result.dir_actual_pnl_dollars:+,.2f}[/{c}]",
+            f"[{c}]${result.dir_realized_pnl_dollars:+,.2f}[/{c}]",
+        )
+    if result.dir_entries_held_pnl_dollars is not None and result.dir_entries_held_pnl_dollars != 0:
+        c = _pnl_color(result.dir_entries_held_pnl_dollars)
+        summary.add_row(
+            "DIR entries held-to-settle",
+            f"{result.dir_realized_n_round_trips:,}",
+            "[dim]—[/dim]",
+            f"[{c}]${result.dir_entries_held_pnl_dollars:+,.2f}[/{c}]",
         )
 
     for sim, label in [
