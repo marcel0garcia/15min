@@ -983,6 +983,7 @@ class AutoTrader:
         # Prevents the price-chase loop where each failed IOC lets the next scan
         # post a new GTC that escalates at an even worse price.
         if time.time() < self._entry_retry_cooldown.get(ticker, 0):
+            log.info(f"{self.tag} REJECT[entry_retry_cooldown]: {ticker}")
             return None
 
         # Confidence gate: skip for reversal re-entries (edge already validated
@@ -992,6 +993,11 @@ class AutoTrader:
         if not is_reversal:
             min_conf_floor = phase_min_confidence(secs, self.cfg)
             if output.confidence < min_conf_floor:
+                log.info(
+                    f"{self.tag} REJECT[min_confidence]: {ticker} "
+                    f"conf={output.confidence:.3f} < floor={min_conf_floor:.3f} "
+                    f"prob_yes={output.prob_yes:.3f}"
+                )
                 return None
 
             # Raw-floor guard against EWMA dip-buoying. When the ensemble
@@ -1013,11 +1019,20 @@ class AutoTrader:
                     )
                     return None
         if not output.recommended_side:
+            log.info(
+                f"{self.tag} REJECT[no_recommended_side]: {ticker} "
+                f"prob_yes={output.prob_yes:.3f}"
+            )
             return None
 
         side = output.recommended_side
         edge = output.edge_yes if side == "yes" else output.edge_no
         if edge is None or edge < self.cfg.min_edge:
+            log.info(
+                f"{self.tag} REJECT[min_edge]: {ticker} {side.upper()} "
+                f"edge={edge if edge is not None else 'None'} "
+                f"< floor={self.cfg.min_edge} prob_yes={output.prob_yes:.3f}"
+            )
             return None
 
         # Suppress high-edge, low-confidence entries — informed-flow trap.
@@ -1097,6 +1112,12 @@ class AutoTrader:
 
         yes_bid = orderbook.get("yes_bid")
         yes_ask = orderbook.get("yes_ask")
+        if yes_bid is None or yes_ask is None:
+            log.info(
+                f"{self.tag} REJECT[no_orderbook]: {ticker} {side.upper()} "
+                f"yes_bid={yes_bid} yes_ask={yes_ask}"
+            )
+            return None
 
         # Strong-signal override: when conviction is high, skip the patient
         # GTC and go straight to IOC. This is what makes earlier "aggressive"
@@ -1153,6 +1174,11 @@ class AutoTrader:
         # GTC/IOC mode — the personas check is authoritative.
         ph_min, ph_max = phase_entry_price_range(secs, self.cfg)
         if raw_price < ph_min or raw_price > ph_max:
+            log.info(
+                f"{self.tag} REJECT[price_band]: {ticker} {side.upper()} "
+                f"raw_price={raw_price} not in ({ph_min}, {ph_max}) "
+                f"phase_secs={secs:.0f}"
+            )
             return None
 
         # Three-tier Kelly: strong signals get 0.75x to capitalize on
@@ -1168,6 +1194,12 @@ class AutoTrader:
 
         frac = kelly_fraction_binary(prob_win, raw_price, kelly_frac)
         if frac <= 0:
+            log.info(
+                f"{self.tag} REJECT[kelly_zero]: {ticker} {side.upper()} "
+                f"prob_win={prob_win:.4f} raw_price={raw_price} "
+                f"kelly_frac={kelly_frac} → returned 0 "
+                f"(Kelly guards: 0 < p < 1 AND 0 < price < 100)"
+            )
             return None
 
         dollar_amount = min(
@@ -1176,10 +1208,19 @@ class AutoTrader:
             self.cfg.max_single_trade_usd,
         )
         if dollar_amount < self.cfg.min_single_trade_usd:
+            log.info(
+                f"{self.tag} REJECT[dollar_amount]: {ticker} {side.upper()} "
+                f"dollar=${dollar_amount:.4f} < min=${self.cfg.min_single_trade_usd} "
+                f"frac={frac} bankroll=${bankroll_usd}"
+            )
             return None
 
         contracts = int(dollar_amount / (raw_price / 100))
         if contracts <= 0:
+            log.info(
+                f"{self.tag} REJECT[contracts]: {ticker} {side.upper()} "
+                f"contracts={contracts} dollar=${dollar_amount} raw_price={raw_price}"
+            )
             return None
 
         phase = "prime" if in_prime else "early"
