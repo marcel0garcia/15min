@@ -164,11 +164,10 @@ def _simulate_entry_from_row(
     if yes_bid <= 0 or yes_ask <= 0:
         return None
 
-    ph_min, ph_max = entry_price_by_phase.get(phase, (10, 95))
-    if not (ph_min <= kalshi_mid <= ph_max):
-        return None
-
     # Pick directional side and compute edge against the market-implied prob.
+    # Personas gates on the SIDE-SPECIFIC entry price, not the YES mid —
+    # so a cheap-YES market (mid 30¢) means the NO entry would be 70¢ and
+    # has to clear the phase entry-price band on its own.
     if prob_yes >= 0.5:
         side = "yes"
         market_implied = yes_ask / 100.0
@@ -179,6 +178,10 @@ def _simulate_entry_from_row(
         market_implied = (100.0 - yes_bid) / 100.0
         edge = (1.0 - prob_yes) - market_implied
         entry_price = int(round(100.0 - yes_bid))
+
+    ph_min, ph_max = entry_price_by_phase.get(phase, (10, 95))
+    if not (ph_min <= entry_price <= ph_max):
+        return None
 
     if edge < min_edge:
         return None

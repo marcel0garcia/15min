@@ -133,15 +133,23 @@ class TraderConfig:
 
     # Phase-aware entry-price gates. Overrides the flat min/max above on a
     # per-phase basis. Empty dict {} falls back to the flat values.
-    # Derived from 1,314-position tape audit (May 28). Early window keeps a
-    # tight 10-60¢ band per user trader-intuition input; mid/late open up as
-    # market crystallizes and prices become more informative.
-    # Keys map to the same secs_remaining boundaries as min_confidence_by_phase.
+    #
+    # The pre-Phase-3 values were derived from a 1,314-position DIR tape
+    # audit (May 28) that found 70+¢ entries in the early window had
+    # NEGATIVE PnL — a DIR overconfidence failure mode. Post Phase 3 brain
+    # swap to fair_value, that asymmetry doesn't apply: FV's math is
+    # symmetric around S = K so a 70¢ NO entry on a 30¢ YES mid is the
+    # same kind of trade as a 30¢ YES entry on a 70¢ YES mid (mirror).
+    #
+    # The old 10-60 early band was silently blocking 100% of FV's NO-side
+    # entries on cheap-YES markets (gate_trace diagnostic confirmed 39
+    # of 39 would-fire candidates failed here). Widened to 10-90 so FV
+    # can pick the side its math actually recommends.
     entry_price_by_phase: dict = field(default_factory=lambda: {
-        "early": {"min": 10, "max": 60},   # >540s — first 6 min, market hasn't crystallized
-        "mid":   {"min": 35, "max": 80},   # 300-540s — directional consensus forming
-        "prime": {"min": 20, "max": 85},   # 180-300s — late but pre-settle
-        "late":  {"min": 10, "max": 95},   # <180s — settlement near-certain at extremes
+        "early": {"min": 10, "max": 90},   # >540s
+        "mid":   {"min": 10, "max": 90},   # 300-540s
+        "prime": {"min": 10, "max": 90},   # 180-300s
+        "late":  {"min": 5,  "max": 95},   # <180s — settlement near-certain at extremes
     })
 
     # ── Settlement lock (late-window near-certainty entries) ──────────────

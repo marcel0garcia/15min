@@ -93,19 +93,19 @@ trader:
   max_entry_price_cents: 72       # fallback ceiling (used when by-phase empty)
 
   # Phase-aware entry-price gates. Overrides the flat min/max above by phase.
-  # Derived from 1,314-position audit on the trade history:
-  #   - 0-3min (early): tighter band (10-60¢) — market hasn't crystallized,
-  #     high prices have asymmetric loss profile per audit; user-set per trader intuition
-  #   - 3-6min (mid):   wider (35-80¢) — directional consensus forming
-  #   - 6-9min (prime): wider (20-85¢) — late but pre-settle
-  #   - 9-12min (late, alt): (10-85¢)
-  #   - 12-15min:       widest (10-95¢) — settlement near-certain at extremes
-  # Set the entire dict to {} to fall back to the flat min/max above.
+  # The old DIR-era values (early 10-60, mid 35-80, etc.) came from a DIR
+  # audit where 70+¢ early entries had NEGATIVE PnL due to DIR
+  # overconfidence — a DIR-specific failure mode. After the Phase 3 brain
+  # swap to fair_value (FV's math is symmetric around S=K), those tight
+  # bands were silently blocking 100% of FV's NO-side entries on cheap-
+  # YES markets. Widened to 10-90 across early/mid/prime so FV can pick
+  # whichever side its math actually recommends. Late stays widest for
+  # settlement-lock entries.
   entry_price_by_phase:
-    early: {min: 10, max: 60}
-    mid:   {min: 35, max: 80}
-    prime: {min: 20, max: 85}
-    late:  {min: 10, max: 95}
+    early: {min: 10, max: 90}
+    mid:   {min: 10, max: 90}
+    prime: {min: 10, max: 90}
+    late:  {min: 5,  max: 95}
 
   # Settlement lock — allow late-window entries when outcome is near-certain
   # BRTI settles on 60s trailing average; with 30s left, half is locked in.
