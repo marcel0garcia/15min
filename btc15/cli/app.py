@@ -697,6 +697,115 @@ def replay_enrich(session_id: str, config_path: str, cache: str):
     console.print(_json.dumps(summary, indent=2))
 
 
+@replay.command("diagnose")
+@click.argument("session_id", required=False)
+@click.option("--config", "config_path", default=None)
+@click.option("--min-edge", default=0.10, help="Min edge gate threshold")
+def replay_diagnose(session_id: str, config_path: str, min_edge: float):
+    """Phase 3 step 5 diagnostic: which gate is killing each brain's signals?
+
+    Walks the decision_log, replays the entry-gate chain against each
+    brain's prob/conf, and reports a kill-table showing where each gate
+    catches each brain. Tells you whether the production brain's lack of
+    fires is by design (selectivity) or by misalignment (gate calibrated
+    to the other brain's distribution).
+    """
+    from btc15.config import load_config
+    from btc15.recording.gate_trace import trace_session, GATE_ORDER
+    cfg = load_config(Path(config_path) if config_path else None)
+    setup_logging("INFO", cfg.logging.log_file)
+
+    recordings_root = Path(cfg.recording.path)
+    if session_id:
+        session_dir = recordings_root / session_id
+        if not session_dir.exists():
+            console.print(f"[red]Session not found: {session_dir}[/red]")
+            return
+    else:
+        sessions = sorted(d for d in recordings_root.iterdir() if d.is_dir())
+        if not sessions:
+            console.print("[yellow]No sessions found[/yellow]")
+            return
+        session_dir = sessions[-1]
+
+    dir_trace, fv_trace, action_counts = trace_session(
+        session_dir, min_edge=min_edge,
+    )
+
+    # ── Headline
+    console.print(
+        f"\n[bold]Session:[/bold] {session_dir.name}  "
+        f"[dim]·  production_brain={cfg.strategy.production_brain}  "
+        f"·  min_edge={min_edge}[/dim]"
+    )
+
+    # ── Actual recorded actions
+    act_t = Table(title="Recorded decision actions (what actually happened)", box=box.SIMPLE)
+    act_t.add_column("action")
+    act_t.add_column("n", justify="right")
+    act_t.add_column("%", justify="right")
+    total_actions = sum(action_counts.values())
+    fires = sum(v for k, v in action_counts.items() if k != "none")
+    for action in sorted(action_counts.keys(), key=lambda k: -action_counts[k]):
+        v = action_counts[action]
+        act_t.add_row(action, f"{v:,}", f"{v/total_actions*100:.1f}%" if total_actions else "—")
+    console.print(act_t)
+    console.print(f"[dim]Total actual fires (action != none): {fires:,}[/dim]")
+
+    # ── Per-brain gate trace
+    gate_t = Table(title="Gate-by-gate filter (where each brain gets killed)", box=box.SIMPLE)
+    gate_t.add_column("gate")
+    gate_t.add_column("DIR n", justify="right")
+    gate_t.add_column("DIR %", justify="right")
+    gate_t.add_column("FV n", justify="right")
+    gate_t.add_column("FV %", justify="right")
+    for gate in GATE_ORDER:
+        d_n = dir_trace.by_gate.get(gate, 0)
+        f_n = fv_trace.by_gate.get(gate, 0)
+        if d_n == 0 and f_n == 0:
+            continue
+        d_pct = d_n / dir_trace.n_rows_evaluated * 100 if dir_trace.n_rows_evaluated else 0
+        f_pct = f_n / fv_trace.n_rows_evaluated * 100 if fv_trace.n_rows_evaluated else 0
+        style = "bold bright_green" if gate == "WOULD_FIRE" else ""
+        gate_t.add_row(
+            f"[{style}]{gate}[/{style}]" if style else gate,
+            f"{d_n:,}",
+            f"{d_pct:.1f}%",
+            f"{f_n:,}",
+            f"{f_pct:.1f}%",
+        )
+    console.print(gate_t)
+    console.print(
+        f"[dim]Rows evaluated: DIR {dir_trace.n_rows_evaluated:,}  "
+        f"FV {fv_trace.n_rows_evaluated:,}  "
+        f"(skipped/no-prob: DIR {dir_trace.n_skipped_no_prob:,}  "
+        f"FV {fv_trace.n_skipped_no_prob:,})[/dim]"
+    )
+
+    # ── Would-fire examples (if any)
+    examples_brain = "fv" if cfg.strategy.production_brain == "fair_value" else "dir"
+    examples = (fv_trace if examples_brain == "fv" else dir_trace).would_fire_examples
+    if examples:
+        ex_t = Table(
+            title=f"Sample {examples_brain.upper()} would-fire rows (first 10)",
+            box=box.SIMPLE,
+        )
+        ex_t.add_column("ticker")
+        ex_t.add_column("secs", justify="right")
+        ex_t.add_column("prob_yes", justify="right")
+        ex_t.add_column("conf", justify="right")
+        ex_t.add_column("mid", justify="right")
+        for ex in examples:
+            ex_t.add_row(
+                str(ex.get("ticker", ""))[-15:],
+                f"{ex.get('secs', 0):.0f}",
+                f"{ex.get('prob_yes', 0):.3f}",
+                f"{ex.get('conf', 0):.3f}",
+                f"{ex.get('kalshi_mid', 0):.0f}",
+            )
+        console.print(ex_t)
+
+
 @replay.command("pnl")
 @click.argument("session_id", required=False)
 @click.option("--config", "config_path", default=None)
