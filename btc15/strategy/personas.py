@@ -244,11 +244,17 @@ class AutoTrader:
                     and ticker not in self.positions
                     and output.recommended_side
                     and output.confidence >= lock_min_conf):
-                # Check BSM probability (the most informative model near settlement)
-                bsm_prob = output.prob_binary_options
-                if bsm_prob is not None:
-                    bsm_extreme = bsm_prob >= lock_min_prob or bsm_prob <= (1 - lock_min_prob)
-                    if bsm_extreme:
+                # Settlement-lock prob check. For DIR, the BSM sub-component
+                # was the most informative near-τ signal. For FV, the brain
+                # IS a binary-options formula — its own prob_yes is the right
+                # signal. Use prob_binary_options when present; fall back to
+                # prob_yes itself when None (FV path).
+                lock_prob = output.prob_binary_options
+                if lock_prob is None:
+                    lock_prob = output.prob_yes
+                if lock_prob is not None:
+                    lock_extreme = lock_prob >= lock_min_prob or lock_prob <= (1 - lock_min_prob)
+                    if lock_extreme:
                         lock_entry = self._check_settlement_lock_entry(
                             ticker, orderbook, output, bankroll_usd, secs,
                         )
@@ -1016,7 +1022,7 @@ class AutoTrader:
         #     bracket because the 30%+ edge bucket showed 51% side-acc across
         #     2,631 fires (just coinflip), even when conf >= 52%. The deep
         #     edges in this zone are mostly adverse selection.
-        if not is_reversal:
+        if not is_reversal and getattr(self.cfg, "entry_suppression_enabled", True):
             if edge > 0.25 and output.confidence < 0.52:
                 log.info(
                     f"{self.tag} ENTRY SUPPRESSED: {ticker} {side.upper()} "

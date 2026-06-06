@@ -197,15 +197,31 @@ trader:
   # Set to 1.0 to disable the guard; 0.0 = strictest (raw must clear floor).
   smoothing_raw_margin: 0.10
 
-  # Phase-conditional min_confidence floor. Overrides the flat
-  # trader.min_confidence on a per-phase basis. Empty dict {} falls back to
-  # flat. Tightening "early" + "late" reflects the noisy open / thin-book
-  # close; loosening "mid" reflects the cleanest-WR window in our data.
+  # Phase-conditional min_confidence floor. FV-era values (post Phase 3
+  # brain swap) — the old 0.45-0.55 floors were calibrated to DIR's
+  # confidence which mixed prob-distance with component-agreement across
+  # 5 sub-models. FV's confidence is just |prob_yes - 0.5| × 2 (no
+  # agreement semantic), so legacy floors required FV prob_yes > 0.775
+  # to even pass — way too strict given the edge gate already enforces
+  # a Kelly-like directional floor. New 0.05 = "have ANY directional
+  # opinion". Flip back to {0.55, 0.48, 0.50, 0.55} if production_brain
+  # = ensemble.
   min_confidence_by_phase:
-    early: 0.55    # >540s remaining (first 6 min of market)
-    mid:   0.48    # 300-540s (6-10 min — best-WR per dynamics analysis)
-    prime: 0.50    # 180-300s (10-12 min — matches flat default)
-    late:  0.55    # <180s (decisive but thin-book risk)
+    early: 0.05
+    mid:   0.05
+    prime: 0.05
+    late:  0.05
+
+  # ENTRY SUPPRESSED tiers (DIR adverse-selection traps).
+  #   Tier-1: edge > 25% AND conf < 52%
+  #   Tier-2: edge >= 35% AND conf < 65%
+  # These caught DIR's "high edge with low component agreement" cases
+  # where the 5 sub-models disagreed = informed-flow trap. FV has no
+  # components to disagree, and its confidence is deterministic from
+  # prob — the tiers filter legitimate FV opportunities (market
+  # mispricing FV is confidently calling). Disabled by default for FV.
+  # Flip True when production_brain = ensemble.
+  entry_suppression_enabled: false
 
   # Trade-tape flow-alignment gate — DISABLED.
   # Phase A audit (tools/friday_audit_backtest.py over 16 sessions, 2,631
@@ -249,7 +265,12 @@ trader:
   # Reversal re-entry: require the live orderbook imbalance to actually
   # confirm the flip direction. Prevents taking reversal exits for profit
   # then immediately losing the re-entry on the same noisy market.
-  reversal_require_orderbook_confirm: true
+  # Flipped False post Phase 3 brain swap: this gate reads
+  # output.prob_orderbook (DIR sub-component) and bails when None,
+  # silently blocking every FV reversal re-entry. FV reads its own
+  # z-score as conviction; orderbook confirmation is redundant. Flip
+  # True when production_brain = ensemble.
+  reversal_require_orderbook_confirm: false
   reversal_orderbook_min_dev: 0.10  # |prob_orderbook - 0.5| ≥ this in flip direction
 
   # Arbitrage — always highest priority when YES+NO < 98¢

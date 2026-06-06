@@ -245,7 +245,12 @@ class TraderConfig:
     # After a reversal exit, don't re-enter the flipped side unless the live
     # orderbook imbalance agrees. Half of last session's reversal re-entries
     # lost immediately — the edge existed on model but the flow hadn't turned.
-    reversal_require_orderbook_confirm: bool = True
+    # Default flipped to False post-Phase 3 brain swap: the orderbook
+    # imbalance check reads output.prob_orderbook which is a DIR
+    # sub-component. FV's adapter returns None for it (no component
+    # decomposition), so the gate silently blocked every FV reversal.
+    # Re-enable when production_brain="ensemble".
+    reversal_require_orderbook_confirm: bool = False
     reversal_orderbook_min_dev: float = 0.10  # |prob_orderbook - 0.5| must exceed this
                                               # in the flip direction to allow re-entry
 
@@ -257,11 +262,30 @@ class TraderConfig:
     # Defaults are conservative tightenings vs. flat 0.50; lower individual
     # values to "loosen" a phase or set the dict to {} to fall back to the
     # flat trader.min_confidence floor.
+    # Entry-suppression tiers (legacy DIR adverse-selection traps).
+    # Tier-1: edge>25% AND conf<52%. Tier-2: edge>=35% AND conf<65%.
+    # These captured DIR's "high edge with low component agreement"
+    # informed-flow trap. FV doesn't decompose into components and its
+    # confidence is a deterministic function of prob, so the tiers
+    # filter legitimate FV opportunities (market mispricing FV is
+    # confidently calling) without protecting against any real failure
+    # mode. Disabled by default post brain swap. Flip True for ensemble.
+    entry_suppression_enabled: bool = False
+
+    # FV-era values (post Phase 3 brain swap). Pre-flip values 0.45-0.55
+    # were calibrated to DIR's confidence — which mixed distance-from-0.5
+    # with component-agreement across 5 sub-models. FV's confidence is
+    # just |prob_yes - 0.5| × 2 (deterministic transformation of prob
+    # distance, no agreement semantic). Legacy floors required FV
+    # prob_yes > 0.775 or < 0.225 — way too strict given the edge check
+    # already enforces a Kelly-like floor. New floor 0.05 = "have ANY
+    # directional opinion". Flip back to {0.55, 0.48, 0.50, 0.55} if
+    # production_brain="ensemble".
     min_confidence_by_phase: dict = field(default_factory=lambda: {
-        "early": 0.55,    # secs > 540  (0-6 min from open: noisier)
-        "mid":   0.48,    # secs 300-540 (6-10 min: best-WR window per dynamics data)
-        "prime": 0.50,    # secs 180-300 (10-12 min: current flat default)
-        "late":  0.55,    # secs < 180  (decisive but thin-book — tighten)
+        "early": 0.05,
+        "mid":   0.05,
+        "prime": 0.05,
+        "late":  0.05,
     })
 
     # ── Confidence-trend filter (denoise the 3-tick gate) ─────────────────
