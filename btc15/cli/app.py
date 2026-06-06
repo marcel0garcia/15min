@@ -728,15 +728,37 @@ def replay_diagnose(session_id: str, config_path: str, min_edge: float):
             return
         session_dir = sessions[-1]
 
+    # Read the live config so the diagnostic reflects what's ACTUALLY
+    # gating in production — not the hardcoded DIR-era defaults. Honors
+    # the per-phase confidence floors + entry-price bands as configured.
+    cfg_min_conf = {
+        k: float(v) for k, v in (cfg.trader.min_confidence_by_phase or {}).items()
+    } or None
+    cfg_entry_band = {}
+    for k, v in (cfg.trader.entry_price_by_phase or {}).items():
+        if isinstance(v, dict):
+            cfg_entry_band[k] = (v.get("min", 10), v.get("max", 95))
+        else:
+            cfg_entry_band[k] = v
+    cfg_entry_band = cfg_entry_band or None
+
     dir_trace, fv_trace, action_counts = trace_session(
-        session_dir, min_edge=min_edge,
+        session_dir,
+        min_edge=cfg.trader.min_edge if cfg.trader.min_edge != 0.10 else min_edge,
+        min_conf_by_phase=cfg_min_conf,
+        entry_price_by_phase=cfg_entry_band,
     )
 
     # ── Headline
     console.print(
         f"\n[bold]Session:[/bold] {session_dir.name}  "
         f"[dim]·  production_brain={cfg.strategy.production_brain}  "
-        f"·  min_edge={min_edge}[/dim]"
+        f"·  min_edge={cfg.trader.min_edge}  "
+        f"·  min_conf={cfg_min_conf}[/dim]"
+    )
+    console.print(
+        f"[dim]entry_price_by_phase={cfg_entry_band}  "
+        f"·  entry_suppression_enabled={cfg.trader.entry_suppression_enabled}[/dim]"
     )
 
     # ── Actual recorded actions
