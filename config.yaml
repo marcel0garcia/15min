@@ -88,7 +88,13 @@ trader:
   # weighted-mean distance from 0.5, NOT std-dev). Looks lower than before
   # but is harder to clear — old 0.55 admitted near-neutral signals.
   min_confidence: 0.50            # minimum model confidence
-  min_edge: 0.10                  # minimum edge over Kalshi mid-price
+  # min_edge floor — lowered post FV calibration from 0.10 to 0.05.
+  # At extreme strikes (price near 5¢ or 95¢) the maximum possible
+  # edge ceiling drops to ~5pp by definition, so the old 10% floor
+  # banned exactly the high-conviction FV opportunities (deep ITM/OTM
+  # contracts where FV is near-certain about side). Kelly math still
+  # enforces +EV; this just lets the extreme-conviction trades pass.
+  min_edge: 0.05
   min_entry_price_cents: 10       # fallback floor (used when by-phase empty)
   max_entry_price_cents: 72       # fallback ceiling (used when by-phase empty)
 
@@ -101,11 +107,16 @@ trader:
   # YES markets. Widened to 10-90 across early/mid/prime so FV can pick
   # whichever side its math actually recommends. Late stays widest for
   # settlement-lock entries.
+  # Widened to 5-95 to accommodate the slip cushion (raw_price = entry +
+  # 2-4¢ on IOC strong-signal entries). FV's would-fire opportunities
+  # cluster at extreme strikes (prob ~0 or ~1) where the entry price
+  # naturally lives at the old band boundary — the slip pushed them
+  # over.
   entry_price_by_phase:
-    early: {min: 10, max: 90}
-    mid:   {min: 10, max: 90}
-    prime: {min: 10, max: 90}
-    late:  {min: 5,  max: 95}
+    early: {min: 3, max: 97}
+    mid:   {min: 3, max: 97}
+    prime: {min: 3, max: 97}
+    late:  {min: 3, max: 97}
 
   # Settlement lock — allow late-window entries when outcome is near-certain
   # BRTI settles on 60s trailing average; with 30s left, half is locked in.

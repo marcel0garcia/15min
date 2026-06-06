@@ -519,9 +519,16 @@ class AutoTrader:
             # more time left = more patience; <240s = no wait, decisive cut.
             our_side_edge = output.edge_yes if side == "yes" else output.edge_no
             our_side_edge = float(our_side_edge) if our_side_edge is not None else 0.0
+            # Tuned for FV's confidence distribution. Was conf>=0.40 (DIR
+            # threshold = "model still has meaningful conviction"), but
+            # FV's conf 0.40 means prob>=0.70 which is already a strong
+            # opinion. Lowered to 0.20 (prob>=0.60) so we hold positions
+            # through drawdowns when FV STILL leans our direction, even
+            # if more mildly. The edge floor (0.03) catches cases where
+            # confidence faded but pricing-edge remains positive.
             model_agrees = (
                 output.recommended_side == side
-                and (output.confidence >= 0.40 or our_side_edge >= 0.03)
+                and (output.confidence >= 0.20 or our_side_edge >= 0.03)
             )
 
             # Pyramid-aware rope: each additional leg widens the stop by 10pp.
@@ -1095,7 +1102,16 @@ class AutoTrader:
         # GTC and go straight to IOC. This is what makes earlier "aggressive"
         # iterations responsive — we stop watching the price run away while
         # a 12s GTC sits at mid-1¢.
-        strong_signal = output.confidence >= 0.65 and abs(edge) >= 0.08
+        # Strong-signal override flag — when True, escalate from patient
+        # GTC (post at mid-1¢, maker rebate, may miss the move) to IOC
+        # (cross the book, pay slip, certain fill). Tuned for FV's
+        # confidence distribution post Phase 3 brain swap: conf>=0.65
+        # was DIR-era (DIR's confidence reached 0.65+ on solid consensus),
+        # but FV's conf = |prob-0.5|*2 only crosses 0.65 at prob>=0.825
+        # — too extreme. 0.40 = prob>=0.70 (solid directional lean) is
+        # the right escalation point for FV. Edge bar stays at 0.08 so
+        # slip cost doesn't eat the trade.
+        strong_signal = output.confidence >= 0.40 and abs(edge) >= 0.08
         in_prime = secs <= self.cfg.prime_window_min_seconds or strong_signal
 
         # Adaptive slippage by realized volatility — calm tape stays at 2¢,

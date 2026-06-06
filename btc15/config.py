@@ -145,11 +145,17 @@ class TraderConfig:
     # entries on cheap-YES markets (gate_trace diagnostic confirmed 39
     # of 39 would-fire candidates failed here). Widened to 10-90 so FV
     # can pick the side its math actually recommends.
+    # Widened to 3-97 across all phases for FV-friendly extreme-strike
+    # entries. Personas checks raw_price = entry + slip (~2¢ on IOC),
+    # so a 95¢ entry submits at 97¢; the cap needs the buffer. Most of
+    # FV's high-conviction opportunities live at the boundary by
+    # design (deep ITM/OTM where FV is near-certain). Edge floor + Kelly
+    # math still filter low-EV picks.
     entry_price_by_phase: dict = field(default_factory=lambda: {
-        "early": {"min": 10, "max": 90},   # >540s
-        "mid":   {"min": 10, "max": 90},   # 300-540s
-        "prime": {"min": 10, "max": 90},   # 180-300s
-        "late":  {"min": 5,  "max": 95},   # <180s — settlement near-certain at extremes
+        "early": {"min": 3, "max": 97},
+        "mid":   {"min": 3, "max": 97},
+        "prime": {"min": 3, "max": 97},
+        "late":  {"min": 3, "max": 97},
     })
 
     # ── Settlement lock (late-window near-certainty entries) ──────────────
