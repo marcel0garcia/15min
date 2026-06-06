@@ -372,6 +372,20 @@ class AutoTrader:
         Rule 3: Loss cut — only near settlement to preserve capital.
         """
         actions = []
+
+        # Settlement-race guard. When secs <= 0 the market has closed for
+        # trading. Kalshi drains the orderbook within ~1s of close_time, so
+        # yes_bid/yes_ask collapse to 0/100. Without this guard, the
+        # per-position MTM downstream computes current_bid=0 → pnl=-100% →
+        # emergency_stop fires and "sells" at 0¢, recording every position
+        # as a total loss — even YES positions on YES-settling markets.
+        # The race window is ~1s versus Kalshi's 5-30s result-publish lag,
+        # so the engine's _check_settlements is guaranteed to lose without
+        # this guard. When secs <= 0 we just wait for _check_settlements to
+        # credit 100¢ (or 0¢) based on the official `result` field.
+        if secs <= 0:
+            return actions
+
         yes_bid = float(orderbook.get("yes_bid") or 0)
         # Do NOT default yes_ask to 100 — that makes NO bid appear as 0¢ when data is missing.
         # Use 0 (unknown) and let the current_bid <= 0 guard skip the position safely.
