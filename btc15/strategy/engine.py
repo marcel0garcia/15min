@@ -141,7 +141,10 @@ class StrategyEngine:
         self._ws: Optional[KalshiWebSocket] = None
 
         # Unified auto-trader (replaces Sniper/Scalper/Arb)
-        self.autotrader = AutoTrader(config.trader)
+        # Pass the active brain label so reason= and dashboard "Src" reflect
+        # which brain produced the signal (fv = fair_value, dir = ensemble).
+        brain_label = "fv" if config.strategy.production_brain == "fair_value" else "dir"
+        self.autotrader = AutoTrader(config.trader, brain_label=brain_label)
 
         # Shared state readable by CLI dashboard
         self.running = False
@@ -209,8 +212,15 @@ class StrategyEngine:
         self._log_file = Path(config.logging.trade_log_file)
         self._ensure_trade_log()
 
-        # Balance cache — refreshed once per scan cycle, not per market
-        self._cached_balance_usd: float = config.risk.max_trade_usd * 20
+        # Balance cache — refreshed once per scan cycle, not per market.
+        # In paper mode the synthetic starting balance is authoritative; the
+        # Kalshi-reported available_usd is ignored because cumulative paper
+        # losses can deplete it below min_single_trade_usd and silently kill
+        # every signal at the sizing gate.
+        if config.strategy.paper_trade:
+            self._cached_balance_usd: float = config.strategy.paper_starting_balance_usd
+        else:
+            self._cached_balance_usd: float = config.risk.max_trade_usd * 20
         self._balance_cache_ts: float = 0.0
 
         # Reconcile guards
@@ -284,14 +294,29 @@ class StrategyEngine:
             self._tasks.append(asyncio.create_task(ws.run(), name=name))
         self._tasks.append(asyncio.create_task(self._live_brti_loop(), name="brti-live"))
 
-        try:
-            _start_bal = await self._kalshi.get_balance()
-            self.state["session_start_balance"] = round(_start_bal.available_usd, 2)
-            self._cached_balance_usd = _start_bal.available_usd
+        if self.cfg.strategy.paper_trade:
+            # Paper mode: use the configured synthetic bankroll and skip the
+            # Kalshi balance fetch entirely. Kalshi's reported paper balance
+            # can be depleted from prior sessions; using it would force every
+            # signal through min_single_trade_usd and silently reject all of
+            # them. Recomputed below as paper_start + realized − cost_basis.
+            paper_start = self.cfg.strategy.paper_starting_balance_usd
+            self.state["session_start_balance"] = round(paper_start, 2)
+            self._cached_balance_usd = paper_start
             self._balance_cache_ts = time.time()
-            log.info(f"Session start balance: ${self.state['session_start_balance']:.2f}")
-        except Exception:
-            pass
+            log.info(
+                f"Paper session start balance: ${paper_start:.2f} "
+                f"(synthetic — Kalshi-reported balance ignored)"
+            )
+        else:
+            try:
+                _start_bal = await self._kalshi.get_balance()
+                self.state["session_start_balance"] = round(_start_bal.available_usd, 2)
+                self._cached_balance_usd = _start_bal.available_usd
+                self._balance_cache_ts = time.time()
+                log.info(f"Session start balance: ${self.state['session_start_balance']:.2f}")
+            except Exception:
+                pass
 
         # Wait for WS handshake to complete before starting loops.
         # 1s is enough — RSA auth is synchronous during HTTP upgrade.
@@ -626,9 +651,19 @@ class StrategyEngine:
 
     async def _get_cached_balance(self) -> float:
         """
-        Return cached balance. Refresh from API if cache is older than 5 seconds.
-        Prevents N balance API calls per scan when watching N markets.
+        Return cached available bankroll.
+
+        Live mode: refresh from Kalshi if cache is older than 5s.
+        Paper mode: compute synthetically as
+            paper_starting_balance_usd + realized_session_pnl − cost_basis_of_open_positions
+        — Kalshi's reported paper balance is ignored (it depletes across
+        sessions and can fall below min_single_trade_usd, silently rejecting
+        every signal at the sizing gate).
         """
+        if self.cfg.strategy.paper_trade:
+            self._cached_balance_usd = self._compute_paper_available_usd()
+            self._balance_cache_ts = time.time()
+            return self._cached_balance_usd
         if time.time() - self._balance_cache_ts > 5.0 and self._kalshi:
             try:
                 bal = await self._kalshi.get_balance()
@@ -637,6 +672,24 @@ class StrategyEngine:
             except Exception:
                 pass
         return self._cached_balance_usd
+
+    def _open_positions_cost_basis_usd(self) -> float:
+        """Cash locked in open paper positions, in dollars (entry × size / 100)."""
+        total = 0.0
+        for entries in self.autotrader.positions.values():
+            for e in entries:
+                try:
+                    total += float(e["entry_cents"]) * float(e["contracts"]) / 100.0
+                except (KeyError, TypeError, ValueError):
+                    continue
+        return total
+
+    def _compute_paper_available_usd(self) -> float:
+        """Synthetic paper-mode bankroll: start + realized − cost_basis_in_open."""
+        paper_start = self.cfg.strategy.paper_starting_balance_usd
+        realized = self.risk.state.session_pnl
+        cost_basis = self._open_positions_cost_basis_usd()
+        return max(0.0, paper_start + realized - cost_basis)
 
     async def _scan_markets(self):
         markets = await self._kalshi.get_markets(
@@ -1038,9 +1091,10 @@ class StrategyEngine:
                         "value": value,
                         "pnl": round(value - cost, 2),
                         "mode": entry.get("mode", "directional"),
-                        # Dashboard source label: "mm" → MM column shows "MM",
-                        # "dir" → "DIR". (terminal.py renders src[:3].upper())
-                        "source": "mm" if entry.get("mode") == "mm" else "dir",
+                        # Dashboard source label: market-making positions
+                        # always render as "MM"; directional positions render
+                        # as the active brain tag (FV / DIR).
+                        "source": "mm" if entry.get("mode") == "mm" else self.autotrader.brain_label,
                     })
             if refreshed:
                 self.state["open_positions"] = refreshed
@@ -2060,8 +2114,8 @@ class StrategyEngine:
                     "value": value,
                     "pnl": round(value - cost, 2),
                     "mode": entry.get("mode", "directional"),
-                    # "mm" → dashboard shows "MM"; "dir" → shows "DIR".
-                    "source": "mm" if entry.get("mode") == "mm" else "dir",
+                    # market-making → "MM"; directional → active brain (FV/DIR).
+                    "source": "mm" if entry.get("mode") == "mm" else self.autotrader.brain_label,
                 })
 
         # Orphan detection (live mode only)
@@ -2262,21 +2316,17 @@ class StrategyEngine:
                         history.append((ts_now, pnl_now))
                         self.state["pnl_history"] = history[-500:]
 
-                # Refresh balance display every 30s
-                if self._kalshi and int(time.time()) % 30 == 0:
-                    try:
-                        bal = await self._kalshi.get_balance()
-                        available = round(bal.available_usd, 2)
-                        portfolio = round(bal.portfolio_usd, 2)
-                        start_bal = self.state.get("session_start_balance")
-                        # In paper mode, Kalshi balance never changes (trades are simulated
-                        # locally), so true_pnl from the API would always read ~$0 and
-                        # override the accurate internal risk.session_pnl. Leave it None so
-                        # the dashboard falls back to risk.session_pnl instead.
-                        if not self.cfg.strategy.paper_trade and start_bal is not None:
-                            true_pnl = round((available + portfolio) - start_bal, 2)
-                        else:
-                            true_pnl = None
+                # Refresh balance display every 30s. Paper mode computes
+                # available/portfolio/true_pnl from the synthetic starting
+                # balance instead of querying Kalshi.
+                if int(time.time()) % 30 == 0:
+                    if self.cfg.strategy.paper_trade:
+                        paper_start = self.cfg.strategy.paper_starting_balance_usd
+                        realized = risk_summary.get("session_pnl", 0.0)
+                        cost_basis = self._open_positions_cost_basis_usd()
+                        available = round(max(0.0, paper_start + realized - cost_basis), 2)
+                        portfolio = round(cost_basis + unrealized, 2)
+                        true_pnl = round(realized + unrealized, 2)
                         self.state["balance"] = {
                             "available": available,
                             "portfolio": portfolio,
@@ -2284,19 +2334,44 @@ class StrategyEngine:
                         }
                         self._cached_balance_usd = available
                         self._balance_cache_ts = time.time()
-                        # Account-level halt check (catches unrealized drawdown)
                         if (
-                            true_pnl is not None
-                            and true_pnl <= -self.cfg.risk.daily_loss_limit_usd
+                            true_pnl <= -self.cfg.risk.daily_loss_limit_usd
                             and not self.risk.state.halted
                         ):
                             self.risk._halt(
                                 f"Daily loss limit hit "
-                                f"(account P&L ${true_pnl:+.2f}, "
+                                f"(paper P&L ${true_pnl:+.2f}, "
                                 f"limit -${self.cfg.risk.daily_loss_limit_usd:.0f})"
                             )
-                    except Exception:
-                        pass
+                    elif self._kalshi:
+                        try:
+                            bal = await self._kalshi.get_balance()
+                            available = round(bal.available_usd, 2)
+                            portfolio = round(bal.portfolio_usd, 2)
+                            start_bal = self.state.get("session_start_balance")
+                            if start_bal is not None:
+                                true_pnl = round((available + portfolio) - start_bal, 2)
+                            else:
+                                true_pnl = None
+                            self.state["balance"] = {
+                                "available": available,
+                                "portfolio": portfolio,
+                                "true_pnl": true_pnl,
+                            }
+                            self._cached_balance_usd = available
+                            self._balance_cache_ts = time.time()
+                            if (
+                                true_pnl is not None
+                                and true_pnl <= -self.cfg.risk.daily_loss_limit_usd
+                                and not self.risk.state.halted
+                            ):
+                                self.risk._halt(
+                                    f"Daily loss limit hit "
+                                    f"(account P&L ${true_pnl:+.2f}, "
+                                    f"limit -${self.cfg.risk.daily_loss_limit_usd:.0f})"
+                                )
+                        except Exception:
+                            pass
 
                 # Proactive reconciliation every 5s — catches missed fills fast
                 now_ts = time.time()

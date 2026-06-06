@@ -112,6 +112,15 @@ class StrategyConfig:
     # (dim) in the Signals panel.
     production_brain: str = "fair_value"
 
+    # Paper-mode synthetic starting balance. In paper mode the engine ignores
+    # whatever the Kalshi API reports for available_usd (which depletes from
+    # accumulated paper losses and can fall below min_single_trade_usd, silently
+    # killing every signal at the sizing gate) and instead uses
+    # `paper_starting_balance_usd + realized_pnl − cost_basis_of_open_positions`
+    # as the bankroll for sizing and as the available cash for the dashboard.
+    # Live mode is unaffected — Kalshi balance is still authoritative there.
+    paper_starting_balance_usd: float = 100.0
+
 
 @dataclass
 class TraderConfig:

@@ -132,14 +132,17 @@ def _trace_row(
     if yes_bid is None or yes_ask is None:
         return "outside_price_band"
 
-    # The personas gate checks the SIDE-SPECIFIC entry price (raw_price),
-    # not the YES mid. For YES side we'd pay yes_ask; for NO we'd pay
-    # (100 - yes_bid). This is the gate that was silently killing every
-    # FV NO-side entry on cheap-YES markets (cheap YES = expensive NO).
+    # The personas gate checks the SIDE-SPECIFIC entry price (raw_price)
+    # AFTER slip is added. For strong-signal IOC entries (conf>=0.65,
+    # |edge|>=0.08), personas uses ask + slip (typ. 2¢). Otherwise GTC
+    # mode uses mid - 1¢. We approximate the strong-signal IOC path
+    # since it's the dominant fire mode for FV's high-conviction
+    # opportunities.
+    SLIP_CENTS = 2
     if prob_yes >= 0.5:
-        entry_price = float(yes_ask)
+        entry_price = float(yes_ask) + SLIP_CENTS
     else:
-        entry_price = 100.0 - float(yes_bid)
+        entry_price = (100.0 - float(yes_bid)) + SLIP_CENTS
 
     phase = _phase_of(secs)
     ph_min, ph_max = entry_price_by_phase.get(phase, (10, 95))

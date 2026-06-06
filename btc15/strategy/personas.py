@@ -132,8 +132,12 @@ class AutoTrader:
     name = "auto"
     tag = "[AUTO]"
 
-    def __init__(self, cfg: TraderConfig):
+    def __init__(self, cfg: TraderConfig, brain_label: str = "dir"):
         self.cfg = cfg
+        # Short tag (≤3 chars) for the brain producing entry signals. Used
+        # in the directional Action.reason and surfaced in the dashboard
+        # "Src" column. "fv" = fair-value brain, "dir" = legacy ensemble.
+        self.brain_label = brain_label
         # ticker → list of open position dicts
         self.positions: dict[str, list[dict]] = {}
         # order_id → {ticker, side, price, contracts, placed_at, purpose, mode}
@@ -983,7 +987,7 @@ class AutoTrader:
         # Prevents the price-chase loop where each failed IOC lets the next scan
         # post a new GTC that escalates at an even worse price.
         if time.time() < self._entry_retry_cooldown.get(ticker, 0):
-            log.info(f"{self.tag} REJECT[entry_retry_cooldown]: {ticker}")
+            log.debug(f"{self.tag} REJECT[entry_retry_cooldown]: {ticker}")
             return None
 
         # Confidence gate: skip for reversal re-entries (edge already validated
@@ -993,7 +997,7 @@ class AutoTrader:
         if not is_reversal:
             min_conf_floor = phase_min_confidence(secs, self.cfg)
             if output.confidence < min_conf_floor:
-                log.info(
+                log.debug(
                     f"{self.tag} REJECT[min_confidence]: {ticker} "
                     f"conf={output.confidence:.3f} < floor={min_conf_floor:.3f} "
                     f"prob_yes={output.prob_yes:.3f}"
@@ -1019,7 +1023,7 @@ class AutoTrader:
                     )
                     return None
         if not output.recommended_side:
-            log.info(
+            log.debug(
                 f"{self.tag} REJECT[no_recommended_side]: {ticker} "
                 f"prob_yes={output.prob_yes:.3f}"
             )
@@ -1028,7 +1032,7 @@ class AutoTrader:
         side = output.recommended_side
         edge = output.edge_yes if side == "yes" else output.edge_no
         if edge is None or edge < self.cfg.min_edge:
-            log.info(
+            log.debug(
                 f"{self.tag} REJECT[min_edge]: {ticker} {side.upper()} "
                 f"edge={edge if edge is not None else 'None'} "
                 f"< floor={self.cfg.min_edge} prob_yes={output.prob_yes:.3f}"
@@ -1113,7 +1117,7 @@ class AutoTrader:
         yes_bid = orderbook.get("yes_bid")
         yes_ask = orderbook.get("yes_ask")
         if yes_bid is None or yes_ask is None:
-            log.info(
+            log.debug(
                 f"{self.tag} REJECT[no_orderbook]: {ticker} {side.upper()} "
                 f"yes_bid={yes_bid} yes_ask={yes_ask}"
             )
@@ -1174,7 +1178,7 @@ class AutoTrader:
         # GTC/IOC mode — the personas check is authoritative.
         ph_min, ph_max = phase_entry_price_range(secs, self.cfg)
         if raw_price < ph_min or raw_price > ph_max:
-            log.info(
+            log.debug(
                 f"{self.tag} REJECT[price_band]: {ticker} {side.upper()} "
                 f"raw_price={raw_price} not in ({ph_min}, {ph_max}) "
                 f"phase_secs={secs:.0f}"
@@ -1194,7 +1198,7 @@ class AutoTrader:
 
         frac = kelly_fraction_binary(prob_win, raw_price, kelly_frac)
         if frac <= 0:
-            log.info(
+            log.debug(
                 f"{self.tag} REJECT[kelly_zero]: {ticker} {side.upper()} "
                 f"prob_win={prob_win:.4f} raw_price={raw_price} "
                 f"kelly_frac={kelly_frac} → returned 0 "
@@ -1208,7 +1212,7 @@ class AutoTrader:
             self.cfg.max_single_trade_usd,
         )
         if dollar_amount < self.cfg.min_single_trade_usd:
-            log.info(
+            log.debug(
                 f"{self.tag} REJECT[dollar_amount]: {ticker} {side.upper()} "
                 f"dollar=${dollar_amount:.4f} < min=${self.cfg.min_single_trade_usd} "
                 f"frac={frac} bankroll=${bankroll_usd}"
@@ -1217,7 +1221,7 @@ class AutoTrader:
 
         contracts = int(dollar_amount / (raw_price / 100))
         if contracts <= 0:
-            log.info(
+            log.debug(
                 f"{self.tag} REJECT[contracts]: {ticker} {side.upper()} "
                 f"contracts={contracts} dollar=${dollar_amount} raw_price={raw_price}"
             )
@@ -1320,7 +1324,7 @@ class AutoTrader:
             price_cents=raw_price,
             post_only=use_gtc,
             time_in_force="gtc" if use_gtc else "ioc",
-            reason=f"dir_{phase} conf={output.confidence:.0%} edge={edge:+.1%}",
+            reason=f"{self.brain_label}_{phase} conf={output.confidence:.0%} edge={edge:+.1%}",
             signal_mid_cents=signal_mid,
         )
 

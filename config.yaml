@@ -66,8 +66,12 @@ strategy:
   # shadow — logged in decision_log + rendered dim in Signals panel.
   # Flip to "ensemble" to revert to legacy DIR without code change.
   production_brain: "fair_value"
+  # Paper-mode synthetic bankroll. Ignored in live mode.
+  # Used for sizing + dashboard so a depleted Kalshi paper account doesn't
+  # silently kill every signal at the min_single_trade_usd gate.
+  paper_starting_balance_usd: 100.0
 
-# ── Unified Auto-Trader ────────────────────────────────────────────────────────
+# ── Unified Auto-Trader────────────────────────────────────────────────────────
 # Replaces the old Sniper / Scalper / Arb persona trio.
 # All decision-making flows through a single AutoTrader with time-phase logic.
 trader:
@@ -252,13 +256,17 @@ trader:
   kelly_fraction_early: 0.25
   kelly_fraction_prime: 0.50
   kelly_fraction_strong: 0.75     # 3/4-Kelly for very strong signals (conf≥0.65, edge≥0.08)
-  max_single_trade_usd: 5.00      # capped at $5 for first live-trading session (was 12.00)
+  max_single_trade_usd: 10.00     # per-trade cap
 
-  # Pyramiding — add to winning positions when model still agrees
+  # Pyramiding — add to winning positions when model still agrees.
+  # Calibrated for FV's confidence scale (|prob-0.5|×2). On the FV brain
+  # conf=0.10 ⇔ prob≥0.55 (modest lean); conf=0.30 ⇔ prob≥0.65 (solid).
+  # The 0.60 / 0.10 defaults below were DIR-scale and effectively
+  # blocked every FV pyramid except extreme outliers.
   pyramid_enabled: true
   pyramid_min_pnl_pct: 0.10       # position must be ≥10% profitable
-  pyramid_min_confidence: 0.60
-  pyramid_min_edge: 0.10
+  pyramid_min_confidence: 0.10    # FV scale — was 0.60 (DIR-era)
+  pyramid_min_edge: 0.05          # matches trader.min_edge — was 0.10 (DIR-era)
   pyramid_min_seconds: 300         # ≥5 min left to pyramid
   pyramid_max_adds: 2              # max 1 add per position
 
@@ -293,9 +301,9 @@ trader:
   max_arb_contracts: 5            # ~$2.50–4.90 per arb pair on $100 bankroll
 
 risk:
-  max_open_positions: 3           # 3 × $5 = $15 max simultaneous exposure on first live
-  max_trade_usd: 5.00             # capped at $5 for first live-trading session (was 20.00)
-  max_position_per_market_usd: 5.00  # capped per-market too; raise after live baseline
+  max_open_positions: 3           # 3 × $10 = $30 max simultaneous exposure
+  max_trade_usd: 10.00            # risk-manager hard cap; matches trader.max_single_trade_usd
+  max_position_per_market_usd: 10.00 # capped per-market too
   daily_loss_limit_usd: 50.00     # halt trading if down $50 on the day
   kelly_fraction: 0.25
   min_trade_usd: 0.50             # Kalshi practical minimum
