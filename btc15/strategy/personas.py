@@ -417,16 +417,25 @@ class AutoTrader:
                 else:
                     current_bid = 0.0
 
-            # IMPORTANT: do NOT skip when current_bid = 0.
-            # A 0¢ bid means the market has moved fully against us — pnl = -100%.
-            # Skipping here is what caused T13873491 and T0ACDC05C to never stop-loss:
-            # YES buyers vanished, bid → 0, old guard triggered, position sat unmanaged
-            # until settlement. Instead, compute pnl at 0¢ and let stop rules fire.
-            # The engine's sell handler now performs a REST refresh on any 0¢ sell
-            # action and retries next cycle if the book is still thin, rather than
-            # latching `settling=True` — so spurious 0¢ reads no longer retire a
-            # healthy position permanently.
-            pnl_pct = (current_bid - entry) / entry  # -1.0 when bid=0 (full loss)
+            # Drained-orderbook guard. For Kalshi binary options, settlement
+            # pays 0¢ or 100¢, so "sell at $X¢" is dominated by "hold to
+            # settle" whenever X is below our subjective P(win)*100. Even at
+            # P(win)=0 the two are equal. Therefore selling at a near-zero
+            # bid is never strictly better than holding — and in practice
+            # the bid drops to ~0 in the last 30-150s before close because
+            # MMs pull bids to avoid settlement risk, not because the
+            # contract is genuinely worth 0¢. Pre-fix: 8 of the last 14
+            # emergency_stops fired between 35s and 134s before close on
+            # markets that then settled IN OUR FAVOR (verified against
+            # Kalshi's /markets result API), recording wins as -100%
+            # losses worth -$40+ in mis-recorded P&L. Floor of 3¢ catches
+            # the drainage pattern without preventing legitimate stops
+            # when there's still a real market on our side.
+            MIN_SELL_BID_CENTS = 3
+            if current_bid <= MIN_SELL_BID_CENTS:
+                continue
+
+            pnl_pct = (current_bid - entry) / entry
 
             # Emergency stop — phase-aware floor.
             # Early-window dips often reverse; late-window dips usually don't.
