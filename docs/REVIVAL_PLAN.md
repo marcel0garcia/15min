@@ -131,29 +131,85 @@ the edge verifies, scaling capital is the easy part.
 
 ## 3. What's already done on this branch
 
-1. **`btc15/models/settlement_twap.py`** — TWAP-aware fair value, replacing
-   the endpoint formula as the default (`strategy.fair_value_pricing: "twap"`,
-   flip back to `"endpoint"` for A/B):
-   - τ > 60s: `z = ln(S/K) / (σ√(τ_eff/yr))` with `τ_eff = τ − 40s`
-     (variance of the time-average of a Brownian path over the final minute:
-     `(τ−W) + W/3`).
-   - τ ≤ 60s: conditions on the accrued average `A` of observed in-window
-     ticks: settlement = `((W−u)/W)·A + (u/W)·M` with
-     `M ~ N(S, S²σ²·u/3)`, so
-     `P(YES) = N((S − K_eff)/(S·σ·√(u/3/yr)))`,
-     `K_eff = (W·K − (W−u)·A)/u`. As u→0 this becomes the exact
-     settlement-lock step function.
-   - 9 unit tests (`tests/test_settlement_twap.py`): regime continuity at the
-     60s boundary, lock-in monotonicity, ATM = coin flip, degenerate inputs,
-     accrued-window bookkeeping.
-2. **Engine wiring** — the scan loop computes the accrued in-window average
-   from the BRTI tick buffer and feeds it to the pricer; config-gated.
-3. **Crash fix** — settlement-lock entry no longer formats `None` under the
-   FV brain; it reports whichever probability actually cleared the gate.
+### 3a. The TWAP-settlement pricer
 
-Effect on behavior: mid-window ITM probabilities firm up (less fake variance
-→ FV stops leaking edge to the market's correct prices), and the final-minute
-signal becomes *the correct math* instead of a heuristic that crashed.
+`btc15/models/settlement_twap.py` replaces the endpoint formula. KXBTC15M
+settles on the **mean of the final 60s of BRTI**, not the closing print:
+
+  - tau > 60s: `z = ln(S/K) / (sigma*sqrt(tau_eff/yr))`, `tau_eff = tau - 40s`
+    (variance of the time-average of a Brownian path over the final minute).
+  - tau <= 60s: conditions on the accrued average `A` of observed in-window
+    ticks. `settle = ((W-u)/W)*A + (u/W)*M`, `M ~ N(S, S^2 sigma^2 u/3)`, so
+    `P(YES) = N((S - K_eff)/(S*sigma*sqrt(u/3)))`, `K_eff = (W*K - (W-u)*A)/u`.
+    As u -> 0 this becomes the exact settlement-lock step function.
+
+### 3b. The brain was rebuilt from scratch, not patched
+
+The whole legacy decision stack was **deleted** — ~6,000 lines: the
+5-model ensemble (audit Brier 0.283, worse than always saying 50%), the
+personas AutoTrader and its ~15 interacting gates, the DIR-era sizer and
+risk manager, the shadow-comparison analyzers, and the Friday audit
+tools. `config.yaml` went from 340 lines of archaeology to ~110 lines
+where every knob is read by live code.
+
+The replacement is `btc15/core/`, a clean vertical:
+
+| Module | Responsibility |
+|---|---|
+| `fees.py` | Kalshi fee math + a runtime calibrator that measures the true rate from real fills |
+| `sigma.py` | Blended fast/slow realized-vol nowcast (one quiet minute can't halve it) |
+| `pricer.py` | `MarketQuote` — model probability *beside* market probability, always |
+| `policy.py` | The entire decision policy: window, slice, EV-after-fees, Kelly. One exit rule. |
+| `paper.py` | Honest paper broker: depth-walking fills, real fees, cash constraints |
+| `engine.py` | Async loop; the CLI dashboard is untouched and reads the same state dict |
+| `score.py` | Model vs. **market mid**, sliced, with paired bootstrap CIs |
+
+Three decisions worth calling out:
+
+1. **The EV gate replaces the flat edge threshold.** `p*(100-price) -
+   (1-p)*price - fee(price) >= margin`. Because the fee peaks at 1.75c
+   mid-range and falls to 0.33c at the extremes, the gate is
+   automatically strict in the coin-flip zone and permissive where edge
+   structurally lives. No special rule needed.
+
+2. **Exits are one rule: flip only.** No loss cuts, no profit takes. A
+   binary settles 0/100; selling into a thin book at 3c is dominated by
+   holding whenever real P(win) > 3%. The June 6 post-mortem showed the
+   old tiers realized losses on positions that settled as wins.
+
+3. **Paper fidelity is the point.** Fills walk displayed depth, pay the
+   real fee curve, and respect cash. The invariant `cash == start +
+   realized_pnl` is asserted over a full synthetic session. A test
+   confirms that when the market quotes our exact probability, the bot
+   fires **zero** trades — the old "fill at ask, no fees" path would have
+   shown a fantasy profit there.
+
+### 3c. Tests: 63, from zero
+
+`tests/test_core.py` (41), `test_settlement_twap.py` (9),
+`test_paper_session.py` (6 end-to-end synthetic sessions),
+`test_engine_wiring.py` (7, drives the real engine against a fake Kalshi).
+
+They already caught three real bugs: a float-rounding error billing an
+extra cent on every mid-price fill, a mixed fee convention that broke
+cash conservation, and a latent `TypeError` that made the old
+settlement-lock entry impossible to fire.
+
+### 3d. Kalshi API currency (validated August 2026)
+
+- Legacy integer `count`/cents fields **removed 2026-03-12** — the client
+  already prefers `_fp`/`_dollars` everywhere. No action needed.
+- `tick_size` **removed 2026-05-07** — never used.
+- `/portfolio/orders*` deprecated (>= 2026-05-21) — we already use
+  `/portfolio/events/orders` and the batched DELETE.
+- **Open risk — the fee rate.** 0.07 is the documented standard-category
+  rate, but reports of the July 2026 revision describe per-category
+  multipliers and suggest crypto may price higher. Kalshi's docs and API
+  are both blocked by this environment's egress policy, so it is
+  unverified. `fee_rate`/`fee_multiplier` are now config knobs, and
+  `FeeCalibrator` measures the real rate from live fills and logs
+  `[FEE] MODEL MISMATCH` with the value to set. **Verify with one small
+  live trade before trusting any EV number.**
 
 ---
 
@@ -161,30 +217,32 @@ signal becomes *the correct math* instead of a heuristic that crashed.
 
 Phased, each with a falsifiable exit criterion. Don't skip gates.
 
-### Phase R1 — Clean re-baseline (paper, ~1 week of sessions)
-- Run paper sessions on this branch (settlement race fixed + TWAP pricer).
-- **Benchmark against the market, not against 0.25.** A Brier of 0.12 means
-  nothing if the Kalshi mid scores 0.10. Extend `shadow_analysis.py` to score
-  the *market mid* as a third brain. Edge exists only where
-  `Brier(FV) < Brier(market)` — measure it overall and sliced by
-  (phase × price band).
-- Exit criterion: ≥300 settled market-observations with clean accounting.
-  If FV never beats the mid in *any* (phase × band) slice, the directional
-  book is dead and only §2(c) MM survives.
+### Phase R1 — Measure against the market (paper, ~1 week of sessions)
+
+**The tooling for this phase is built and tested. R1 is now just running it.**
+
+- Run paper sessions: `./run.sh run --trade`. Every market-scan writes a
+  decision row carrying both `p_model` and `p_market`.
+- After each session: `./run.sh replay enrich <session>` then
+  `./run.sh score --suggest`.
+- The bar is the market, not 0.25. `score` reports
+  `Δ = Brier(market) − Brier(model)` per (phase × price band) slice with a
+  paired bootstrap CI; a slice is real only when its CI clears zero.
+- Leave `core.enabled_slices: []` for the whole phase — observe everything,
+  restrict later. Leave `auto_trade` on so fills and fees are exercised, but
+  remember paper P&L is secondary here; the Brier delta is the finding.
+- Exit criterion: ≥300 settled observations. If no slice beats the market,
+  the directional book is dead and only §2(c) maker capture survives.
 
 ### Phase R2 — Trade only where the model beats the market
 - Expect the win slices to be: final-minute lock-ins, and extreme bands
   (≤15¢ / ≥85¢) in the back half. Restrict entries to the winning slices —
   i.e., re-introduce price-band gates, but this time *derived from measured
   Brier advantage*, not from session anecdotes.
-- Kill remaining DIR-era gates outright (suppression tiers, flow gate,
-  orderbook-confirm) rather than leaving them toggled off. The policy should
-  read: fee-aware edge threshold + Kelly + risk caps + the measured-slice
-  gate. Four things.
-- **Make the edge threshold fee-aware**: require
-  `edge ≥ fee(price)/100 + spread_half + margin` instead of a flat 5%. At
-  95¢ that's ~1¢; at 50¢ it's ~3¢+. This single change encodes "don't trade
-  the middle."
+- *(Done in the rebuild: the DIR-era gates no longer exist, and the policy
+  already reads exactly four things — window, slice, fee-aware EV, Kelly.)*
+- *(Done: `core.ev_margin_cents` gates on EV after the exact fee curve,
+  which is structurally strict mid-range and permissive at the extremes.)*
 - σ upgrade (the FV brain's real weak spot): blend the 60s nowcast with a
   5-minute EWMA of squared returns and de-noise the 1s reconstruction
   (microstructure noise biases σ up, which drags every FV prob toward 0.5).
@@ -257,9 +315,12 @@ ranges) before leaving the platform entirely.
 
 ## 6. Immediate next steps (this week)
 
-1. Merge this branch; run `python3 tests/test_settlement_twap.py`.
-2. Start nightly paper sessions with recording on (R1).
-3. Extend `shadow_analysis.py` with the market-mid brain (small change,
-   biggest informational payoff in the project).
-4. After ~5 sessions: run the slice analysis and let the data pick the
-   tradeable slices for R2.
+1. Apply this branch and run the suite: `for t in tests/*.py; do python3 $t; done`
+   (63 tests; all should pass).
+2. `./run.sh` for one window and confirm the dashboard populates — Signals,
+   BRTI, sigma, fair_value.
+3. Start nightly paper sessions: `./run.sh run --trade`.
+4. After ~5 sessions: `./run.sh replay enrich <session>` then
+   `./run.sh score --suggest`. That output decides R2.
+5. **Before any live trade**: verify the fee rate (§3d). One small order,
+   compare Kalshi's reported fee to `taker_fee_usd`, set `core.fee_rate`.

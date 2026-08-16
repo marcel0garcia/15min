@@ -22,7 +22,9 @@ log = logging.getLogger(__name__)
 # Marker for "which brain produced these decisions". Bump when the strategy's
 # probability source changes (e.g. when Phase 3 swaps the ensemble for the
 # fair-value engine). Lets replay/analyze segregate sessions by brain era.
-BRAIN_VERSION = "ensemble-v1-phase1"
+# Stamped into every session's meta.json so recorded data can always
+# be traced back to the brain that produced it.
+BRAIN_VERSION = "core-v3-twap"
 
 
 def _git_commit() -> Optional[str]:

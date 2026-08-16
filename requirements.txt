@@ -1,30 +1,27 @@
-# Core
+# Core runtime
 aiohttp>=3.9.0
-cryptography>=41.0.0
+cryptography>=41.0.0          # RSA request signing for Kalshi auth
 websockets>=12.0
 click>=8.1.0
-rich>=13.7.0
-pydantic>=2.5.0
-pydantic-settings>=2.0.0
+rich>=13.7.0                  # the CLI dashboard
 PyYAML>=6.0.1
 python-dotenv>=1.0.0
+httpx>=0.26.0
 
-# Numerics / ML
+# Numerics
+# NOTE: the v3 core deliberately has NO ML dependency. The pricer is a
+# closed-form TWAP-settlement formula in pure stdlib math, and the scorer
+# uses a hand-rolled bootstrap — so lightgbm / scikit-learn / pandas are
+# gone along with the ensemble brain they served. numpy remains only for
+# the price feed's bar/vol helpers.
 numpy>=1.26.0
-pandas>=2.1.0
-scipy>=1.11.0
-scikit-learn>=1.3.0
-lightgbm>=4.1.0
-joblib>=1.3.0
 
 # Storage
 aiosqlite>=0.19.0
 
-# Utilities
-httpx>=0.26.0
-tenacity>=8.2.0
-python-dateutil>=2.8.2
-pytz>=2023.3
-colorama>=0.4.6
-tabulate>=0.9.0
-prompt-toolkit>=3.0.43
+# Optional — web dashboard (`main.py web`)
+# fastapi>=0.110.0
+# uvicorn>=0.29.0
+
+# Optional — session charts (visualize_sessions.py)
+# matplotlib>=3.8.0

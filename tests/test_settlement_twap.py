@@ -10,12 +10,23 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from btc15.models.fair_value import fair_value
-from btc15.models.settlement_twap import twap_fair_value, accrued_average
+from btc15.models.settlement_twap import (
+    twap_fair_value, accrued_average, _norm_cdf, SECONDS_PER_YEAR,
+)
 
 
 S = 100_000.0
 SIGMA = 0.50  # annualized
+
+
+def endpoint_prob_yes(spot: float, strike: float, sigma: float, tau_seconds: float) -> float:
+    """The legacy closing-print pricer, inlined as the comparison baseline:
+    P(YES) = N(ln(S/K) / (sigma*sqrt(tau))). Kept here (not in the package)
+    because it prices the wrong instrument — it exists only to prove the
+    TWAP pricer differs from it in the expected direction."""
+    return _norm_cdf(
+        math.log(spot / strike) / (sigma * math.sqrt(tau_seconds / SECONDS_PER_YEAR))
+    )
 
 
 def approx(a, b, tol=1e-9):
@@ -42,9 +53,9 @@ def test_tighter_than_endpoint_before_window():
     pricer (tau_eff = tau - 40), so an ITM prob must be strictly higher."""
     strike = S * 0.999  # spot above strike → ITM YES
     for tau in (90, 180, 420, 840):
-        ep = fair_value(spot=S, strike=strike, sigma=SIGMA, tau_seconds=tau)
+        ep = endpoint_prob_yes(S, strike, SIGMA, tau)
         tw = twap_fair_value(spot=S, strike=strike, sigma=SIGMA, tau_seconds=tau)
-        assert tw.prob_yes > ep.prob_yes, (tau, tw.prob_yes, ep.prob_yes)
+        assert tw.prob_yes > ep, (tau, tw.prob_yes, ep)
 
 
 def test_lock_in_dominates_as_u_shrinks():

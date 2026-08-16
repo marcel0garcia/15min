@@ -1,319 +1,95 @@
-# ─────────────────────────────────────────────────
-#  15-MIN BTC PREDICTION BOT  ·  Configuration
-# ─────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  15-MIN BTC BOT · v3 core configuration
+#
+#  Every knob below is read by live code. If you add one, wire it to the
+#  policy AND justify it with measured evidence from `./run.sh score` —
+#  the previous config grew to ~15 interacting gates calibrated against a
+#  brain that no longer existed, and most of them were silently blocking
+#  the trades they were supposed to protect.
+# ─────────────────────────────────────────────────────────────────────────────
 
 kalshi:
   base_url: "https://api.elections.kalshi.com/trade-api/v2"
   ws_url: "wss://api.elections.kalshi.com/trade-api/ws/v2"
-  # Credentials loaded from .env (KALSHI_EMAIL / KALSHI_PASSWORD / KALSHI_API_KEY)
+  # Credentials come from .env (KALSHI_API_KEY / KALSHI_RSA_KEY_PATH)
   series_ticker: "KXBTC15M"
-  order_type: "limit"
-  limit_slippage_cents: 2
 
 feeds:
-  coinbase_ws_url: "wss://ws-feed.exchange.coinbase.com"
-  coinbase_rest_url: "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
   bar_interval_sec: 60
   lookback_bars: 200
-
-models:
-  # Minimum model confidence to generate a signal (0.0–1.0)
-  # NOTE: trader.min_edge (below) is the single source of truth for edge.
-  min_confidence: 0.55
-  # Weights for ensemble (must sum to 1.0)
-  # orderbook_imbalance: real-time buy/sell pressure — highest alpha for this market
-  # technical_momentum: RSI/MACD/BB composite — strong for 15-min moves
-  # trend_regression:   OLS slope & R² — medium-term context
-  # binary_options_model: Black-Scholes sanity check — reduced weight; becomes a step
-  #                        function at short horizons
-  # ml_model: LightGBM trained on historical outcomes (requires 500+ samples)
-  ensemble_weights:
-    orderbook_imbalance:  0.35
-    technical_momentum:   0.35
-    trend_regression:     0.20
-    binary_options_model: 0.00       # BSM information already encoded by ml_model at finer resolution
-    ml_model:             0.10       # trained LightGBM (data/ml_model.pkl)
-  rsi_period: 14
-  macd_fast: 12
-  macd_slow: 26
-  macd_signal: 9
-  bb_period: 20
-  bb_std: 2.0
-  default_annual_vol: 0.80
-
-  # EWMA signal smoothing — DISABLED BY DEFAULT.
-  # Per-second technical indicators (live partial bar) provide natural
-  # smoothing via component diversity; EWMA's denoising became redundant.
-  # Flip to a positive value if a session shows excessive tick-to-tick noise.
-  # Half-life ≈ ln(2)/-ln(1-α) at 1s scan:
-  #   0.00 → disable (current default)
-  #   0.20 → 3.1s smoothing
-  #   0.30 → 1.9s smoothing
-  signal_smoothing_alpha: 0.00
-  signal_smoothing_stale_sec: 5.0  # reset smoothing after WS gaps this long
+  # "brti" = consolidated median of Coinbase/Kraken/Bitstamp top-of-book,
+  # MAD outlier rejection. This is what KXBTC15M actually settles against.
+  price_source: "brti"
 
 strategy:
-  min_seconds_remaining: 60
-  max_seconds_remaining: 840
-  preferred_entry_window_sec: [180, 600]
-  auto_trade: false       # set true to enable live trading
-  paper_trade: true       # always start in paper mode
-  max_open_positions: 4
-  allowed_sides: "both"
-  # Phase 3 step 5: brain that fires trades. "fair_value" is the new
-  # production after the 30h shadow window (FV Brier 0.1204 vs DIR
-  # 0.1539, simulated P&L +$2.75 vs -$5.88). DIR keeps running in
-  # shadow — logged in decision_log + rendered dim in Signals panel.
-  # Flip to "ensemble" to revert to legacy DIR without code change.
-  production_brain: "fair_value"
-  # FV pricing model. "twap" prices the real settlement instrument (mean of
-  # the final 60s of BRTI): tau_eff = tau - 40s outside the final minute,
-  # and conditions on the locked-in accrued average inside it. "endpoint"
-  # is the legacy closing-print formula — keep for replay A/B only.
-  fair_value_pricing: "twap"
-  # Paper-mode synthetic bankroll. Ignored in live mode.
-  # Used for sizing + dashboard so a depleted Kalshi paper account doesn't
-  # silently kill every signal at the min_single_trade_usd gate.
-  paper_starting_balance_usd: 100.0
+  auto_trade: false     # false = observe and log only; no orders
+  paper_trade: true     # true = simulated fills via the paper broker
 
-# ── Unified Auto-Trader────────────────────────────────────────────────────────
-# Replaces the old Sniper / Scalper / Arb persona trio.
-# All decision-making flows through a single AutoTrader with time-phase logic.
-trader:
-  enabled: true
-  budget_pct: 1.0          # fraction of bankroll available to auto-trader
+# ── The decision core ────────────────────────────────────────────────────────
+core:
+  # 1. WINDOW — when a market is tradeable at all.
+  min_seconds: 30.0
+  max_seconds: 840.0
 
-  # Time-phase thresholds (seconds remaining in the 15-min window)
-  #   Early  (>8 min):  GTC post_only entries + market making; 0% maker fee
-  #   Prime  (3–8 min): IOC directional entries; escalates unfilled GTC
-  #   Late   (<3 min):  no new entries; manage existing positions only
-  early_window_min_seconds: 480   # 8 min
-  prime_window_min_seconds: 180   # 3 min
-  late_window_min_seconds:  60    # 1 min
-  max_entry_seconds: 840          # wait 60s after market open before entering
+  # 2. SLICES — which (phase × price-band) buckets may fire.
+  #    phase: early >9m · mid 5–9m · prime 1.5–5m · late <1.5m
+  #    band:  extreme ≤15¢ or ≥85¢ · outer 15–30/70–85 · middle 30–70
+  #
+  #    EMPTY = every slice enabled. That is the correct R1 setting: observe
+  #    everything, then restrict to what the data supports:
+  #        ./run.sh score --suggest
+  #    Paste the emitted list here for R2. Do not hand-pick slices.
+  enabled_slices: []
 
-  # Entry thresholds
-  # min_confidence: 0.45 is the new conviction-weighted scale (anchored to
-  # weighted-mean distance from 0.5, NOT std-dev). Looks lower than before
-  # but is harder to clear — old 0.55 admitted near-neutral signals.
-  min_confidence: 0.50            # minimum model confidence
-  # min_edge floor — lowered post FV calibration from 0.10 to 0.05.
-  # At extreme strikes (price near 5¢ or 95¢) the maximum possible
-  # edge ceiling drops to ~5pp by definition, so the old 10% floor
-  # banned exactly the high-conviction FV opportunities (deep ITM/OTM
-  # contracts where FV is near-certain about side). Kelly math still
-  # enforces +EV; this just lets the extreme-conviction trades pass.
-  min_edge: 0.05
-  min_entry_price_cents: 10       # fallback floor (used when by-phase empty)
-  max_entry_price_cents: 72       # fallback ceiling (used when by-phase empty)
+  # 3. EV GATE — required expected value per contract, in cents, AFTER the
+  #    Kalshi taker fee. Replaces the old flat "edge ≥ 5%". Automatically
+  #    strict mid-range (fee peaks at 1.75¢) and permissive at the extremes
+  #    (0.33¢), which is the structural shape of edge in this market.
+  ev_margin_cents: 0.75
+  min_confidence: 0.04      # |p − 0.5| × 2 — "have some directional view"
+  max_spread_cents: 8.0     # wider books can't be priced honestly
 
-  # Phase-aware entry-price gates. Overrides the flat min/max above by phase.
-  # The old DIR-era values (early 10-60, mid 35-80, etc.) came from a DIR
-  # audit where 70+¢ early entries had NEGATIVE PnL due to DIR
-  # overconfidence — a DIR-specific failure mode. After the Phase 3 brain
-  # swap to fair_value (FV's math is symmetric around S=K), those tight
-  # bands were silently blocking 100% of FV's NO-side entries on cheap-
-  # YES markets. Widened to 10-90 across early/mid/prime so FV can pick
-  # whichever side its math actually recommends. Late stays widest for
-  # settlement-lock entries.
-  # Widened to 5-95 to accommodate the slip cushion (raw_price = entry +
-  # 2-4¢ on IOC strong-signal entries). FV's would-fire opportunities
-  # cluster at extreme strikes (prob ~0 or ~1) where the entry price
-  # naturally lives at the old band boundary — the slip pushed them
-  # over.
-  entry_price_by_phase:
-    early: {min: 3, max: 97}
-    mid:   {min: 3, max: 97}
-    prime: {min: 3, max: 97}
-    late:  {min: 3, max: 97}
+  # 4. SIZING / RISK
+  kelly_fraction: 0.25      # quarter-Kelly on the fee-adjusted edge
+  max_single_trade_usd: 10.00
+  min_single_trade_usd: 1.00
+  max_per_market_usd: 10.00
+  max_open_positions: 3
+  daily_loss_limit_usd: 50.00
 
-  # Settlement lock — allow late-window entries when outcome is near-certain
-  # BRTI settles on 60s trailing average; with 30s left, half is locked in.
-  # When BSM says ≥88% and BTC is well clear of strike, enter even <60s.
-  settlement_lock_enabled: true
-  settlement_lock_min_seconds: 20
-  settlement_lock_max_seconds: 60
-  settlement_lock_min_prob: 0.88
-  settlement_lock_min_confidence: 0.50
+  # EXIT — one rule. Leave only if the model now wants the OTHER side by
+  # this much EV and there is still time for the flip to pay. No loss cuts,
+  # no profit takes: a binary settles 0/100, and the June 6 post-mortem
+  # showed the loss-cut tiers realized losses on positions that went on to
+  # settle as wins.
+  exit_flip_min_ev_cents: 2.0
+  exit_min_seconds: 120.0
 
-  # GTC order management
-  # Early-window entries post GTC post_only at mid-1¢ (0% maker fee).
-  # If unfilled after gtc_escalate_seconds, cancel and retry as IOC.
-  # 5s: tightened from 8s for live-trading readiness. With the reconciler
-  # placement-race guard (commit 6801952) closing the duplicate-position
-  # window, we no longer need a wider GTC patience window. 5s still gives
-  # quiet markets time for a maker fill while halving in-flight exposure.
-  gtc_escalate_seconds: 5.0
-  slippage_cents: 2               # IOC slippage above current ask (adaptive by vol)
+  # EXECUTION
+  slippage_cents: 1         # limit padding above the displayed ask
 
-  # Market making — runs in early window when spread ≥ mm_min_spread_cents
-  # Posts both YES and NO sides with GTC post_only; earns spread at 0% fee.
-  mm_min_spread_cents: 5
-  mm_contracts_per_side: 2        # used when mm_aggressive=false
-  mm_max_inventory: 8             # legacy NET cap (used when mm_aggressive=false)
-  mm_cancel_before_seconds: 120   # cancel all MM orders with <2 min to settlement
-  mm_quote_offset_cents: 2        # post this many cents inside best bid/ask
+  # PAPER FIDELITY — fills always walk real displayed depth and pay real
+  # fees. adverse_cents adds pessimism for the tick that moves against us
+  # between decision and arrival; raise to 1.0 for a conservative estimate.
+  paper_starting_cash_usd: 100.00
+  paper_adverse_cents: 0.0
 
-  # Aggressive MM mode — flip to true to activate the parallel maker strategy.
-  # When true: lower spread threshold (3¢), bigger size (4/side), wider
-  # window (down to 240s remaining instead of 480s), and MM fires CONCURRENT
-  # with directional entries (not mutually exclusive). Per-side hard caps
-  # prevent runaway inventory on either side.
-  # Default: false. Pull the code, then flip this knob when ready to start
-  # the experiment. Flip back to false to halt MM immediately; no code revert.
-  mm_aggressive: false
-  mm_aggressive_min_spread_cents: 3
-  mm_aggressive_contracts_per_side: 4
-  mm_window_min_seconds: 240               # eligibility floor (secs remaining)
-  mm_per_side_max_inventory: 10            # hard cap per side per ticker
-  mm_max_inventory_net: 15                 # bumped from 8 to accommodate wider per-side
-  mm_volatility_cancel_threshold_cents_per_sec: 5.0   # reserved for future use
+  # FEE MODEL — fee = ceil_to_cent(rate × multiplier × n × p × (1−p)).
+  #
+  # ⚠ VERIFY BEFORE LIVE TRADING. 0.07 is the documented standard-category
+  #   rate. Reports of the July 2026 fee revision describe per-category
+  #   multipliers and suggest CRYPTO may price above standard; Kalshi's own
+  #   docs were unreachable from the build environment, so this is unverified.
+  #   If the true rate is higher, every EV decision is mispriced in our favor
+  #   — the worst kind of error. The engine's FeeCalibrator watches real
+  #   fills and logs "[FEE] MODEL MISMATCH" with the measured value to set here.
+  fee_rate: 0.07
+  fee_multiplier: 1.0
 
-  # Exit rules (simplified — no trailing stop, no profit decay)
-  #   Rule 1: Pure arb pairs always hold to settlement ($1.00 guaranteed — never cut)
-  #   Rule 2: Flip if model reverses with strong edge AND enough time remains
-  #   Rule 3: Phase-aware loss_cut tiers (hardcoded in personas.py, see Rule 3)
-  #   Rule 4: Everything else → hold to $1.00 settlement
-  # NOTE: stop_loss_pct / stop_loss_min_seconds were dead config fields (defined
-  # but never read by the strategy code). Removed. The actual loss_cut behavior
-  # is the phase-tiered thresholds in personas.py: early=-65%, mid=-55%,
-  # prime=-40%, late=-25%. Tweak there if you want to change thresholds.
-  emergency_stop_pct: 0.65        # late-window backstop (any time, any phase)
-  reversal_min_edge: 0.10         # 10% edge required to flip sides
-  reversal_min_seconds: 300       # only flip with >5 min left
-
-  # Loss-cut cool-off — DISABLED (set to 0).
-  # Rationale: empirical tape data (tools/friday_market_tape.py over 737
-  # markets) showed real recoveries take MINUTES, not the 5-10s the
-  # cool-off was set to. Of 8 cool-off "saves" in the 18MAY22:30 live
-  # session, 7 went on to hit -65% emergency_stop anyway — the cool-off
-  # converted -40% loss_cuts into deeper losses, net-negative for the
-  # session. Replaced by phase-aware emergency_stop tiers in personas.py.
-  cool_off_seconds_high_runway: 0.0   # was 10.0
-  cool_off_seconds_mid_runway: 0.0    # was 5.0
-
-  # Entry signal persistence: fresh entries (not reversal, not pyramid) must
-  # see the conf+edge gate clear for this many consecutive 1s scans before
-  # firing.
-  #   1 = fire immediately on first tick (current — EWMA does the denoising)
-  #   2 = ~2s of confirmation
-  #   3 = ~3s — was choking fire rate when combined with EWMA at α=0.20
-  # With K=1, SIGNAL PENDING log lines no longer appear (nothing to "pend")
-  # and SIGNAL FADED becomes inert (needs ≥2 observations to detect fade).
-  # EWMA + raw-floor guard + ENTRY SUPPRESSED tiers carry the noise rejection.
-  entry_confirmation_ticks: 1
-
-  # Confidence-trend filter: on top of the K-tick gate, require the fire-tick
-  # confidence to be at least (peak_in_window - this) so we don't fire on
-  # signals that spiked then faded. Set to 1.0 to disable.
-  entry_conf_fade_max: 0.05
-
-  # Raw-floor guard against EWMA dip-buoying. EWMA smoothing is symmetric
-  # (pulls toward the moving average in BOTH directions), so a recently-strong
-  # signal that has now decayed can still clear the smoothed floor even when
-  # the current RAW value is weak. This guard rejects such fires.
-  #   raw_conf >= (phase_min_confidence - smoothing_raw_margin)
-  # 0.10 = raw can drop 10pp below the floor before we drop the entry.
-  # Set to 1.0 to disable the guard; 0.0 = strictest (raw must clear floor).
-  smoothing_raw_margin: 0.10
-
-  # Phase-conditional min_confidence floor. FV-era values (post Phase 3
-  # brain swap) — the old 0.45-0.55 floors were calibrated to DIR's
-  # confidence which mixed prob-distance with component-agreement across
-  # 5 sub-models. FV's confidence is just |prob_yes - 0.5| × 2 (no
-  # agreement semantic), so legacy floors required FV prob_yes > 0.775
-  # to even pass — way too strict given the edge gate already enforces
-  # a Kelly-like directional floor. New 0.05 = "have ANY directional
-  # opinion". Flip back to {0.55, 0.48, 0.50, 0.55} if production_brain
-  # = ensemble.
-  min_confidence_by_phase:
-    early: 0.05
-    mid:   0.05
-    prime: 0.05
-    late:  0.05
-
-  # ENTRY SUPPRESSED tiers (DIR adverse-selection traps).
-  #   Tier-1: edge > 25% AND conf < 52%
-  #   Tier-2: edge >= 35% AND conf < 65%
-  # These caught DIR's "high edge with low component agreement" cases
-  # where the 5 sub-models disagreed = informed-flow trap. FV has no
-  # components to disagree, and its confidence is deterministic from
-  # prob — the tiers filter legitimate FV opportunities (market
-  # mispricing FV is confidently calling). Disabled by default for FV.
-  # Flip True when production_brain = ensemble.
-  entry_suppression_enabled: false
-
-  # Trade-tape flow-alignment gate — DISABLED.
-  # Phase A audit (tools/friday_audit_backtest.py over 16 sessions, 2,631
-  # fires, 380 settled rejections) showed FLOW MISALIGNMENT rejected 65%
-  # WINS — the filter was actively costing us money. The tape feed itself
-  # stays alive (flow=... tag on SIGNAL lines is still useful diagnostic
-  # info); only the gate is disabled. Re-enable by setting required_alignment
-  # back to a positive value if a future analysis suggests it.
-  trade_flow_window_seconds: 30.0
-  trade_flow_required_alignment: 0.0   # was 0.30 — see Phase A audit findings
-  trade_flow_min_volume: 5.0
-
-  # Position sizing (tuned for $100 starting balance)
-  # Early window (GTC): quarter-Kelly — patient entries, time uncertainty higher
-  # Prime window (IOC): half-Kelly — high conviction, short window
-  # Sizer also hard-caps at 20% of bankroll internally (see btc15/strategy/sizer.py)
-  kelly_fraction_early: 0.25
-  kelly_fraction_prime: 0.50
-  kelly_fraction_strong: 0.75     # 3/4-Kelly for very strong signals (conf≥0.65, edge≥0.08)
-  max_single_trade_usd: 10.00     # per-trade cap
-
-  # Pyramiding — add to winning positions when model still agrees.
-  # Calibrated for FV's confidence scale (|prob-0.5|×2). On the FV brain
-  # conf=0.10 ⇔ prob≥0.55 (modest lean); conf=0.30 ⇔ prob≥0.65 (solid).
-  # The 0.60 / 0.10 defaults below were DIR-scale and effectively
-  # blocked every FV pyramid except extreme outliers.
-  pyramid_enabled: true
-  pyramid_min_pnl_pct: 0.10       # position must be ≥10% profitable
-  pyramid_min_confidence: 0.10    # FV scale — was 0.60 (DIR-era)
-  pyramid_min_edge: 0.05          # matches trader.min_edge — was 0.10 (DIR-era)
-  pyramid_min_seconds: 300         # ≥5 min left to pyramid
-  pyramid_max_adds: 2              # max 1 add per position
-
-  # Stop/whipsaw cooldowns — the 12APR06:15 session had one market
-  # take 4 losing trades in 10 minutes; these prevent re-entering chop.
-  stop_cooldown_seconds: 90         # entry lockout after a stop-loss (was 45)
-  reversal_cooldown_seconds: 60     # entry lockout after any reversal exit
-
-  # GTC→IOC escalation drift gate. When the resting GTC didn't fill and the
-  # IOC would now have to cross far above signal-time mid, we're chasing
-  # informed flow. Halve or skip depending on how bad the drift is.
-  escalation_drift_halve_cents: 2   # drift > 2¢ beyond slippage → halve contracts
-  escalation_drift_skip_cents: 3    # drift > 3¢                  → skip IOC entirely
-
-  # Reversal re-entry: require the live orderbook imbalance to actually
-  # confirm the flip direction. Prevents taking reversal exits for profit
-  # then immediately losing the re-entry on the same noisy market.
-  # Flipped False post Phase 3 brain swap: this gate reads
-  # output.prob_orderbook (DIR sub-component) and bails when None,
-  # silently blocking every FV reversal re-entry. FV reads its own
-  # z-score as conviction; orderbook confirmation is redundant. Flip
-  # True when production_brain = ensemble.
-  reversal_require_orderbook_confirm: false
-  reversal_orderbook_min_dev: 0.10  # |prob_orderbook - 0.5| ≥ this in flip direction
-
-  # Arbitrage — always highest priority when YES+NO < 98¢
-  # Disabled for first live-trading session: holding YES+NO simultaneously
-  # on the same market complicates reconciler reasoning and realized arb
-  # edge across 67 paper trades was only +$5. Re-enable after live baseline.
-  arb_enabled: false
-  min_arb_cents: 2                # minimum profit per pair in cents
-  max_arb_contracts: 5            # ~$2.50–4.90 per arb pair on $100 bankroll
-
-risk:
-  max_open_positions: 3           # 3 × $10 = $30 max simultaneous exposure
-  max_trade_usd: 10.00            # risk-manager hard cap; matches trader.max_single_trade_usd
-  max_position_per_market_usd: 10.00 # capped per-market too
-  daily_loss_limit_usd: 50.00     # halt trading if down $50 on the day
-  kelly_fraction: 0.25
-  min_trade_usd: 0.50             # Kalshi practical minimum
-  win_rate_lookback: 20
-  win_rate_min: 0.20              # halt if recent win rate drops below 20%
+  # VOL NOWCAST — blended fast/slow realized vol feeding the TWAP pricer.
+  sigma_fast_sec: 60.0
+  sigma_slow_sec: 300.0
+  sigma_fast_weight: 0.6
 
 logging:
   level: "INFO"
@@ -321,23 +97,18 @@ logging:
   trade_log_file: "logs/trades.csv"
   max_log_size_mb: 50
 
-# ── v2 Phase 1: ambient telemetry recorder ────────────────────────────────────
-# Records Kalshi raw WS frames + venue top-of-book + decision log per session.
-# Co-runs with the engine; never places orders. Disabled cleanly via enabled:false.
-# See btc15/recording/ for implementation; `python main.py replay convert <session>`
-# converts the JSONL sidecars into joined Parquet for offline analysis.
+# ── Telemetry recorder ───────────────────────────────────────────────────────
+# Captures Kalshi WS frames, venue ticks, and one decision row per market
+# per scan (with both p_model and p_market — that pairing is what makes
+# `./run.sh score` possible). Never places orders.
 recording:
   enabled: true
   path: "data/recordings"
-  # BRTI constituents to capture for the consolidated-mid placeholder. CB +
-  # Kraken + Bitstamp gives a median-of-3; gemini optional.
   venue_coinbase: true
   venue_kraken: true
   venue_bitstamp: true
   venue_gemini: false
-  # Derived 1Hz grid is rebuilt at convert time from raw venue ticks, not live.
   grid_interval_sec: 1.0
-  # Bound disk usage on chatty venues; 0 disables rate limiting.
   venue_max_msg_per_sec: 10
 
 database:

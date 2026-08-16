@@ -101,10 +101,10 @@ def run(trade: bool, live: bool, web: bool, web_port: int, config_path: str):
 
 
 async def _run_engine(cfg, web_port: int = None):
-    from btc15.strategy.engine import StrategyEngine
+    from btc15.core import CoreEngine
     from btc15.cli.terminal import run_dashboard
 
-    engine = StrategyEngine(cfg)
+    engine = CoreEngine(cfg)
     tasks = []
 
     try:
@@ -253,13 +253,45 @@ def trade(side: str, ticker: str, amount: float, live: bool, config_path: str):
             return
 
     async def _run():
-        from btc15.strategy.engine import StrategyEngine
-        engine = StrategyEngine(cfg)
+        from btc15.core.fees import taker_fee_usd
         from btc15.kalshi.client import KalshiClient
+        from btc15.kalshi.models import OrderType, Side, TimeInForce
+
         async with KalshiClient(cfg.kalshi) as client:
-            engine._kalshi = client
-            result = await engine.manual_trade(ticker, side, amount)
-        console.print(result)
+            ob = await client.get_orderbook(ticker)
+            price = ob.best_yes_ask if side == "yes" else (
+                100 - ob.best_yes_bid if ob.best_yes_bid is not None else None
+            )
+            if price is None:
+                console.print(f"[bright_red]No {side.upper()} ask on {ticker}[/bright_red]")
+                return
+            contracts = int(amount / (price / 100))
+            if contracts <= 0:
+                console.print(
+                    f"[yellow]${amount:.2f} buys 0 contracts at {price:.0f}¢[/yellow]"
+                )
+                return
+            fee = taker_fee_usd(price, contracts)
+            cost = contracts * price / 100
+            if cfg.strategy.paper_trade:
+                console.print(
+                    f"[yellow][PAPER][/yellow] would buy {side.upper()} ×{contracts} "
+                    f"@ {price:.0f}¢ on {ticker} — cost ${cost:.2f} + fee ${fee:.2f}"
+                )
+                return
+            order = await client.place_order(
+                ticker=ticker,
+                side=Side.YES if side == "yes" else Side.NO,
+                contracts=contracts,
+                price_cents=int(price),
+                order_type=OrderType.LIMIT,
+                time_in_force=TimeInForce.IOC,
+            )
+            console.print(
+                f"[bright_green][LIVE][/bright_green] {side.upper()} ×{order.filled_count}"
+                f"/{contracts} @ {price:.0f}¢ on {ticker} "
+                f"(fees ${order.fees_paid_usd:.2f})"
+            )
 
     asyncio.run(_run())
 
@@ -433,36 +465,6 @@ def report(paper_only: bool, live_only: bool, since_str: str, no_fetch: bool):
 
 
 @cli.command()
-@click.option("--min-samples", default=100, help="Minimum samples required to train")
-def train(min_samples: int):
-    """Train the ML model on collected trade data."""
-    from btc15.models.ml_model import train_model, DATA_PATH
-    if not DATA_PATH.exists():
-        console.print(f"[yellow]No training data at {DATA_PATH}. Run bootstrap first:[/yellow]")
-        console.print("  [cyan]./run.sh bootstrap[/cyan]")
-        return
-    import numpy as np
-    data = np.load(DATA_PATH)
-    console.print(f"Found {len(data['X']):,} training samples.")
-    success = train_model(min_samples=min_samples)
-    if success:
-        console.print("[bright_green]Model trained successfully![/bright_green]")
-    else:
-        console.print("[red]Training failed — check logs.[/red]")
-
-
-@cli.command()
-@click.option("--months", default=6, help="Months of historical data to fetch (default: 6)")
-def bootstrap(months: int):
-    """Bootstrap ML model from years of historical BTC data (no live trading needed)."""
-    import asyncio
-    from btc15.models.bootstrap import main as bootstrap_main
-    console.print(f"[bold]Bootstrapping ML model with {months} months of Kraken data...[/bold]")
-    console.print("[dim]This fetches free historical data and trains LightGBM immediately.[/dim]\n")
-    asyncio.run(bootstrap_main(months=months))
-
-
-@cli.command()
 @click.option("--port", default=8080, help="Port for web dashboard (default: 8080)")
 @click.option("--trade", is_flag=True, default=False, help="Enable auto-trading")
 @click.option("--live", is_flag=True, default=False, help="Disable paper mode (real money!)")
@@ -496,10 +498,10 @@ def web(port: int, trade: bool, live: bool, config_path: str):
 
 async def _run_web(cfg, port: int):
     import uvicorn
-    from btc15.strategy.engine import StrategyEngine
+    from btc15.core import CoreEngine
     from btc15.web.server import create_app
 
-    engine = StrategyEngine(cfg)
+    engine = CoreEngine(cfg)
     app = create_app(engine)
 
     server = uvicorn.Server(
@@ -697,449 +699,6 @@ def replay_enrich(session_id: str, config_path: str, cache: str):
     console.print(_json.dumps(summary, indent=2))
 
 
-@replay.command("diagnose")
-@click.argument("session_id", required=False)
-@click.option("--config", "config_path", default=None)
-@click.option("--min-edge", default=0.10, help="Min edge gate threshold")
-def replay_diagnose(session_id: str, config_path: str, min_edge: float):
-    """Phase 3 step 5 diagnostic: which gate is killing each brain's signals?
-
-    Walks the decision_log, replays the entry-gate chain against each
-    brain's prob/conf, and reports a kill-table showing where each gate
-    catches each brain. Tells you whether the production brain's lack of
-    fires is by design (selectivity) or by misalignment (gate calibrated
-    to the other brain's distribution).
-    """
-    from btc15.config import load_config
-    from btc15.recording.gate_trace import trace_session, GATE_ORDER
-    cfg = load_config(Path(config_path) if config_path else None)
-    setup_logging("INFO", cfg.logging.log_file)
-
-    recordings_root = Path(cfg.recording.path)
-    if session_id:
-        session_dir = recordings_root / session_id
-        if not session_dir.exists():
-            console.print(f"[red]Session not found: {session_dir}[/red]")
-            return
-    else:
-        sessions = sorted(d for d in recordings_root.iterdir() if d.is_dir())
-        if not sessions:
-            console.print("[yellow]No sessions found[/yellow]")
-            return
-        session_dir = sessions[-1]
-
-    # Read the live config so the diagnostic reflects what's ACTUALLY
-    # gating in production — not the hardcoded DIR-era defaults. Honors
-    # the per-phase confidence floors + entry-price bands as configured.
-    cfg_min_conf = {
-        k: float(v) for k, v in (cfg.trader.min_confidence_by_phase or {}).items()
-    } or None
-    cfg_entry_band = {}
-    for k, v in (cfg.trader.entry_price_by_phase or {}).items():
-        if isinstance(v, dict):
-            cfg_entry_band[k] = (v.get("min", 10), v.get("max", 95))
-        else:
-            cfg_entry_band[k] = v
-    cfg_entry_band = cfg_entry_band or None
-
-    dir_trace, fv_trace, action_counts = trace_session(
-        session_dir,
-        min_edge=cfg.trader.min_edge if cfg.trader.min_edge != 0.10 else min_edge,
-        min_conf_by_phase=cfg_min_conf,
-        entry_price_by_phase=cfg_entry_band,
-    )
-
-    # ── Headline
-    console.print(
-        f"\n[bold]Session:[/bold] {session_dir.name}  "
-        f"[dim]·  production_brain={cfg.strategy.production_brain}  "
-        f"·  min_edge={cfg.trader.min_edge}  "
-        f"·  min_conf={cfg_min_conf}[/dim]"
-    )
-    console.print(
-        f"[dim]entry_price_by_phase={cfg_entry_band}  "
-        f"·  entry_suppression_enabled={cfg.trader.entry_suppression_enabled}[/dim]"
-    )
-
-    # ── Actual recorded actions
-    act_t = Table(title="Recorded decision actions (what actually happened)", box=box.SIMPLE)
-    act_t.add_column("action")
-    act_t.add_column("n", justify="right")
-    act_t.add_column("%", justify="right")
-    total_actions = sum(action_counts.values())
-    fires = sum(v for k, v in action_counts.items() if k != "none")
-    for action in sorted(action_counts.keys(), key=lambda k: -action_counts[k]):
-        v = action_counts[action]
-        act_t.add_row(action, f"{v:,}", f"{v/total_actions*100:.1f}%" if total_actions else "—")
-    console.print(act_t)
-    console.print(f"[dim]Total actual fires (action != none): {fires:,}[/dim]")
-
-    # ── Per-brain gate trace
-    gate_t = Table(title="Gate-by-gate filter (where each brain gets killed)", box=box.SIMPLE)
-    gate_t.add_column("gate")
-    gate_t.add_column("DIR n", justify="right")
-    gate_t.add_column("DIR %", justify="right")
-    gate_t.add_column("FV n", justify="right")
-    gate_t.add_column("FV %", justify="right")
-    for gate in GATE_ORDER:
-        d_n = dir_trace.by_gate.get(gate, 0)
-        f_n = fv_trace.by_gate.get(gate, 0)
-        if d_n == 0 and f_n == 0:
-            continue
-        d_pct = d_n / dir_trace.n_rows_evaluated * 100 if dir_trace.n_rows_evaluated else 0
-        f_pct = f_n / fv_trace.n_rows_evaluated * 100 if fv_trace.n_rows_evaluated else 0
-        style = "bold bright_green" if gate == "WOULD_FIRE" else ""
-        gate_t.add_row(
-            f"[{style}]{gate}[/{style}]" if style else gate,
-            f"{d_n:,}",
-            f"{d_pct:.1f}%",
-            f"{f_n:,}",
-            f"{f_pct:.1f}%",
-        )
-    console.print(gate_t)
-    console.print(
-        f"[dim]Rows evaluated: DIR {dir_trace.n_rows_evaluated:,}  "
-        f"FV {fv_trace.n_rows_evaluated:,}  "
-        f"(skipped/no-prob: DIR {dir_trace.n_skipped_no_prob:,}  "
-        f"FV {fv_trace.n_skipped_no_prob:,})[/dim]"
-    )
-
-    # ── Would-fire examples (if any)
-    examples_brain = "fv" if cfg.strategy.production_brain == "fair_value" else "dir"
-    examples = (fv_trace if examples_brain == "fv" else dir_trace).would_fire_examples
-    if examples:
-        ex_t = Table(
-            title=f"Sample {examples_brain.upper()} would-fire rows (first 10)",
-            box=box.SIMPLE,
-        )
-        ex_t.add_column("ticker")
-        ex_t.add_column("secs", justify="right")
-        ex_t.add_column("prob_yes", justify="right")
-        ex_t.add_column("conf", justify="right")
-        ex_t.add_column("mid", justify="right")
-        for ex in examples:
-            ex_t.add_row(
-                str(ex.get("ticker", ""))[-15:],
-                f"{ex.get('secs', 0):.0f}",
-                f"{ex.get('prob_yes', 0):.3f}",
-                f"{ex.get('conf', 0):.3f}",
-                f"{ex.get('kalshi_mid', 0):.0f}",
-            )
-        console.print(ex_t)
-
-
-@replay.command("pnl")
-@click.argument("session_id", required=False)
-@click.option("--config", "config_path", default=None)
-@click.option(
-    "--results-cache",
-    default="data/market_results_cache.json",
-    help="Path to settled-market results cache",
-)
-@click.option(
-    "--trades-csv",
-    default="logs/trades.csv",
-    help="Path to the actual trade log (for DIR's realized P&L)",
-)
-@click.option("--contracts", default=1, help="Contracts per simulated trade")
-@click.option("--min-edge", default=0.10, help="Min edge to fire a simulated entry")
-def replay_pnl(session_id: str, config_path: str, results_cache: str,
-               trades_csv: str, contracts: int, min_edge: float):
-    """Phase 3 step 4.5: counterfactual P&L (DIR vs FV, hold-to-settle).
-
-    Brier validates calibration; P&L validates execution outcome. This
-    replays the recorded decision log through the production entry gates
-    using each brain's prob_yes + confidence, assumes hold-to-settlement
-    on every fired entry, and compares dollars made.
-    """
-    from btc15.config import load_config
-    from btc15.recording.shadow_pnl import analyze_pnl
-    cfg = load_config(Path(config_path) if config_path else None)
-    setup_logging("INFO", cfg.logging.log_file)
-
-    recordings_root = Path(cfg.recording.path)
-    if session_id:
-        session_dir = recordings_root / session_id
-        if not session_dir.exists():
-            console.print(f"[red]Session not found: {session_dir}[/red]")
-            return
-    else:
-        sessions = sorted(d for d in recordings_root.iterdir() if d.is_dir())
-        if not sessions:
-            console.print("[yellow]No sessions found[/yellow]")
-            return
-        session_dir = sessions[-1]
-
-    result = analyze_pnl(
-        session_dir, Path(results_cache), Path(trades_csv),
-        contracts=contracts, min_edge=min_edge,
-    )
-
-    # ── Headline table
-    summary = Table(title=f"P&L — {result.session_id}  [dim](contracts={contracts}, min_edge={min_edge:.2f})[/dim]", box=box.SIMPLE)
-    summary.add_column("scenario")
-    summary.add_column("n trades", justify="right")
-    summary.add_column("win rate", justify="right")
-    summary.add_column("total P&L ($)", justify="right")
-
-    def _pnl_color(v):
-        return "bright_green" if v > 0 else "bright_red" if v < 0 else "white"
-
-    if result.dir_realized_pnl_dollars is not None and result.dir_realized_n_round_trips:
-        c = _pnl_color(result.dir_realized_pnl_dollars)
-        summary.add_row(
-            "DIR realized (round-trips)",
-            f"{result.dir_realized_n_round_trips:,}",
-            "[dim]—[/dim]",
-            f"[{c}]${result.dir_realized_pnl_dollars:+,.2f}[/{c}]",
-        )
-    if result.dir_entries_held_pnl_dollars is not None and result.dir_entries_held_pnl_dollars != 0:
-        c = _pnl_color(result.dir_entries_held_pnl_dollars)
-        summary.add_row(
-            "DIR entries held-to-settle",
-            f"{result.dir_realized_n_round_trips:,}",
-            "[dim]—[/dim]",
-            f"[{c}]${result.dir_entries_held_pnl_dollars:+,.2f}[/{c}]",
-        )
-
-    for sim, label in [
-        (result.dir_simulated, "DIR hold-to-settle (sim)"),
-        (result.fv_simulated, "FV hold-to-settle (sim)"),
-    ]:
-        c = _pnl_color(sim.total_pnl_dollars)
-        wr = sim.win_rate
-        summary.add_row(
-            label,
-            f"{sim.n_trades:,}",
-            f"{wr:.1%}" if wr is not None else "[dim]—[/dim]",
-            f"[{c}]${sim.total_pnl_dollars:+,.2f}[/{c}]",
-        )
-    console.print(summary)
-
-    console.print(
-        f"[dim]Decision rows: {result.n_decision_rows:,}  ·  "
-        f"settled rows: {result.n_settled_rows:,}  ·  "
-        f"settled tickers: {result.settled_tickers:,}[/dim]"
-    )
-
-    # ── Per-phase breakdown
-    phase_t = Table(title="Simulated P&L by phase", box=box.SIMPLE)
-    phase_t.add_column("phase")
-    phase_t.add_column("DIR n", justify="right")
-    phase_t.add_column("DIR P&L", justify="right")
-    phase_t.add_column("DIR WR", justify="right")
-    phase_t.add_column("FV n", justify="right")
-    phase_t.add_column("FV P&L", justify="right")
-    phase_t.add_column("FV WR", justify="right")
-    dir_phase = result.dir_simulated.per_phase()
-    fv_phase = result.fv_simulated.per_phase()
-    for phase in ("early", "mid", "prime", "late"):
-        d = dir_phase.get(phase, {"n": 0, "pnl_cents": 0, "wins": 0})
-        f = fv_phase.get(phase, {"n": 0, "pnl_cents": 0, "wins": 0})
-        if d["n"] == 0 and f["n"] == 0:
-            continue
-        d_pnl = d["pnl_cents"] / 100.0
-        f_pnl = f["pnl_cents"] / 100.0
-        d_c = _pnl_color(d_pnl)
-        f_c = _pnl_color(f_pnl)
-        phase_t.add_row(
-            phase,
-            f"{d['n']:,}",
-            f"[{d_c}]${d_pnl:+,.2f}[/{d_c}]",
-            f"{d['wins']/d['n']:.1%}" if d["n"] else "—",
-            f"{f['n']:,}",
-            f"[{f_c}]${f_pnl:+,.2f}[/{f_c}]",
-            f"{f['wins']/f['n']:.1%}" if f["n"] else "—",
-        )
-    console.print(phase_t)
-
-    # ── Disagreement P&L
-    d = result.disagreement_pnl_cents
-    da_t = Table(title="Disagreement-zone P&L (who's making money on signals the other missed?)", box=box.SIMPLE)
-    da_t.add_column("category")
-    da_t.add_column("n trades", justify="right")
-    da_t.add_column("DIR P&L", justify="right")
-    da_t.add_column("FV P&L", justify="right")
-    if d.get("both_n"):
-        both_dir = d["both_dir_pnl_cents"] / 100.0
-        both_fv = d["both_fv_pnl_cents"] / 100.0
-        da_t.add_row(
-            "Both brains entered",
-            f"{d['both_n']:,}",
-            f"[{_pnl_color(both_dir)}]${both_dir:+,.2f}[/{_pnl_color(both_dir)}]",
-            f"[{_pnl_color(both_fv)}]${both_fv:+,.2f}[/{_pnl_color(both_fv)}]",
-        )
-    if d.get("dir_only_n"):
-        do = d["dir_only_pnl_cents"] / 100.0
-        da_t.add_row(
-            "DIR only (FV skipped)",
-            f"{d['dir_only_n']:,}",
-            f"[{_pnl_color(do)}]${do:+,.2f}[/{_pnl_color(do)}]",
-            "[dim]—[/dim]",
-        )
-    if d.get("fv_only_n"):
-        fo = d["fv_only_pnl_cents"] / 100.0
-        da_t.add_row(
-            "FV only (DIR skipped)",
-            f"{d['fv_only_n']:,}",
-            "[dim]—[/dim]",
-            f"[{_pnl_color(fo)}]${fo:+,.2f}[/{_pnl_color(fo)}]",
-        )
-    console.print(da_t)
-
-
-@replay.command("brier")
-@click.argument("session_id", required=False)
-@click.option("--all", "all_sessions", is_flag=True, default=False,
-              help="Aggregate across every session under data/recordings/")
-@click.option("--config", "config_path", default=None)
-@click.option(
-    "--results-cache",
-    default="data/market_results_cache.json",
-    help="Path to settled-market results cache",
-)
-def replay_brier(session_id: str, all_sessions: bool, config_path: str, results_cache: str):
-    """Phase 3: DIR vs FV Brier comparison on settled markets.
-
-    Uses the dual-brain decision rows (Phase 3 step 3+) joined to the
-    market settlement cache. Lower Brier = better calibrated. Baseline
-    is 0.25 (constant-50% predictor); the legacy ensemble's audit
-    measured 0.283.
-    """
-    from btc15.config import load_config
-    from btc15.recording.shadow_analysis import (
-        analyze_session, analyze_all_sessions, merge_results,
-    )
-    cfg = load_config(Path(config_path) if config_path else None)
-    setup_logging("INFO", cfg.logging.log_file)
-
-    recordings_root = Path(cfg.recording.path)
-    cache_path = Path(results_cache)
-
-    if all_sessions:
-        per_session = analyze_all_sessions(recordings_root, cache_path)
-        result = merge_results(per_session)
-        sub_count = len(per_session)
-    elif session_id:
-        session_dir = recordings_root / session_id
-        if not session_dir.exists():
-            console.print(f"[red]Session not found: {session_dir}[/red]")
-            return
-        result = analyze_session(session_dir, cache_path)
-        sub_count = None
-    else:
-        sessions = sorted(d for d in recordings_root.iterdir() if d.is_dir())
-        if not sessions:
-            console.print("[yellow]No sessions found[/yellow]")
-            return
-        result = analyze_session(sessions[-1], cache_path)
-        sub_count = None
-
-    # ── Summary table
-    title = result.session_id
-    if sub_count is not None:
-        title = f"{title}  [dim]({sub_count} sessions)[/dim]"
-    summary = Table(title=f"DIR vs FV — {title}", box=box.SIMPLE)
-    summary.add_column("metric")
-    summary.add_column("DIR", justify="right")
-    summary.add_column("FV", justify="right")
-    summary.add_column("baseline", justify="right", style="dim")
-    db = result.dir_scores.mean_brier
-    fb = result.fv_scores.mean_brier
-    da = result.dir_scores.directional_accuracy
-    fa = result.fv_scores.directional_accuracy
-    summary.add_row(
-        "Brier (lower = better)",
-        f"{db:.4f}" if db is not None else "—",
-        f"{fb:.4f}" if fb is not None else "—",
-        "0.2500",
-    )
-    summary.add_row(
-        "directional accuracy",
-        f"{da:.1%}" if da is not None else "—",
-        f"{fa:.1%}" if fa is not None else "—",
-        "50.0%",
-    )
-    summary.add_row(
-        "n predictions",
-        f"{result.dir_scores.n_rows:,}",
-        f"{result.fv_scores.n_rows:,}",
-        "",
-    )
-    console.print(summary)
-    console.print(
-        f"[dim]Settled markets: {result.settled_tickers}  ·  "
-        f"settled rows: {result.n_settled_rows:,} / {result.n_total_rows:,} total  ·  "
-        f"FV-eligible rows: {result.n_with_fv:,}[/dim]"
-    )
-
-    # ── Per-phase breakdown
-    if result.dir_scores.per_phase:
-        phase_t = Table(title="Brier by phase", box=box.SIMPLE)
-        phase_t.add_column("phase")
-        phase_t.add_column("n", justify="right")
-        phase_t.add_column("DIR Brier", justify="right")
-        phase_t.add_column("FV Brier", justify="right")
-        for phase in ("early", "mid", "prime", "late"):
-            d_cell = result.dir_scores.per_phase.get(phase, {"n": 0, "brier": 0.0})
-            f_cell = result.fv_scores.per_phase.get(phase, {"n": 0, "brier": 0.0})
-            if d_cell["n"] == 0 and f_cell["n"] == 0:
-                continue
-            phase_t.add_row(
-                phase,
-                f"{d_cell['n']:,}",
-                f"{d_cell['brier']/d_cell['n']:.4f}" if d_cell["n"] else "—",
-                f"{f_cell['brier']/f_cell['n']:.4f}" if f_cell["n"] else "—",
-            )
-        console.print(phase_t)
-
-    # ── Confidence-band breakdown
-    if result.dir_scores.per_conf_band:
-        cb_t = Table(title="By confidence band (does higher confidence predict better?)", box=box.SIMPLE)
-        cb_t.add_column("conf")
-        cb_t.add_column("DIR n", justify="right")
-        cb_t.add_column("DIR Brier", justify="right")
-        cb_t.add_column("DIR WR", justify="right")
-        cb_t.add_column("FV n", justify="right")
-        cb_t.add_column("FV Brier", justify="right")
-        cb_t.add_column("FV WR", justify="right")
-        for band in ("0.0–0.2", "0.2–0.4", "0.4–0.6", "0.6–0.8", "0.8–1.0"):
-            d_cell = result.dir_scores.per_conf_band.get(band, {"n": 0, "brier": 0.0, "won": 0})
-            f_cell = result.fv_scores.per_conf_band.get(band, {"n": 0, "brier": 0.0, "won": 0})
-            if d_cell["n"] == 0 and f_cell["n"] == 0:
-                continue
-            cb_t.add_row(
-                band,
-                f"{d_cell['n']:,}",
-                f"{d_cell['brier']/d_cell['n']:.4f}" if d_cell["n"] else "—",
-                f"{d_cell['won']/d_cell['n']:.1%}" if d_cell["n"] else "—",
-                f"{f_cell['n']:,}",
-                f"{f_cell['brier']/f_cell['n']:.4f}" if f_cell["n"] else "—",
-                f"{f_cell['won']/f_cell['n']:.1%}" if f_cell["n"] else "—",
-            )
-        console.print(cb_t)
-
-    # ── Agreement matrix
-    if result.agreement:
-        ag_t = Table(title="Agreement / disagreement (who's right?)", box=box.SIMPLE)
-        ag_t.add_column("case")
-        ag_t.add_column("n", justify="right")
-        ag_t.add_column("DIR correct", justify="right")
-        ag_t.add_column("FV correct", justify="right")
-        ordered = ["agree_yes", "agree_no", "dir_yes_fv_no", "dir_no_fv_yes"]
-        for key in ordered:
-            cell = result.agreement.get(key)
-            if not cell or cell["n"] == 0:
-                continue
-            ag_t.add_row(
-                key,
-                f"{cell['n']:,}",
-                f"{cell['dir_correct']/cell['n']:.1%}",
-                f"{cell['fv_correct']/cell['n']:.1%}",
-            )
-        console.print(ag_t)
-
-
 @replay.command("analyze")
 @click.argument("session_id")
 @click.option("--config", "config_path", default=None)
@@ -1161,3 +720,143 @@ def replay_analyze(session_id: str, config_path: str, results_cache: str):
     )
     import json as _json
     console.print(_json.dumps(summary, indent=2))
+
+
+# ── R1 measurement: does the model beat the market? ──────────────────────────
+
+@cli.command()
+@click.argument("session_id", required=False)
+@click.option("--config", "config_path", default=None)
+@click.option("--results-cache", default="data/market_results_cache.json",
+              help="Settled-market results cache (ticker → yes/no)")
+@click.option("--dedup-seconds", default=15.0,
+              help="Thin each ticker to one observation per N seconds")
+@click.option("--suggest", is_flag=True, default=False,
+              help="Print the enabled_slices list the data supports")
+@click.option("--calibration", is_flag=True, default=False,
+              help="Also print predicted-vs-realized calibration deciles")
+def score(session_id: str, config_path: str, results_cache: str,
+          dedup_seconds: float, suggest: bool, calibration: bool):
+    """Score the model AGAINST THE MARKET MID, sliced by phase × price band.
+
+    This is the R1 gate. A good Brier means nothing on its own — the only
+    question that matters is whether we beat the price we could have just
+    accepted. Slices whose paired bootstrap CI clears zero are the ones
+    that earn a place in core.enabled_slices.
+
+      ./run.sh score                 # newest session
+      ./run.sh score 16AUG14:30      # a specific session
+      ./run.sh score --suggest       # emit the config line to paste
+    """
+    import json
+    from btc15.config import load_config
+    from btc15.core.score import (
+        load_observations, score_slices, calibration_buckets,
+        enabled_slice_suggestion,
+    )
+
+    cfg = load_config(Path(config_path) if config_path else None)
+    root = Path(cfg.recording.path)
+    if not root.exists():
+        console.print(f"[bright_red]No recordings at {root}[/bright_red]")
+        return
+
+    if session_id:
+        session_dir = root / session_id
+    else:
+        candidates = sorted(
+            (d for d in root.iterdir() if d.is_dir() and (d / "decisions.jsonl").exists()),
+            key=lambda d: d.stat().st_mtime,
+        )
+        if not candidates:
+            console.print("[yellow]No sessions with decisions.jsonl yet.[/yellow]")
+            return
+        session_dir = candidates[-1]
+
+    decisions = session_dir / "decisions.jsonl"
+    if not decisions.exists():
+        console.print(f"[bright_red]No decisions.jsonl in {session_dir}[/bright_red]")
+        return
+
+    cache_path = Path(results_cache)
+    if not cache_path.exists():
+        console.print(
+            f"[yellow]No results cache at {cache_path}.[/yellow]\n"
+            f"Run [cyan]./run.sh replay enrich {session_dir.name}[/cyan] first "
+            f"to fetch settled outcomes."
+        )
+        return
+    raw = json.loads(cache_path.read_text())
+    outcomes = {
+        t: rec.get("result")
+        for t, rec in raw.items()
+        if isinstance(rec, dict) and rec.get("status") == "finalized" and rec.get("result")
+    }
+
+    obs = load_observations(decisions, outcomes, dedup_seconds=dedup_seconds)
+    if not obs:
+        console.print(
+            "[yellow]No scoreable observations — decisions logged but no "
+            "matching settled outcomes yet.[/yellow]"
+        )
+        return
+
+    reports = score_slices(obs)
+    table = Table(title=f"Model vs Market — {session_dir.name}  (n={len(obs)})",
+                  box=None, header_style="bold dim")
+    table.add_column("Slice", style="cyan")
+    table.add_column("N", justify="right")
+    table.add_column("Brier(model)", justify="right")
+    table.add_column("Brier(mkt)", justify="right")
+    table.add_column("Δ", justify="right")
+    table.add_column("95% CI", justify="right")
+    table.add_column("Verdict")
+
+    verdict_color = {
+        "BEATS_MARKET": "bright_green",
+        "loses_to_market": "bright_red",
+        "inconclusive": "yellow",
+        "insufficient": "dim",
+        "no_market_data": "dim",
+    }
+    for r in reports:
+        v = r.verdict
+        ci = (f"[{r.delta_ci_low:+.4f}, {r.delta_ci_high:+.4f}]"
+              if r.delta_ci_low is not None else "—")
+        table.add_row(
+            r.key, str(r.n), f"{r.brier_model:.4f}",
+            f"{r.brier_market:.4f}" if r.brier_market is not None else "—",
+            f"{r.delta:+.4f}" if r.delta is not None else "—",
+            ci,
+            f"[{verdict_color.get(v, 'white')}]{v}[/{verdict_color.get(v, 'white')}]",
+        )
+    console.print(table)
+    console.print(
+        "\n[dim]Δ = Brier(market) − Brier(model). Positive means we are more "
+        "accurate than the price. Only slices whose CI is entirely above zero "
+        "have earned real money.[/dim]"
+    )
+
+    if calibration:
+        cal = Table(title="Calibration", box=None, header_style="bold dim")
+        cal.add_column("Predicted")
+        cal.add_column("N", justify="right")
+        cal.add_column("Mean p", justify="right")
+        cal.add_column("Realized", justify="right")
+        for row in calibration_buckets(obs):
+            cal.add_row(row["bucket"], str(row["n"]),
+                        f"{row['mean_predicted']:.3f}", f"{row['realized']:.3f}")
+        console.print(cal)
+
+    if suggest:
+        winners = enabled_slice_suggestion(reports)
+        console.print("\n[bold]Suggested config.yaml:[/bold]")
+        if winners:
+            console.print("core:\n  enabled_slices:")
+            for k in winners:
+                console.print(f"    - \"{k}\"")
+        else:
+            console.print(
+                "[yellow]  # No slice beats the market yet — keep "
+                "enabled_slices empty and stay in observation mode.[/yellow]"
+            )

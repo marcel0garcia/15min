@@ -301,13 +301,8 @@ def build_positions_panel(state: dict) -> Panel:
         return Panel("[dim]No open positions[/dim]", title="Positions", border_style="dim")
 
     persona_colors = {
-        # Current modes:
-        "dir": "bright_cyan",        # directional (model-driven) entries
-        "mm":  "bright_yellow",      # market-maker quote fills
-        # Legacy / fallback:
-        "auto": "white",
-        "adopted": "dim",
-        "sniper": "bright_magenta", "scalper": "bright_cyan", "arb": "bright_yellow",
+        "core": "bright_cyan",       # the v3 decision core — the only source now
+        "adopted": "dim",            # reconciled from the exchange, not us
     }
     table = Table(box=box.SIMPLE, show_header=True, header_style="bold dim", padding=(0, 1))
     table.add_column("Ticker", style="cyan", no_wrap=True)
@@ -569,30 +564,6 @@ def build_pnl_chart(state: dict) -> Panel:
         title="[bold]PnL[/bold]",
         border_style=trend_color,
     )
-
-
-def build_personas_panel(state: dict) -> Panel:
-    personas = state.get("personas", {})
-    if not personas:
-        return Panel("[dim]Personas inactive[/dim]", title="Personas")
-
-    lines = []
-    icons = {"sniper": ("SNP", "bright_magenta"), "scalper": ("SCA", "bright_cyan"), "arb": ("ARB", "bright_yellow")}
-    for name, info in personas.items():
-        tag, color = icons.get(name, (name[:3].upper(), "white"))
-        pnl = info.get("daily_pnl", 0)
-        pnl_c = "bright_green" if pnl >= 0 else "bright_red"
-        trades = info.get("daily_trades", 0)
-        positions = info.get("positions", 0)
-        resting = info.get("resting_orders", 0)
-        inv = info.get("inventory", "")
-        inv_str = f" inv={inv}" if inv else ""
-        lines.append(
-            f"[{color}][bold]{tag}[/bold][/{color}] "
-            f"PnL:[{pnl_c}]${pnl:+.2f}[/{pnl_c}] "
-            f"T:{trades} P:{positions} R:{resting}{inv_str}"
-        )
-    return Panel("\n".join(lines), title="[bold]Personas[/bold]", border_style="magenta")
 
 
 def build_event_log_panel(state: dict) -> Panel:

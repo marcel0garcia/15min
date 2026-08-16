@@ -49,12 +49,31 @@ convention as fair_value.fair_value().
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Optional, Sequence
 
-from btc15.models.fair_value import FairValueOutput, _norm_cdf, SECONDS_PER_YEAR
 
-
+SECONDS_PER_YEAR = 365.0 * 24.0 * 3600.0
 AVG_WINDOW_SEC = 60.0
+
+
+@dataclass
+class FairValueOutput:
+    prob_yes: float        # in [0, 1]
+    prob_no: float         # = 1 - prob_yes
+    z_score: float         # standardized distance in the active regime
+    confidence: float      # |prob_yes - 0.5| * 2, in [0, 1]
+    sigma_used: float      # annualized sigma that fed the formula
+    tau_seconds: float     # raw seconds to settlement
+    inputs: dict           # everything that fed the calc, for logging
+    degenerate: bool       # True iff inputs were missing/invalid
+    reason: Optional[str] = None  # diagnostic when degenerate=True
+
+
+def _norm_cdf(z: float) -> float:
+    """Standard normal CDF via erf — pure stdlib, keeps scipy off the
+    engine's 1 Hz hot path."""
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
 
 def accrued_average(
