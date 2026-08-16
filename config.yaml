@@ -66,6 +66,11 @@ strategy:
   # shadow — logged in decision_log + rendered dim in Signals panel.
   # Flip to "ensemble" to revert to legacy DIR without code change.
   production_brain: "fair_value"
+  # FV pricing model. "twap" prices the real settlement instrument (mean of
+  # the final 60s of BRTI): tau_eff = tau - 40s outside the final minute,
+  # and conditions on the locked-in accrued average inside it. "endpoint"
+  # is the legacy closing-print formula — keep for replay A/B only.
+  fair_value_pricing: "twap"
   # Paper-mode synthetic bankroll. Ignored in live mode.
   # Used for sizing + dashboard so a depleted Kalshi paper account doesn't
   # silently kill every signal at the min_single_trade_usd gate.

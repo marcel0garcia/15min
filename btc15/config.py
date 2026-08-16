@@ -112,6 +112,16 @@ class StrategyConfig:
     # (dim) in the Signals panel.
     production_brain: str = "fair_value"
 
+    # How the fair-value brain prices the contract:
+    #   "twap"      (default) prices the actual settlement instrument — the
+    #               mean of the final 60s of BRTI. Outside the final minute
+    #               this shortens the variance horizon (tau_eff = tau - 40s);
+    #               inside it, the observed part of the average is locked in
+    #               and the pricer conditions on it (settlement_twap.py).
+    #   "endpoint"  legacy N(ln(S/K)/(sigma*sqrt(tau))) on the closing print
+    #               (fair_value.py). Kept for A/B comparison in replays.
+    fair_value_pricing: str = "twap"
+
     # Paper-mode synthetic starting balance. In paper mode the engine ignores
     # whatever the Kalshi API reports for available_usd (which depletes from
     # accumulated paper losses and can fall below min_single_trade_usd, silently

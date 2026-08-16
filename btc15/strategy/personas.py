@@ -1412,9 +1412,17 @@ class AutoTrader:
         if contracts <= 0:
             return None
 
+        # Under the FV brain prob_binary_options is None (no BSM
+        # sub-component) — the lock gate already fell back to prob_yes, so
+        # report whichever probability actually cleared the gate.
+        lock_prob = (
+            output.prob_binary_options
+            if output.prob_binary_options is not None
+            else output.prob_yes
+        )
         log.info(
             f"{self.tag} SETTLEMENT LOCK: {ticker} {side.upper()} | "
-            f"bsm={output.prob_binary_options:.0%} conf={output.confidence:.0%} "
+            f"p={lock_prob:.0%} conf={output.confidence:.0%} "
             f"edge={edge:+.1%} ×{contracts} @ {raw_price}¢ | {secs:.0f}s left"
         )
 
@@ -1426,7 +1434,7 @@ class AutoTrader:
             price_cents=raw_price,
             post_only=False,
             time_in_force="ioc",
-            reason=f"settlement_lock bsm={output.prob_binary_options:.0%} {secs:.0f}s",
+            reason=f"settlement_lock p={lock_prob:.0%} {secs:.0f}s",
         )
 
     # ── GTC escalation ────────────────────────────────────────────────────────

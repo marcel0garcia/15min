@@ -33,6 +33,10 @@ from btc15.config import AppConfig
 from btc15.feeds.aggregator import PriceAggregator
 from btc15.feeds.brti_feed import BRTIPriceFeed
 from btc15.models.fair_value import fair_value as _fair_value
+from btc15.models.settlement_twap import (
+    twap_fair_value as _twap_fair_value,
+    accrued_average as _accrued_average,
+)
 from btc15.models.vol_nowcast import close_to_close as _vol_nowcast
 from btc15.kalshi.client import KalshiClient, KalshiAPIError
 from btc15.kalshi.models import (
@@ -746,6 +750,7 @@ class StrategyEngine:
         except Exception:
             sigma_nowcast = 0.80  # safe annualized-vol fallback
             vol_est = None
+            vol_pairs = []
         self.state["sigma_nowcast"] = round(sigma_nowcast, 4)
 
         # Fetch balance once for the whole scan cycle
@@ -879,12 +884,30 @@ class StrategyEngine:
             # surfaced in the dashboard, never drive AutoTrader yet. When
             # production_brain flips to "fair_value" the existing personas
             # path consumes this output instead of the ensemble's.
-            fv = _fair_value(
-                spot=current_price,
-                strike=market.strike_price,
-                sigma=sigma_nowcast,
-                tau_seconds=secs,
-            )
+            if getattr(self.cfg.strategy, "fair_value_pricing", "twap") == "twap":
+                # KXBTC15M settles on the MEAN of the final 60 seconds of
+                # BRTI, not the closing print. Outside the final minute this
+                # shortens the variance horizon (tau_eff = tau - 40s); inside
+                # it, the observed portion of the average is locked in and
+                # the pricer conditions on it.
+                acc_avg, acc_n = _accrued_average(
+                    vol_pairs, now_ts=now_utc.timestamp(), tau_seconds=secs,
+                )
+                fv = _twap_fair_value(
+                    spot=current_price,
+                    strike=market.strike_price,
+                    sigma=sigma_nowcast,
+                    tau_seconds=secs,
+                    accrued_avg=acc_avg,
+                    accrued_count=acc_n,
+                )
+            else:
+                fv = _fair_value(
+                    spot=current_price,
+                    strike=market.strike_price,
+                    sigma=sigma_nowcast,
+                    tau_seconds=secs,
+                )
             # First market in the scan iteration (soonest-to-settle per
             # Kalshi's natural ordering) drives the BTC tape footer's
             # fair_value / z readout. Per-market values still go into the
