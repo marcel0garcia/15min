@@ -25,6 +25,12 @@ class KalshiRawTap:
     def attach(self, ws) -> None:
         if not self.recorder.enabled:
             return
+        if not getattr(self.recorder, "kalshi_frames_enabled", True):
+            # Don't just drop the writes — never register the handlers, so
+            # the JSON round-trip cost disappears too. At ~420 frames/sec
+            # that is the difference between 0.5 GB/hour and nothing.
+            log.info("[REC-KAL] Raw frame capture disabled (recording.kalshi_frames=false)")
+            return
         ws.on("orderbook_snapshot", self._on_snapshot)
         ws.on("orderbook_delta", self._on_delta)
         ws.on("trade", self._on_trade)

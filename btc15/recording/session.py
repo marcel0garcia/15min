@@ -27,6 +27,35 @@ log = logging.getLogger(__name__)
 BRAIN_VERSION = "core-v3-twap"
 
 
+# The modules that together decide what the bot does. A recording is only
+# comparable to a replay when this fingerprint matches, and `git_commit` is
+# not a substitute: during development the working tree changes constantly
+# while HEAD does not, so recordings made minutes apart by materially
+# different policies would otherwise look identical.
+_CORE_SOURCES = (
+    "core/policy.py", "core/pricer.py", "core/sigma.py", "core/fees.py",
+    "core/paper.py", "models/settlement_twap.py", "models/vol_nowcast.py",
+)
+
+
+def _core_fingerprint() -> str:
+    """12-char hash of the decision code's source, stamped into meta.json.
+
+    Answers "which brain produced these rows?" precisely enough that the
+    replay harness can refuse to compare itself against a recording made by
+    a different policy — see tests/test_replay.py.
+    """
+    h = hashlib.sha256()
+    base = Path(__file__).resolve().parent.parent
+    for rel in _CORE_SOURCES:
+        try:
+            h.update(rel.encode())
+            h.update((base / rel).read_bytes())
+        except OSError:
+            h.update(b"<missing>")
+    return h.hexdigest()[:12]
+
+
 def _git_commit() -> Optional[str]:
     try:
         out = subprocess.check_output(
@@ -112,6 +141,7 @@ class SessionRecorder:
         self.start_ts: float = 0.0
         self.config_hash: str = ""
         self.git_commit: Optional[str] = None
+        self.core_fingerprint: str = _core_fingerprint()
         self.brain_version: str = BRAIN_VERSION
 
         if not self.enabled:
@@ -123,7 +153,11 @@ class SessionRecorder:
         self.root = Path(cfg.recording.path) / self.session_id
         self.root.mkdir(parents=True, exist_ok=True)
 
-        self.kalshi_writer = _JSONLWriter(self.root / "kalshi_frames.jsonl")
+        self.record_kalshi_frames = bool(getattr(cfg.recording, "kalshi_frames", True))
+        self.kalshi_writer = (
+            _JSONLWriter(self.root / "kalshi_frames.jsonl")
+            if self.record_kalshi_frames else None
+        )
         self.venue_writer = _JSONLWriter(self.root / "venue_ticks.jsonl")
         self.decision_writer = _JSONLWriter(self.root / "decisions.jsonl")
 
@@ -146,14 +180,17 @@ class SessionRecorder:
             "git_commit": self.git_commit,
             "config_hash": self.config_hash,
             "brain_version": self.brain_version,
+            "core_fingerprint": self.core_fingerprint,
             "mode": mode,
+            "session_tag": getattr(cfg, "session_tag", None),
             "recording_path": str(self.root),
         }
         (self.root / "meta.json").write_text(json.dumps(meta, indent=2))
         self._append_session_index(meta)
         log.info(
             f"[REC] Session {self.session_id} mode={mode} brain={self.brain_version} "
-            f"git={self.git_commit} cfg_hash={self.config_hash} path={self.root}"
+            f"core={self.core_fingerprint} git={self.git_commit} "
+            f"cfg_hash={self.config_hash} path={self.root}"
         )
 
     # ── Public write API (called by tap / venue connectors / decision log) ──
@@ -161,6 +198,10 @@ class SessionRecorder:
     def write_kalshi(self, record: dict) -> None:
         if self.enabled and self.kalshi_writer is not None:
             self.kalshi_writer.write(record)
+
+    @property
+    def kalshi_frames_enabled(self) -> bool:
+        return self.enabled and self.kalshi_writer is not None
 
     def write_venue(self, record: dict) -> None:
         if self.enabled and self.venue_writer is not None:

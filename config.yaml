@@ -54,8 +54,18 @@ core:
   max_single_trade_usd: 10.00
   min_single_trade_usd: 1.00
   max_per_market_usd: 10.00
-  max_open_positions: 3
+  max_open_positions: 3     # inert: KXBTC15M lists ONE market at a time
   daily_loss_limit_usd: 50.00
+
+  # ENTRY CADENCE — the only lever on trade count.
+  # Verified against the live series: KXBTC15M opens exactly one market per
+  # 15-minute window (open_time == the previous window's close_time), strike
+  # set at-the-money at open. So the ceiling is 96 markets/day, and with
+  # max_entries_per_market: 1 the bot gets exactly one shot per window.
+  # Raise this to permit re-entry after an exit / scaling in as the model
+  # sharpens late in the window. 1 = the original hold-to-settle behavior.
+  max_entries_per_market: 1
+  entry_cooldown_sec: 0.0   # wait this long after a close before re-entering
 
   # EXIT — one rule. Leave only if the model now wants the OTHER side by
   # this much EV and there is still time for the flip to pay. No loss cuts,
@@ -87,9 +97,48 @@ core:
   fee_multiplier: 1.0
 
   # VOL NOWCAST — blended fast/slow realized vol feeding the TWAP pricer.
+  #
+  # ⚠ These three were declared here from day one but never reached the
+  #   engine, which called blended_sigma() with hard-coded defaults. Wired
+  #   as of this change; so are the clamp bounds below, which used to live
+  #   as module constants in models/vol_nowcast.py.
   sigma_fast_sec: 60.0
   sigma_slow_sec: 300.0
   sigma_fast_weight: 0.6
+
+  # ⚠ sigma_floor IS THE MOST DANGEROUS NUMBER IN THIS FILE.
+  #   It exists so one quiet minute cannot push fair value to a false
+  #   coin-flip — but set too LOW it does the opposite: a floored sigma
+  #   understates settlement variance, driving P(YES) toward 0/1 at exactly
+  #   the extreme strikes we intend to trade. Measured on the 19AUG v3
+  #   session: 27% of scans ran at this floor, and 27.5% of rows priced
+  #   beyond 0.999 while the market quoted 0.99. BTC realized vol is
+  #   typically 0.40-0.60 annualized. SWEEP THIS. Do not inherit the guess.
+  sigma_floor: 0.20
+  sigma_ceiling: 5.0
+  sigma_min_samples: 10
+  # Applied after blending, before the clamp. >1 widens the distribution
+  # (humbler probabilities), <1 sharpens it. The single knob that trades
+  # conviction against calibration — set it from `score --calibration`.
+  sigma_scale: 1.0
+
+  # SLICE GRID — the (phase × band) boundaries R1 measures and R2 gates on.
+  # Previously hard-coded in core/pricer.py, which made the whole R1/R2
+  # methodology rest on three unmeasured constants.
+  phase_early_sec: 540.0    # >  this -> "early"
+  phase_mid_sec: 300.0      # >  this -> "mid"
+  phase_prime_sec: 90.0     # >  this -> "prime", else "late"
+  band_extreme_cents: 15.0  # <= this from either end -> "extreme"
+  band_outer_cents: 30.0    # <= this -> "outer", else "middle"
+
+  # ENGINE CADENCES — were module constants in core/engine.py. scan_interval
+  # bounds how fast we can react inside the final minute, where the TWAP
+  # lock-in edge lives.
+  scan_interval_sec: 1.0
+  ob_refresh_interval_sec: 4.0
+  settlement_check_interval_sec: 5.0
+  brti_hz: 4.0
+  venue_staleness_sec: 5.0
 
 logging:
   level: "INFO"
@@ -110,6 +159,12 @@ recording:
   venue_gemini: false
   grid_interval_sec: 1.0
   venue_max_msg_per_sec: 10
+  # Raw Kalshi WS frames cost ~0.5 GB/hour (12 GB/day) — they make 24/7
+  # recording impossible. Every decision row now carries the top 5 levels of
+  # both sides, which is all `sweep` needs to simulate fills, so leave this
+  # OFF for unattended running and switch it on only when you want
+  # between-scan microstructure detail.
+  kalshi_frames: false
 
 database:
   path: "data/btc15.db"

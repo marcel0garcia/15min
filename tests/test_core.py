@@ -204,6 +204,10 @@ def _q(**kw) -> MarketQuote:
         ticker="T", strike=100_000.0, spot=100_000.0, secs=300.0, phase="mid",
         prob_yes=0.75, confidence=0.5, z_score=1.0, sigma=0.5, degenerate=False,
         yes_bid=60.0, yes_ask=62.0,
+        # A healthy vol nowcast by default: plenty of BRTI history behind it
+        # and no clamp binding. Tests that care about the warm-up guards
+        # override these explicitly.
+        sigma_clamped=False, tick_span_sec=600.0,
     )
     base.update(kw)
     return MarketQuote(**base)
@@ -259,6 +263,138 @@ def test_no_duplicate_position():
     p.record_open(Position(ticker="T", side="yes", contracts=5, entry_cents=60,
                            cost_usd=3.0, fees_usd=0.05, opened_ts=0.0, trade_id="x"))
     assert p.evaluate_entry(_q(), 100.0).reject_gate == "already_positioned"
+
+
+def test_entry_blocked_during_warmup():
+    """The 2026-08-19 startup bug: entering before enough BRTI history exists
+    to trust sigma. The engine fired 0.2s after start on a floored sigma,
+    then flipped out four seconds later at a loss."""
+    p = _policy(warmup_sec=120.0)
+    d = p.evaluate_entry(_q(tick_span_sec=5.0), bankroll_usd=100.0)
+    assert d.kind == "none"
+    assert d.reject_gate == "warmup"
+    # ...and clears once history accumulates.
+    assert p.evaluate_entry(_q(tick_span_sec=300.0), bankroll_usd=100.0).kind == "enter"
+
+
+def test_entry_blocked_while_sigma_is_clamped():
+    """A floored sigma understates settlement variance, which drives P(YES)
+    to false certainty at exactly the extreme strikes we want to trade."""
+    p = _policy()
+    d = p.evaluate_entry(_q(sigma_clamped=True), bankroll_usd=100.0)
+    assert d.kind == "none"
+    assert d.reject_gate == "sigma_clamped"
+    # The guard is a knob, so the sweep can measure whether it costs us.
+    p2 = _policy(reject_clamped_sigma=False)
+    assert p2.evaluate_entry(_q(sigma_clamped=True), bankroll_usd=100.0).kind == "enter"
+
+
+def test_crossed_book_is_refused():
+    """bid STRICTLY above ask means our cache is stale, not that the market
+    is offering riskless arbitrage. Observed live 2026-08-19 (bid 85/ask 84)."""
+    p = _policy()
+    d = p.evaluate_entry(_q(yes_bid=85.0, yes_ask=84.0), bankroll_usd=100.0)
+    assert d.kind == "none"
+    assert d.reject_gate == "crossed_book"
+
+
+def test_locked_book_is_tradeable():
+    """bid == ask means the best YES bid and best NO bid sum to exactly 100
+    — a zero spread, not corruption. Rejecting these killed 60-95% of scans
+    in the 19AUG sessions when the guard used >= instead of >."""
+    q = _q(yes_bid=62.0, yes_ask=62.0)
+    assert q.locked is True
+    assert q.crossed is False
+    assert _policy().evaluate_entry(q, bankroll_usd=100.0).kind == "enter"
+
+
+def test_entry_budget_allows_reentry_after_close():
+    """KXBTC15M lists one market at a time, so max_entries_per_market is the
+    only lever that can lift trade count above one per window."""
+    p = _policy(max_entries_per_market=1)
+    d = p.evaluate_entry(_q(), bankroll_usd=100.0)
+    assert d.kind == "enter"
+    p.record_open(Position(
+        ticker="T", side="yes", contracts=10, entry_cents=62.0, cost_usd=6.2,
+        fees_usd=0.02, opened_ts=0.0, trade_id="x",
+    ))
+    p.record_close("T", 0.0, now_ts=1000.0)
+    assert p.evaluate_entry(_q(), bankroll_usd=100.0).reject_gate == "max_entries_per_market"
+
+    p2 = _policy(max_entries_per_market=2, entry_cooldown_sec=30.0)
+    p2.record_open(Position(
+        ticker="T", side="yes", contracts=10, entry_cents=62.0, cost_usd=6.2,
+        fees_usd=0.02, opened_ts=0.0, trade_id="x",
+    ))
+    p2.record_close("T", 0.0, now_ts=1000.0)
+    # Inside the cooldown -> blocked; past it -> allowed.
+    assert p2.evaluate_entry(_q(), 100.0, now_ts=1010.0).reject_gate == "entry_cooldown"
+    assert p2.evaluate_entry(_q(), 100.0, now_ts=1040.0).kind == "enter"
+
+
+def test_sigma_scale_widens_the_distribution():
+    """sigma_scale is the conviction-vs-calibration knob: >1 must produce
+    strictly humbler probabilities on the same ticks."""
+    from btc15.core.sigma import SigmaConfig
+    ticks = [(1000.0 + i, 100_000.0 * (1 + 0.00002 * ((i % 7) - 3))) for i in range(400)]
+    base = blended_sigma(ticks, now_ts=1400.0, cfg=SigmaConfig(scale=1.0))
+    wide = blended_sigma(ticks, now_ts=1400.0, cfg=SigmaConfig(scale=2.0))
+    assert wide.sigma > base.sigma
+    assert wide.sigma_raw == base.sigma_raw     # scale applies after blending
+
+
+def test_sigma_floor_binding_is_reported():
+    """The floor is the most dangerous knob in the repo; when it binds we
+    must be able to see it in the recordings."""
+    from btc15.core.sigma import SigmaConfig
+    flat = [(1000.0 + i, 100_000.0) for i in range(400)]   # zero realized vol
+    n = blended_sigma(flat, now_ts=1400.0, cfg=SigmaConfig(floor=0.35))
+    assert n.sigma == 0.35
+    assert n.clamped is True
+    assert n.sigma_raw < 0.35
+
+
+def test_bootstrap_clusters_by_market_not_by_scan():
+    """The R1 gate must not promote a slice on five coin flips.
+
+    Before this, the CI resampled individual scan rows. A 15-minute window
+    contributes dozens of rows sharing one outcome, so the interval came out
+    roughly sqrt(rows-per-market) times too narrow and a slice could reach
+    `enabled_slices` — and real money — on a handful of markets.
+    """
+    from btc15.core.score import Observation, score_slices
+
+    def build(n_markets, per_market):
+        out = []
+        for m in range(n_markets):
+            outcome = m % 2
+            for i in range(per_market):
+                out.append(Observation(
+                    ticker=f"T{m}", phase="late", band="extreme",
+                    p_model=0.70 + 0.001 * i, p_market=0.68,
+                    outcome=outcome, secs=60.0,
+                ))
+        return out
+
+    few = score_slices(build(5, 40))[0]
+    assert few.n == 200 and few.n_markets == 5
+    assert few.verdict == "insufficient", "5 markets must never be promotable"
+
+    # Same rows-per-market, more markets => a tighter interval. The width
+    # must track the market count, not the scan count.
+    many = score_slices(build(60, 40))[0]
+    assert many.n_markets == 60
+    wide = few.delta_ci_high - few.delta_ci_low
+    narrow = many.delta_ci_high - many.delta_ci_low
+    assert narrow < wide
+
+    # And scanning the SAME markets more often must not narrow the interval
+    # much — that is the autocorrelation the cluster bootstrap absorbs.
+    dense = score_slices(build(60, 160))[0]
+    dense_width = dense.delta_ci_high - dense.delta_ci_low
+    assert dense_width > narrow * 0.5, (
+        "4x the scans on the same markets should not meaningfully shrink the CI"
+    )
 
 
 def test_max_open_positions():

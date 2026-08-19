@@ -44,13 +44,14 @@ against a drained book.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 from btc15.core.fees import (
     DEFAULT_MULTIPLIER, TAKER_RATE, taker_fee_cents_per_contract,
 )
-from btc15.core.pricer import MarketQuote, price_band
+from btc15.core.pricer import DEFAULT_GRID, MarketQuote, SliceGrid, price_band
 
 log = logging.getLogger(__name__)
 
@@ -120,6 +121,28 @@ class PolicyConfig:
     exit_flip_min_ev_cents: float = 2.0   # model must want the OTHER side this much
     exit_min_seconds: float = 120.0       # ...and this much time must remain
 
+    # Input-sanity guards on the vol nowcast. NOT strategy gates — these
+    # exist because of an observed failure, not a hunch. On 2026-08-19 the
+    # engine fired 0.2s after startup: sigma was pinned at its 0.20 floor
+    # (no BRTI history yet), the model priced 0.996 against a market at
+    # 0.905, it bought 10 contracts at 91c, and four seconds later — once
+    # real ticks arrived and sigma rose — the same model wanted the other
+    # side by 13.7c and flipped out for a loss. Both legs were sigma
+    # instability. Neither was information.
+    warmup_sec: float = 120.0          # BRTI history required before entering
+    reject_clamped_sigma: bool = True  # never enter while sigma is at a clamp
+
+    # Entry cadence. KXBTC15M lists exactly one market at a time, so
+    # max_open_positions can never bind and one-shot-per-window is the
+    # real constraint on trade count. max_entries_per_market = 1 is the
+    # original hold-to-settle behavior; > 1 permits re-entry after an exit
+    # (and, with it, scaling into a market as the model sharpens late).
+    max_entries_per_market: int = 1
+    entry_cooldown_sec: float = 0.0
+
+    # Slice grid — the (phase x band) boundaries the slice gate reads.
+    grid: SliceGrid = field(default_factory=lambda: DEFAULT_GRID)
+
     # Execution
     slippage_cents: int = 1               # limit padding on IOC entries
 
@@ -182,19 +205,44 @@ class Policy:
         self.realized_pnl_usd: float = 0.0
         self.halted: bool = False
         self.halt_reason: str = ""
+        # Per-market entry budget and cooldown clock. Keyed by ticker and
+        # never pruned during a session — a 15-minute market is gone long
+        # before the dict is worth trimming.
+        self.entries_by_ticker: dict[str, int] = {}
+        self.last_close_ts: dict[str, float] = {}
 
     # ── Entries ──────────────────────────────────────────────────────────────
 
-    def evaluate_entry(self, q: MarketQuote, bankroll_usd: float) -> Decision:
+    def evaluate_entry(
+        self, q: MarketQuote, bankroll_usd: float, now_ts: float | None = None,
+    ) -> Decision:
         """One market, one scan. Returns an 'enter' or 'none' Decision;
-        the reject_gate field always says which test failed."""
+        the reject_gate field always says which test failed.
+
+        Pure with respect to market data: calling it never mutates the
+        policy. That is what lets the engine shadow-evaluate on every scan
+        even when auto_trade is off, so `reject_gate` telemetry exists in
+        signal-only sessions instead of being uniformly null.
+        """
         d = Decision(kind="none", ticker=q.ticker)
+        if now_ts is None:
+            now_ts = time.time()
 
         if self.halted:
             d.reject_gate = "halted"
             return d
         if q.degenerate:
             d.reject_gate = "degenerate_quote"
+            return d
+        if q.crossed:
+            # Not a strategy gate — a data-sanity guard. See MarketQuote.crossed.
+            d.reject_gate = "crossed_book"
+            return d
+        if self.cfg.warmup_sec > 0 and q.tick_span_sec < self.cfg.warmup_sec:
+            d.reject_gate = "warmup"
+            return d
+        if self.cfg.reject_clamped_sigma and q.sigma_clamped:
+            d.reject_gate = "sigma_clamped"
             return d
         # 1. WINDOW
         if not (self.cfg.min_seconds <= q.secs <= self.cfg.max_seconds):
@@ -203,6 +251,14 @@ class Policy:
         if q.ticker in self.positions:
             d.reject_gate = "already_positioned"
             return d
+        if self.entries_by_ticker.get(q.ticker, 0) >= self.cfg.max_entries_per_market:
+            d.reject_gate = "max_entries_per_market"
+            return d
+        if self.cfg.entry_cooldown_sec > 0:
+            last = self.last_close_ts.get(q.ticker)
+            if last is not None and (now_ts - last) < self.cfg.entry_cooldown_sec:
+                d.reject_gate = "entry_cooldown"
+                return d
         if len(self.positions) >= self.cfg.max_open_positions:
             d.reject_gate = "max_open_positions"
             return d
@@ -229,7 +285,7 @@ class Policy:
                 return d
 
         # 2. SLICE
-        band = price_band(price)
+        band = price_band(price, self.cfg.grid)
         key = slice_key(q.phase, band)
         if self.cfg.enabled_slices and key not in self.cfg.enabled_slices:
             d.reject_gate = f"slice_disabled[{key}]"
@@ -301,6 +357,9 @@ class Policy:
         if q.degenerate:
             d.reject_gate = "degenerate_quote"
             return d
+        if q.crossed:
+            d.reject_gate = "crossed_book"
+            return d
         if q.secs < self.cfg.exit_min_seconds:
             d.reject_gate = "too_late_to_flip"
             return d
@@ -339,9 +398,11 @@ class Policy:
 
     def record_open(self, pos: Position) -> None:
         self.positions[pos.ticker] = pos
+        self.entries_by_ticker[pos.ticker] = self.entries_by_ticker.get(pos.ticker, 0) + 1
 
-    def record_close(self, ticker: str, pnl_usd: float) -> None:
+    def record_close(self, ticker: str, pnl_usd: float, now_ts: float | None = None) -> None:
         self.positions.pop(ticker, None)
+        self.last_close_ts[ticker] = time.time() if now_ts is None else now_ts
         self.realized_pnl_usd += pnl_usd
         if (
             self.cfg.daily_loss_limit_usd > 0

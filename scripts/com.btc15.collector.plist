@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd job for the 24/7 corpus collector.
+
+  Install:
+      cp scripts/com.btc15.collector.plist ~/Library/LaunchAgents/
+      # edit the two absolute paths below if the project moves
+      launchctl load  ~/Library/LaunchAgents/com.btc15.collector.plist
+      launchctl start com.btc15.collector
+
+  Status / stop:
+      launchctl list | grep btc15
+      launchctl stop   com.btc15.collector
+      launchctl unload ~/Library/LaunchAgents/com.btc15.collector.plist
+
+  KeepAlive restarts the supervisor if it ever dies; the supervisor itself
+  restarts individual bot segments. RunAtLoad means it comes back after a
+  reboot without anyone remembering to start it — which matters, because the
+  only thing that produces settled markets is wall-clock time.
+
+  Note: a LaunchAgent runs only while the user is logged in, and macOS will
+  still sleep the machine. For genuinely uninterrupted collection either run
+  `caffeinate -s` alongside it, or disable sleep in System Settings > Battery.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.btc15.collector</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/marcelogarcia/Desktop/Projects/15min-v3/scripts/collector.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/marcelogarcia/Desktop/Projects/15min-v3</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SEGMENT_SEC</key>
+        <string>21600</string>
+        <key>TRADE</key>
+        <string>1</string>
+        <key>TAG</key>
+        <string>collector</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/marcelogarcia/Desktop/Projects/15min-v3/logs/collector.launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/marcelogarcia/Desktop/Projects/15min-v3/logs/collector.launchd.log</string>
+</dict>
+</plist>

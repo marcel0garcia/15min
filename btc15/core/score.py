@@ -41,10 +41,18 @@ class Observation:
     secs: float
 
 
+# A slice must contain at least this many DISTINCT SETTLED MARKETS before it
+# can be promoted. Not observations — markets. One 15-minute window is one
+# coin flip no matter how many times we scanned it, and KXBTC15M lists only
+# one market at a time, so 30 markets is ~7.5 hours of runtime.
+MIN_MARKETS_FOR_VERDICT = 30
+
+
 @dataclass
 class SliceReport:
     key: str
-    n: int
+    n: int                              # observations (scans), autocorrelated
+    n_markets: int                      # distinct settled markets — the real n
     brier_model: float
     brier_market: Optional[float]
     delta: Optional[float]              # market - model; > 0 means we win
@@ -57,7 +65,7 @@ class SliceReport:
     def verdict(self) -> str:
         if self.delta is None or self.delta_ci_low is None:
             return "no_market_data"
-        if self.n < 30:
+        if self.n_markets < MIN_MARKETS_FOR_VERDICT:
             return "insufficient"
         if self.delta_ci_low > 0:
             return "BEATS_MARKET"
@@ -121,20 +129,43 @@ def load_observations(
     return obs
 
 
-def _bootstrap_ci(
-    diffs: list[float],
+def _cluster_bootstrap_ci(
+    clusters: list[list[float]],
     *,
     iters: int = 2000,
     alpha: float = 0.05,
     seed: int = 7,
 ) -> tuple[float, float]:
-    if not diffs:
+    """Paired bootstrap that resamples MARKETS, not observations.
+
+    This is the difference between a real R1 gate and a rubber stamp. The
+    engine logs one row per market per second; even thinned to one row per
+    15 seconds, a single 15-minute window contributes ~36 rows that share
+    one outcome and one price path. Resampling those rows independently
+    treats 36 views of one coin flip as 36 coin flips, and the interval
+    comes out roughly sqrt(36) = 6x too narrow. A slice could then be
+    promoted to `enabled_slices` — and traded with real money — on the
+    strength of five markets.
+
+    Resampling whole tickers with replacement keeps the correlation inside
+    the cluster where it belongs. The interval gets much wider. That is not
+    the method being pessimistic; it is the earlier interval having been
+    wrong.
+    """
+    clusters = [c for c in clusters if c]
+    if not clusters:
         return (0.0, 0.0)
     rng = random.Random(seed)
-    n = len(diffs)
+    k = len(clusters)
     means = []
     for _ in range(iters):
-        means.append(sum(diffs[rng.randrange(n)] for _ in range(n)) / n)
+        total = 0.0
+        count = 0
+        for _ in range(k):
+            c = clusters[rng.randrange(k)]
+            total += sum(c)
+            count += len(c)
+        means.append(total / count if count else 0.0)
     means.sort()
     lo = means[int((alpha / 2) * iters)]
     hi = means[min(iters - 1, int((1 - alpha / 2) * iters))]
@@ -145,18 +176,21 @@ def _score(obs: list[Observation], key: str) -> SliceReport:
     n = len(obs)
     bm = sum((o.p_model - o.outcome) ** 2 for o in obs) / n
     paired = [o for o in obs if o.p_market is not None]
+    n_markets = len({o.ticker for o in obs})
     if paired:
         bk = sum((o.p_market - o.outcome) ** 2 for o in paired) / len(paired)
-        diffs = [
-            (o.p_market - o.outcome) ** 2 - (o.p_model - o.outcome) ** 2
-            for o in paired
-        ]
+        by_ticker: dict[str, list[float]] = defaultdict(list)
+        for o in paired:
+            by_ticker[o.ticker].append(
+                (o.p_market - o.outcome) ** 2 - (o.p_model - o.outcome) ** 2
+            )
+        diffs = [d for c in by_ticker.values() for d in c]
         delta = sum(diffs) / len(diffs)
-        lo, hi = _bootstrap_ci(diffs)
+        lo, hi = _cluster_bootstrap_ci(list(by_ticker.values()))
     else:
         bk = delta = lo = hi = None
     return SliceReport(
-        key=key, n=n,
+        key=key, n=n, n_markets=n_markets,
         brier_model=bm,
         brier_market=bk,
         delta=delta, delta_ci_low=lo, delta_ci_high=hi,

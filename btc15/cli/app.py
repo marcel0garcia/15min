@@ -27,6 +27,7 @@ from rich.table import Table
 from rich import box
 
 console = Console()
+log = logging.getLogger(__name__)
 
 
 def setup_logging(level: str, log_file: str):
@@ -57,13 +58,34 @@ def cli(ctx):
 @click.option("--web", is_flag=True, default=False, help="Also start web dashboard")
 @click.option("--web-port", default=8080, help="Web dashboard port (default: 8080)")
 @click.option("--config", "config_path", default=None, help="Path to config.yaml")
-def run(trade: bool, live: bool, web: bool, web_port: int, config_path: str):
-    """Start the bot with live dashboard."""
-    from btc15.config import load_config
+@click.option("--headless", is_flag=True, default=False,
+              help="No terminal dashboard — log lines only. Use for unattended runs.")
+@click.option("--duration", default=0.0, type=float, metavar="SECONDS",
+              help="Stop cleanly after N seconds (0 = run until interrupted).")
+@click.option("--set", "overrides", multiple=True, metavar="SECTION.FIELD=VALUE",
+              help="Override a config field for this run only; repeatable. "
+                   "e.g. --set core.sigma_floor=0.45 --set core.ev_margin_cents=0.25")
+@click.option("--tag", default=None,
+              help="Label stamped into the session's meta.json, for grouping A/B runs.")
+def run(trade: bool, live: bool, web: bool, web_port: int, config_path: str,
+        headless: bool, duration: float, overrides: tuple, tag: str):
+    """Start the bot with live dashboard (or --headless for unattended runs)."""
+    from btc15.config import apply_overrides, load_config
     from pathlib import Path
 
     cfg = load_config(Path(config_path) if config_path else None)
     setup_logging(cfg.logging.level, cfg.logging.log_file)
+
+    if overrides:
+        try:
+            changed = apply_overrides(cfg, overrides)
+        except ValueError as e:
+            console.print(f"[bright_red]--set error: {e}[/bright_red]")
+            sys.exit(2)
+        for line in changed:
+            console.print(f"[dim]override[/dim] {line}")
+    if tag:
+        cfg.session_tag = tag
 
     if trade:
         cfg.strategy.auto_trade = True
@@ -97,10 +119,22 @@ def run(trade: bool, live: bool, web: bool, web_port: int, config_path: str):
             f"Web dashboard → [bold cyan]http://localhost:{web_port}[/bold cyan]"
         )
 
-    asyncio.run(_run_engine(cfg, web_port=web_port if web else None))
+    if headless:
+        console.print(
+            "[dim]headless — no dashboard. Follow with: "
+            f"tail -f {cfg.logging.log_file}[/dim]"
+        )
+    if duration > 0:
+        console.print(f"[dim]will stop cleanly after {duration:.0f}s[/dim]")
+
+    asyncio.run(_run_engine(
+        cfg, web_port=web_port if web else None,
+        headless=headless, duration=duration,
+    ))
 
 
-async def _run_engine(cfg, web_port: int = None):
+async def _run_engine(cfg, web_port: int = None, headless: bool = False,
+                      duration: float = 0.0):
     from btc15.core import CoreEngine
     from btc15.cli.terminal import run_dashboard
 
@@ -110,7 +144,22 @@ async def _run_engine(cfg, web_port: int = None):
     try:
         await engine.start()
 
-        tasks.append(asyncio.create_task(run_dashboard(engine), name="terminal"))
+        if not headless:
+            tasks.append(asyncio.create_task(run_dashboard(engine), name="terminal"))
+        else:
+            # Something must keep the loop alive and let Ctrl-C land; the
+            # dashboard normally does that job.
+            async def _idle():
+                while engine.running:
+                    await asyncio.sleep(1.0)
+            tasks.append(asyncio.create_task(_idle(), name="idle"))
+
+        if duration > 0:
+            async def _deadline():
+                await asyncio.sleep(duration)
+                log.info(f"[RUN] duration {duration:.0f}s reached — stopping")
+                engine.running = False
+            tasks.append(asyncio.create_task(_deadline(), name="deadline"))
 
         if web_port:
             try:
@@ -722,6 +771,166 @@ def replay_analyze(session_id: str, config_path: str, results_cache: str):
     console.print(_json.dumps(summary, indent=2))
 
 
+# ── Offline sweep: many configs, one corpus ──────────────────────────────────
+
+@cli.command()
+@click.option("--knob", "knobs", multiple=True, metavar="FIELD=V1,V2,...",
+              help="Sweep a CoreConfig field over values; repeatable. "
+                   "e.g. --knob sigma_floor=0.2,0.35,0.5 --knob ev_margin_cents=0.25,0.75")
+@click.option("--sessions", default=None, metavar="ID1,ID2",
+              help="Session ids to replay (default: every re-priceable session).")
+@click.option("--last", default=0, type=int,
+              help="Use only the N most recent re-priceable sessions.")
+@click.option("--holdout", default=0.0, type=float, metavar="FRAC",
+              help="Withhold the newest FRAC of sessions and re-score on them "
+                   "(time-ordered split; 0.3 is a reasonable choice).")
+@click.option("--official-only", is_flag=True, default=False,
+              help="Settle only from Kalshi official results; no BRTI-TWAP fallback.")
+@click.option("--top", default=15, help="Rows to print.")
+@click.option("--workers", default=0, type=int, help="Parallel workers (0 = auto).")
+@click.option("--out", "out_path", default=None, help="Write the full report as JSON here.")
+@click.option("--config", "config_path", default=None)
+def sweep(knobs, sessions, last, holdout, official_only, top, workers,
+          out_path, config_path):
+    """Replay recorded sessions under many configurations and rank them.
+
+    A config test costs seconds here instead of the days a live A/B would
+    take. What you get is a hypothesis, not a track record — replay models
+    neither latency nor queue position, and a sweep large enough to search
+    will also find noise. Narrow the space here; let live paper arbitrate.
+
+      ./run.sh sweep                                     # baseline only
+      ./run.sh sweep --knob sigma_floor=0.2,0.35,0.5
+      ./run.sh sweep --knob ev_margin_cents=0.25,0.75,1.5 --holdout 0.3
+    """
+    from btc15.config import load_config
+    from btc15.research.corpus import discover_sessions
+    from btc15.research.sweep import (
+        expand_grid, pareto_frontier, parse_knob, run_sweep, write_report,
+    )
+
+    cfg = load_config(Path(config_path) if config_path else None)
+    root = Path(cfg.recording.path)
+
+    if sessions:
+        dirs = [root / sid.strip() for sid in sessions.split(",") if sid.strip()]
+        missing = [d for d in dirs if not d.exists()]
+        if missing:
+            console.print("[bright_red]No such session(s): "
+                          + ", ".join(m.name for m in missing) + "[/bright_red]")
+            return
+    else:
+        dirs = discover_sessions(root)
+    if last > 0:
+        dirs = dirs[-last:]
+    if not dirs:
+        console.print(
+            "[yellow]No re-priceable sessions.[/yellow] A session is re-priceable "
+            "only if its decision rows carry both `spot` and `strike` — pre-v3 "
+            "recordings do not, and Kalshi purges settled 15-minute markets "
+            "within weeks, so their outcomes are gone too.\n"
+            "Build a corpus first:  [cyan]./run.sh run --headless --trade[/cyan]"
+        )
+        return
+
+    try:
+        knob_map = dict(parse_knob(k) for k in knobs)
+    except ValueError as e:
+        console.print("[bright_red]--knob error: " + str(e) + "[/bright_red]")
+        return
+    configs = expand_grid(knob_map)
+
+    console.print(
+        "[dim]" + str(len(configs)) + " config(s) x " + str(len(dirs)) + " session(s)"
+        + ((", holdout %.0f%%" % (holdout * 100)) if holdout > 0 else "")
+        + ", settlement="
+        + ("official only" if official_only else "official + BRTI TWAP")
+        + "[/dim]"
+    )
+
+    with console.status("replaying..."):
+        rows = run_sweep(
+            cfg.core, dirs, configs,
+            results_cache=Path("data/market_results_cache.json"),
+            allow_twap_fallback=not official_only,
+            holdout_frac=holdout,
+            workers=(workers or None),
+        )
+
+    table = Table(title="Config sweep — ranked by Brier advantage over the market",
+                  box=None, header_style="bold dim")
+    table.add_column("Config", style="cyan", no_wrap=True, overflow="ellipsis",
+                     max_width=46)
+    table.add_column("Mkts", justify="right")
+    table.add_column("Trades", justify="right")
+    table.add_column("/day", justify="right")
+    table.add_column("P&L", justify="right")
+    table.add_column("delta vs mkt", justify="right")
+    table.add_column("95% CI", justify="right")
+    if holdout > 0:
+        table.add_column("delta holdout", justify="right")
+    table.add_column("Verdict")
+
+    colors = {"BEATS_MARKET": "bright_green", "loses_to_market": "bright_red",
+              "inconclusive": "yellow", "insufficient": "dim", "no_data": "dim",
+              "no_market_data": "dim"}
+    for r in rows[:top]:
+        cells = [
+            r.label, str(r.n_markets), str(r.n_trades), "%.1f" % r.trades_per_day,
+            "$%+.2f" % r.pnl_usd,
+            ("%+.4f" % r.delta) if r.delta is not None else "-",
+            (("[%+.4f, %+.4f]" % (r.delta_ci_low, r.delta_ci_high))
+             if r.delta_ci_low is not None else "-"),
+        ]
+        if holdout > 0:
+            cells.append(("%+.4f" % r.holdout_delta)
+                         if r.holdout_delta is not None else "-")
+        c = colors.get(r.verdict, "white")
+        cells.append("[" + c + "]" + r.verdict + "[/" + c + "]")
+        table.add_row(*cells)
+    console.print(table)
+
+    front = pareto_frontier(rows)
+    if len(front) > 1:
+        pf = Table(title="Edge / frequency frontier — pick your operating point",
+                   box=None, header_style="bold dim")
+        pf.add_column("Config", style="cyan", no_wrap=True, overflow="ellipsis",
+                      max_width=46)
+        pf.add_column("Trades/day", justify="right")
+        pf.add_column("delta vs mkt", justify="right")
+        pf.add_column("P&L", justify="right")
+        for r in front:
+            pf.add_row(r.label, "%.1f" % r.trades_per_day,
+                       "%+.4f" % r.delta, "$%+.2f" % r.pnl_usd)
+        console.print(pf)
+
+    best = rows[0] if rows else None
+    if best is not None and best.n_markets < 30:
+        console.print(
+            "\n[yellow]Only " + str(best.n_markets) + " settled market(s) behind "
+            "these numbers. Kalshi lists ONE 15-minute market at a time, so 30 "
+            "markets is about 7.5 hours of runtime and the 300-market R1 bar is "
+            "about 75 hours. Nothing here is decidable yet — keep the collector "
+            "running.[/yellow]"
+        )
+    if len(configs) > 20:
+        console.print(
+            "[dim]" + str(len(configs)) + " configs tested. At 95% confidence "
+            "roughly " + ("%.0f" % (len(configs) * 0.05)) + " will clear zero by "
+            "chance alone — which is why promotion happens via `score` on data the "
+            "sweep did not pick the config with.[/dim]"
+        )
+
+    if out_path:
+        write_report(rows, Path(out_path), {
+            "sessions": [d.name for d in dirs],
+            "n_configs": len(configs),
+            "holdout_frac": holdout,
+            "official_only": official_only,
+        })
+        console.print("[dim]report -> " + out_path + "[/dim]")
+
+
 # ── R1 measurement: does the model beat the market? ──────────────────────────
 
 @cli.command()
@@ -751,8 +960,8 @@ def score(session_id: str, config_path: str, results_cache: str,
     import json
     from btc15.config import load_config
     from btc15.core.score import (
-        load_observations, score_slices, calibration_buckets,
-        enabled_slice_suggestion,
+        MIN_MARKETS_FOR_VERDICT, load_observations, score_slices,
+        calibration_buckets, enabled_slice_suggestion,
     )
 
     cfg = load_config(Path(config_path) if config_path else None)
@@ -806,6 +1015,7 @@ def score(session_id: str, config_path: str, results_cache: str,
                   box=None, header_style="bold dim")
     table.add_column("Slice", style="cyan")
     table.add_column("N", justify="right")
+    table.add_column("Mkts", justify="right")
     table.add_column("Brier(model)", justify="right")
     table.add_column("Brier(mkt)", justify="right")
     table.add_column("Δ", justify="right")
@@ -824,7 +1034,7 @@ def score(session_id: str, config_path: str, results_cache: str,
         ci = (f"[{r.delta_ci_low:+.4f}, {r.delta_ci_high:+.4f}]"
               if r.delta_ci_low is not None else "—")
         table.add_row(
-            r.key, str(r.n), f"{r.brier_model:.4f}",
+            r.key, str(r.n), str(r.n_markets), f"{r.brier_model:.4f}",
             f"{r.brier_market:.4f}" if r.brier_market is not None else "—",
             f"{r.delta:+.4f}" if r.delta is not None else "—",
             ci,
@@ -835,6 +1045,13 @@ def score(session_id: str, config_path: str, results_cache: str,
         "\n[dim]Δ = Brier(market) − Brier(model). Positive means we are more "
         "accurate than the price. Only slices whose CI is entirely above zero "
         "have earned real money.[/dim]"
+    )
+    console.print(
+        "[dim]Mkts is the number the statistics actually rest on: the CI is a "
+        "bootstrap over distinct settled MARKETS, not over scans. One 15-minute "
+        "window is one coin flip however many times we sampled it, and Kalshi "
+        f"lists one market at a time — so {MIN_MARKETS_FOR_VERDICT} markets is "
+        "roughly 7.5 hours of runtime.[/dim]"
     )
 
     if calibration:

@@ -36,8 +36,8 @@ from btc15.config import AppConfig
 from btc15.core.fees import FeeCalibrator, taker_fee_usd
 from btc15.core.paper import PaperBroker, PaperBrokerConfig
 from btc15.core.policy import Policy, PolicyConfig, Position, slice_key
-from btc15.core.pricer import MarketQuote, price_band, quote_market
-from btc15.core.sigma import blended_sigma
+from btc15.core.pricer import MarketQuote, SliceGrid, price_band, quote_market
+from btc15.core.sigma import SigmaConfig, blended_sigma
 from btc15.feeds.brti_feed import BRTIPriceFeed
 from btc15.kalshi.client import KalshiClient
 from btc15.kalshi.models import MarketStatus, Order, OrderType, Side, TimeInForce
@@ -49,11 +49,20 @@ from btc15.recording.venues import build_venue_tasks
 
 log = logging.getLogger(__name__)
 
+# Fallbacks only. The live values come from CoreConfig (config.yaml) so the
+# sweep and the agent can vary cadence without editing source.
 SCAN_INTERVAL = 1.0
 OB_REFRESH_INTERVAL = 4.0
 SETTLEMENT_CHECK_INTERVAL = 5.0
 BRTI_HZ = 4.0
 VENUE_STALENESS_SEC = 5.0
+
+# How many price levels of each side to stamp into every decision row.
+# This is what makes the recordings self-sufficient for offline fill
+# simulation: with depth in decisions.jsonl, `sweep` never has to touch
+# kalshi_frames.jsonl, which is why raw-frame capture can be turned off
+# for long unattended runs (~0.5 GB/hour vs ~20 MB/hour).
+DECISION_BOOK_LEVELS = 5
 
 
 class _DashboardLogHandler(logging.Handler):
@@ -94,6 +103,28 @@ class CoreEngine:
             bar_interval_sec=config.feeds.bar_interval_sec,
             lookback_bars=config.feeds.lookback_bars,
         )
+        self.grid = SliceGrid(
+            phase_early_sec=core.phase_early_sec,
+            phase_mid_sec=core.phase_mid_sec,
+            phase_prime_sec=core.phase_prime_sec,
+            band_extreme_cents=core.band_extreme_cents,
+            band_outer_cents=core.band_outer_cents,
+        )
+        self.sigma_cfg = SigmaConfig(
+            fast_sec=core.sigma_fast_sec,
+            slow_sec=core.sigma_slow_sec,
+            fast_weight=core.sigma_fast_weight,
+            floor=core.sigma_floor,
+            ceiling=core.sigma_ceiling,
+            min_samples=core.sigma_min_samples,
+            scale=core.sigma_scale,
+        )
+        self.scan_interval = core.scan_interval_sec
+        self.ob_refresh_interval = core.ob_refresh_interval_sec
+        self.settlement_check_interval = core.settlement_check_interval_sec
+        self.brti_hz = core.brti_hz
+        self.venue_staleness_sec = core.venue_staleness_sec
+
         self.policy = Policy(PolicyConfig(
             min_seconds=core.min_seconds,
             max_seconds=core.max_seconds,
@@ -112,6 +143,11 @@ class CoreEngine:
             slippage_cents=core.slippage_cents,
             fee_rate=core.fee_rate,
             fee_multiplier=core.fee_multiplier,
+            max_entries_per_market=core.max_entries_per_market,
+            entry_cooldown_sec=core.entry_cooldown_sec,
+            warmup_sec=core.warmup_sec,
+            reject_clamped_sigma=core.reject_clamped_sigma,
+            grid=self.grid,
         ))
         # Verifies our fee model against what Kalshi actually charges on
         # live fills. A silent fee-model error is the quietest way for a
@@ -266,7 +302,7 @@ class CoreEngine:
         it into the price feed. This is the settlement instrument."""
         while self.running:
             try:
-                await asyncio.sleep(1.0 / BRTI_HZ)
+                await asyncio.sleep(1.0 / self.brti_hz)
                 now = time.time()
                 venue_mids: dict[str, float] = {}
                 venue_status: dict = {}
@@ -276,7 +312,7 @@ class CoreEngine:
                         venue_status[vname] = {"connected": False, "age_sec": None}
                         continue
                     age = now - ws.last_ts if ws.last_ts > 0 else None
-                    fresh = age is not None and age <= VENUE_STALENESS_SEC
+                    fresh = age is not None and age <= self.venue_staleness_sec
                     mid = (ws.last_bid + ws.last_ask) / 2.0
                     venue_status[vname] = {
                         "connected": True, "bid": ws.last_bid, "ask": ws.last_ask,
@@ -319,7 +355,7 @@ class CoreEngine:
     async def _orderbook_refresh_loop(self) -> None:
         while self.running:
             try:
-                await asyncio.sleep(OB_REFRESH_INTERVAL)
+                await asyncio.sleep(self.ob_refresh_interval)
                 for ticker in list(self._watched.keys()):
                     await self._refresh_orderbook(ticker)
             except asyncio.CancelledError:
@@ -337,7 +373,7 @@ class CoreEngine:
                 break
             except Exception as e:
                 log.error(f"Scan error: {e}", exc_info=True)
-            await asyncio.sleep(SCAN_INTERVAL)
+            await asyncio.sleep(self.scan_interval)
 
     async def _scan(self) -> None:
         markets = await self._kalshi.get_markets(
@@ -365,8 +401,21 @@ class CoreEngine:
         now_ts = time.time()
         now_utc = datetime.now(timezone.utc)
         ticks = [(t.ts, t.price) for t in self.price_feed.recent_ticks(seconds=360.0) if t.price > 0]
-        nowcast = blended_sigma(ticks, now_ts=now_ts)
+        nowcast = blended_sigma(ticks, now_ts=now_ts, cfg=self.sigma_cfg)
         self.state["sigma_nowcast"] = round(nowcast.sigma, 4)
+        self.state["sigma_raw"] = round(nowcast.sigma_raw, 4)
+        self.state["sigma_clamped"] = nowcast.clamped
+        if nowcast.clamped:
+            # Silent floor-binding is how the model manufactures false
+            # certainty at extreme strikes. Surface it.
+            log.debug(
+                f"sigma clamped: raw={nowcast.sigma_raw:.4f} -> {nowcast.sigma:.4f} "
+                f"(floor={self.sigma_cfg.floor} ceiling={self.sigma_cfg.ceiling})"
+            )
+
+        # How much BRTI history stands behind sigma. Guards the warm-up case
+        # where a floored sigma manufactures false conviction.
+        tick_span = (now_ts - ticks[0][0]) if ticks else 0.0
 
         bankroll = self._bankroll_usd()
         signals: dict = {}
@@ -388,7 +437,8 @@ class CoreEngine:
             q = quote_market(
                 ticker=market.ticker, strike=market.strike_price, spot=spot,
                 secs=secs, sigma=nowcast.sigma, ticks=ticks, now_ts=now_ts,
-                yes_bid=yes_bid, yes_ask=yes_ask,
+                yes_bid=yes_bid, yes_ask=yes_ask, grid=self.grid,
+                sigma_clamped=nowcast.clamped, tick_span_sec=tick_span,
             )
 
             markets_snapshot.append({
@@ -399,7 +449,7 @@ class CoreEngine:
             })
 
             mid = q.mid_cents
-            band = price_band(mid) if mid is not None else "?"
+            band = price_band(mid, self.grid) if mid is not None else "?"
             best_edge = 0.0
             if q.market_prob_yes is not None and q.recommended_side:
                 p = q.prob_win(q.recommended_side)
@@ -435,13 +485,23 @@ class CoreEngine:
                     await self._execute_exit(q, ex)
                     acted = True
 
-            entry = None
-            if not acted and self.cfg.strategy.auto_trade:
-                entry = self.policy.evaluate_entry(q, bankroll)
-                if entry.kind == "enter":
-                    await self._execute_entry(q, entry)
+            # Shadow-evaluate on EVERY scan, trading or not. evaluate_entry
+            # is pure, so this costs nothing, and it is the only way a
+            # signal-only session learns which gate rejected which market.
+            # Before this, signal-only runs wrote reject_gate: null on every
+            # row — 528 of 528 in the 19AUG session — which made the
+            # recordings useless for answering "why didn't it trade?".
+            entry = self.policy.evaluate_entry(q, bankroll, now_ts=now_ts)
+            executed = False
+            if entry.kind == "enter" and not acted and self.cfg.strategy.auto_trade:
+                await self._execute_entry(q, entry)
+                executed = True
 
-            self._record_decision(q, band, entry)
+            self._record_decision(
+                q, band, entry, nowcast,
+                await self._book_depth(market.ticker),
+                executed=executed,
+            )
 
         self.state["signals"] = signals
         self.state["open_markets"] = markets_snapshot
@@ -457,6 +517,21 @@ class CoreEngine:
     def _bankroll_usd(self) -> float:
         """Cash available for new positions."""
         return max(0.0, self.broker.cash_usd)
+
+    async def _book_depth(self, ticker: str, levels: int = DECISION_BOOK_LEVELS) -> dict:
+        """Top `levels` of each side as [[price_cents, qty], ...].
+
+        Stamped into every decision row so the recordings can drive an
+        offline fill simulation on their own. Bids descend (best first),
+        asks ascend (best first) — the order a taker walks them.
+        """
+        book = await self._book_for(ticker)
+        bids = sorted(book.get("yes_bids", {}).items(), key=lambda kv: -float(kv[0]))
+        asks = sorted(book.get("yes_asks", {}).items(), key=lambda kv: float(kv[0]))
+        return {
+            "yes_bids": [[float(px), float(qty)] for px, qty in bids[:levels] if qty],
+            "yes_asks": [[float(px), float(qty)] for px, qty in asks[:levels] if qty],
+        }
 
     async def _book_for(self, ticker: str) -> dict:
         """Raw depth ladder for fill simulation."""
@@ -526,7 +601,7 @@ class CoreEngine:
             - pos.fees_usd * (fill.contracts / pos.contracts)
         )
 
-        self.policy.record_close(q.ticker, pnl)
+        self.policy.record_close(q.ticker, pnl, now_ts=time.time())
         log.info(
             f"[EXIT] {q.ticker} {pos.side.upper()} x{fill.contracts} @ "
             f"{fill.avg_price_cents:.1f}c pnl=${pnl:+.2f} | {d.reason}"
@@ -628,7 +703,7 @@ class CoreEngine:
     async def _settlement_loop(self) -> None:
         while self.running:
             try:
-                await asyncio.sleep(SETTLEMENT_CHECK_INTERVAL)
+                await asyncio.sleep(self.settlement_check_interval)
                 await self._check_settlements()
             except asyncio.CancelledError:
                 break
@@ -683,7 +758,7 @@ class CoreEngine:
                 entry_cents=pos.entry_cents, result=result,
                 entry_fee_usd=pos.fees_usd, trade_id=pos.trade_id,
             )
-            self.policy.record_close(ticker, pnl)
+            self.policy.record_close(ticker, pnl, now_ts=time.time())
             self._pending_settlement.pop(ticker, None)
             self._settled[ticker] = time.time()
             settle_cents = 100 if result == pos.side else 0
@@ -708,11 +783,21 @@ class CoreEngine:
 
     # ── Recording / state ────────────────────────────────────────────────────
 
-    def _record_decision(self, q: MarketQuote, band: str, decision) -> None:
-        """One row per market per scan. Always carries p_model AND p_market
-        so core/score.py can measure us against the market offline."""
+    def _record_decision(
+        self, q: MarketQuote, band: str, decision, nowcast=None,
+        book: Optional[dict] = None, executed: bool = False,
+    ) -> None:
+        """One row per market per scan — the unit of everything offline.
+
+        Always carries p_model AND p_market so core/score.py can measure us
+        against the market. It also carries enough state to RE-DERIVE the
+        decision under a different config: the sigma legs before and after
+        clamping, the accrued settlement average, and the top of the book
+        on both sides. That last part is what lets `sweep` simulate fills
+        without reading kalshi_frames.jsonl.
+        """
         try:
-            self._recorder.write_decision({
+            row = {
                 "ts": time.time(),
                 "session": self._session_label,
                 "ticker": q.ticker,
@@ -730,10 +815,37 @@ class CoreEngine:
                 "z": round(q.z_score, 4),
                 "degenerate": q.degenerate,
                 "action": decision.kind if decision else "none",
+                "executed": executed,
                 "reject_gate": decision.reject_gate if decision else None,
                 "ev_cents": decision.ev_cents if decision else None,
+                "edge": decision.edge if decision else None,
                 "contracts": decision.contracts if decision else 0,
-            })
+                "side": (decision.side if decision and decision.side
+                         else q.recommended_side),
+                "crossed": q.crossed,
+                "confidence": round(q.confidence, 5),
+            }
+            if nowcast is not None:
+                # sigma_raw vs sigma is how you detect the floor binding —
+                # the failure mode that manufactures 0.999 probabilities.
+                row.update({
+                    "sigma_raw": round(nowcast.sigma_raw, 5),
+                        "sigma_clamped": nowcast.clamped,
+                    "sigma_fast": round(nowcast.sigma_fast, 5),
+                    "sigma_slow": round(nowcast.sigma_slow, 5),
+                    "sigma_n_fast": nowcast.n_fast,
+                    "sigma_n_slow": nowcast.n_slow,
+                })
+            if q.accrued_avg is not None:
+                row.update({
+                    "accrued_avg": round(q.accrued_avg, 2),
+                    "accrued_n": q.accrued_count,
+                    "locked_frac": round(q.locked_frac, 4),
+                    "k_eff": round(q.k_eff, 2) if q.k_eff is not None else None,
+                })
+            if book:
+                row["book"] = book
+            self._recorder.write_decision(row)
         except Exception as e:
             log.debug(f"decision record failed: {e}")
 

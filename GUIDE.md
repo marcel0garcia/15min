@@ -24,6 +24,30 @@ price?**
 
 ---
 
+## The shape of the market (read this first)
+
+Verified against the live series on 2026-08-19:
+
+**KXBTC15M lists exactly one tradeable market at a time.** Each window's
+`open_time` is the previous window's `close_time`, and the strike is set
+at-the-money when the window opens. There is no strike ladder.
+
+Everything downstream follows from that:
+
+| Fact | Consequence |
+|---|---|
+| 96 markets/day, 4/hour | That is the ceiling on trade count, forever. |
+| One market open at a time | `max_open_positions` can never bind. |
+| One entry per window by default | `core.max_entries_per_market` is the only lever on frequency. |
+| Strike is ATM at open | Every window *starts* at ~50¢ — peak fee, minimum edge — and only drifts to the extremes as time runs out. So the extreme-band edge structurally lives in the back half. |
+| One window = one coin flip | 30 settled markets ≈ **7.5 hours** of runtime. The R1 bar of 300 ≈ **75 hours**. |
+
+That last row is the whole project plan in one line: **the binding
+constraint is wall-clock, not analysis.** You cannot tune this bot by
+watching it. That is what `sweep` and the collector are for.
+
+---
+
 ## Quick start
 
 ```bash
@@ -35,14 +59,22 @@ pip install -r requirements.txt
 # 2. Simulated trading with honest fills, fees, and settlement.
 ./run.sh run --trade
 
-# 3. After a few sessions — the R1 measurement that decides everything.
+# 3. Unattended collection — the only thing that produces settled markets.
+scripts/collector.sh &                 # 6h segments, auto-enrich, auto-restart
+
+# 4. The R1 measurement that decides everything.
 ./run.sh replay enrich <session_id>    # fetch settled outcomes
-./run.sh score --suggest               # did we beat the market?
+./run.sh score --calibration           # did we beat the market?
+
+# 5. Tune knobs offline — seconds per config instead of days.
+./run.sh sweep --knob sigma_floor=0.2,0.3,0.4,0.5 --holdout 0.3
 ```
 
 Real money requires `--live` **and** a typed confirmation. Don't go there
 until `score` says a slice beats the market and you've verified the fee
-rate (see the warning below).
+rate.
+
+(See the fee-rate warning below before trusting any EV number.)
 
 ---
 
@@ -76,6 +108,23 @@ the math in two places:
 realized-vol window, so one quiet minute can't halve the estimate.
 
 **2. Decide.** `core/policy.py` — four ideas, and only four:
+
+Before any of the four, two **input-sanity guards** run. They are not
+strategy — they refuse to price inputs we know are untrustworthy:
+
+- **`warmup` / `sigma_clamped`** — no entry until `core.warmup_sec` of
+  BRTI history exists and the vol nowcast is off its clamps. On
+  2026-08-19 the engine fired 0.2s after startup on a sigma pinned to its
+  0.20 floor, priced 0.996 against a market at 0.905, bought 10 contracts
+  at 91¢, and flipped out four seconds later at a loss once real ticks
+  arrived. Both legs were sigma noise, neither was information.
+- **`crossed_book`** — refuse when the YES bid is *strictly* above the
+  YES ask, i.e. best YES bid + best NO bid > 100. That is riskless
+  arbitrage and cannot persist on the exchange, so it means our cache is
+  stale. Note the strictness: bid **==** ask is a *locked* book (the two
+  sides sum to exactly 100), which is normal, common, and tradeable at
+  zero spread — an earlier version of this guard used `>=` and rejected
+  60–95% of all scans.
 
 | # | Gate | What it does |
 |---|------|--------------|
@@ -130,6 +179,10 @@ what produced the phantom −100% losses in the old logs.
 |---|---|
 | `./run.sh` | Dashboard, no trading |
 | `./run.sh run --trade` | Paper trading |
+| `./run.sh run --headless --duration 3600` | Unattended run, no dashboard, stops cleanly |
+| `./run.sh run --set core.sigma_floor=0.4` | Override any config field for one run |
+| `./run.sh sweep --knob FIELD=v1,v2` | **Replay many configs over the corpus** |
+| `scripts/collector.sh` | 24/7 supervised collection + auto-enrich |
 | `./run.sh run --trade --live` | **Real money** (confirmation required) |
 | `./run.sh run --web` | Also serve the browser dashboard |
 | `./run.sh score` | **Model vs. market**, sliced. The R1 gate. |
@@ -177,6 +230,60 @@ market is one independent event, not 900.
 
 **Workflow:** run paper sessions → `replay enrich` → `score --suggest` →
 paste the winning slices into `core.enabled_slices` → re-measure.
+
+---
+
+## Tuning knobs without waiting for the market
+
+`btc15/research/` replays recorded sessions through the **same** pricer,
+policy and paper broker the live engine runs, under any configuration. A
+config test costs seconds instead of the days a live A/B would take.
+
+```bash
+./run.sh sweep                                          # baseline only
+./run.sh sweep --knob sigma_floor=0.2,0.3,0.4,0.5
+./run.sh sweep --knob ev_margin_cents=0.25,0.75,1.5 --holdout 0.3
+./run.sh sweep --knob max_entries_per_market=1,2,4 --out reports/freq.json
+```
+
+Every result reports `Mkts` — the distinct settled markets behind it —
+next to `Trades/day`, and prints an **edge/frequency frontier** so the
+operating point stays a choice rather than an accident.
+
+**What replay does not model**, and why a sweep result is a hypothesis
+rather than a track record:
+
+- **Latency** — decisions hit the book as recorded at that scan; live,
+  a few hundred ms pass before the order lands. `paper_adverse_cents`
+  buys pessimism here.
+- **Market impact** — our fills consume recorded depth, but the rest of
+  the book never reacts. Negligible at $10; not at size.
+- **Queue position** — every fill is a taker fill. Maker strategies
+  cannot be evaluated by this harness at all.
+
+Three guards are built in and none is optional: results count **markets,
+not scans**; `--holdout` splits the corpus **by time** and re-scores the
+winners on data they were not chosen with; and the config count is
+printed as a standing reminder that 200 configs at 95% confidence yield
+~10 false winners by construction.
+
+### What the corpus can contain
+
+A session is re-priceable only if its decision rows carry `spot` and
+`strike`. Pre-v3 recordings don't, and **Kalshi 404s settled 15-minute
+markets within weeks** — so the ~1.5 GB of June 2026 recordings are
+permanently unscoreable: the one session with cached outcomes predates
+`strike`, and every later session's tickers are gone.
+
+The operational lesson: **`replay enrich` every session promptly.**
+`scripts/collector.sh` does it automatically between segments.
+
+### The agent
+
+`.claude/agents/btc15-tuner.md` defines an agent that runs this whole
+loop — collector health, enrichment, scoring, sweeps, and a dated report
+in `docs/sessions/` — autonomously, in paper mode only. It may change
+any `core:` knob with committed evidence except `fee_rate`.
 
 ---
 
@@ -259,7 +366,14 @@ btc15/
   kalshi/                 REST + WS client (preserved)
   feeds/                  BRTI price feed (preserved)
   recording/              telemetry capture + replay (preserved)
-tests/                    63 tests — run them before you trade
+  research/               ← the offline tuning harness
+    corpus.py             load recordings; resolve settlement outcomes
+    replay.py             re-run the real core over recorded frames
+    sweep.py              rank many configs; edge/frequency frontier
+scripts/collector.sh      24/7 supervised collection + auto-enrich
+scripts/com.btc15.collector.plist   launchd job for true unattended running
+.claude/agents/btc15-tuner.md       the research-operator agent
+tests/                    86 tests — run them before you trade
 docs/REVIVAL_PLAN.md      strategy assessment and roadmap
 ```
 

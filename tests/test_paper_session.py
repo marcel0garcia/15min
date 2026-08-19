@@ -85,6 +85,10 @@ def _simulate_window(
             ticker=ticker, strike=strike, spot=price, secs=secs_left,
             sigma=nowcast.sigma, ticks=ticks, now_ts=now,
             yes_bid=None, yes_ask=None,
+            # Same vol-nowcast health the engine reports, so the synthetic
+            # session exercises the warm-up guards instead of bypassing them.
+            sigma_clamped=nowcast.clamped,
+            tick_span_sec=(now - ticks[0][0]) if ticks else 0.0,
         )
         # The market's own price: either fair (quoting the model's own
         # probability) or a stale coin-flip the model can exploit.
