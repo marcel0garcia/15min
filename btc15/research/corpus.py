@@ -42,6 +42,21 @@ SETTLEMENT_WINDOW_SEC = 60.0
 # an outcome — a thin window is a reconstruction artifact, not a settlement.
 MIN_TWAP_SAMPLES = 20
 
+# How close to the strike our own TWAP may land before we stop trusting it
+# to decide an outcome.
+#
+# Measured 2026-08-19 against 16 markets with official Kalshi results: our
+# 3-venue reconstruction agreed on 15 (94%). The single miss settled $1.94
+# from the strike — a reconstruction error of ~0.003% on a $68.7k index,
+# which is excellent accuracy and still enough to flip the answer. Every
+# market that settled more than $21 from its strike agreed.
+#
+# So near-strike TWAP outcomes are coin flips, and a coin flip used as a
+# training label is worse than no label: it teaches the sweep noise with
+# the authority of data. Inside this band we return no outcome and leave
+# the market unscored unless Kalshi's official result is available.
+MIN_TWAP_MARGIN_USD = 25.0
+
 
 @dataclass
 class Frame:
@@ -84,6 +99,11 @@ class LoadedSession:
     has_depth: bool
     n_rows: int
     n_skipped: int
+    # 'brti' means the recording carried the engine-cadence tick stream, so a
+    # replay sees exactly the series the live vol nowcast saw. 'decisions'
+    # means we fell back to one spot per scan, which reads sigma lower
+    # because microstructure noise is sampled away.
+    tick_source: str = "decisions"
     meta: dict = field(default_factory=dict)
 
     @property
@@ -153,7 +173,24 @@ def load_session(session_dir: Path, *, tick_resolution_sec: float = 0.5) -> Load
         strikes[ticker].append(float(strike))
 
     frames.sort(key=lambda f: f.ts)
-    ticks = [ticks_by_bucket[b] for b in sorted(ticks_by_bucket)]
+
+    # Prefer the engine-cadence BRTI stream when the recording has it: the
+    # vol nowcast is sensitive to sampling rate, so replaying off a 1 Hz
+    # reconstruction of a 4 Hz series changes sigma and therefore changes
+    # decisions.
+    tick_source = "decisions"
+    brti_path = session_dir / "brti_ticks.jsonl"
+    brti_ticks: list[tuple[float, float]] = []
+    for row in _iter_jsonl(brti_path):
+        ts_, mid = row.get("ts"), row.get("mid")
+        if ts_ is not None and mid:
+            brti_ticks.append((float(ts_), float(mid)))
+    if len(brti_ticks) > len(ticks_by_bucket):
+        brti_ticks.sort()
+        ticks = brti_ticks
+        tick_source = "brti"
+    else:
+        ticks = [ticks_by_bucket[b] for b in sorted(ticks_by_bucket)]
 
     meta_path = session_dir / "meta.json"
     meta = {}
@@ -174,6 +211,7 @@ def load_session(session_dir: Path, *, tick_resolution_sec: float = 0.5) -> Load
         has_depth=has_depth,
         n_rows=n_rows,
         n_skipped=n_skipped,
+        tick_source=tick_source,
         meta=meta,
     )
 
@@ -216,12 +254,17 @@ def resolve_outcomes(
     official: dict[str, str],
     *,
     allow_twap_fallback: bool = True,
+    min_twap_margin_usd: float = MIN_TWAP_MARGIN_USD,
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Return (ticker -> 'yes'/'no', ticker -> source).
 
     Source is 'official' or 'twap'. Markets that can be resolved by neither
     are absent — a replay must never invent a settlement, which is exactly
     the class of bug that produced the phantom -100% losses in the old logs.
+
+    A TWAP landing within `min_twap_margin_usd` of the strike is treated as
+    unresolved rather than guessed; see MIN_TWAP_MARGIN_USD for the
+    measurement behind that number.
     """
     outcomes: dict[str, str] = {}
     source: dict[str, str] = {}
@@ -235,7 +278,10 @@ def resolve_outcomes(
         twap = settlement_twap(sess.ticks, close)
         if twap is None:
             continue
-        outcomes[ticker] = "yes" if twap >= sess.strikes[ticker] else "no"
+        strike = sess.strikes[ticker]
+        if abs(twap - strike) < min_twap_margin_usd:
+            continue        # too close to call with our own reconstruction
+        outcomes[ticker] = "yes" if twap >= strike else "no"
         source[ticker] = "twap"
     return outcomes, source
 

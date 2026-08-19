@@ -36,9 +36,10 @@ from btc15.core.score import Observation
 from btc15.core.sigma import SigmaConfig, blended_sigma
 from btc15.research.corpus import LoadedSession
 
-# How much BRTI history to hand the vol nowcast. Must exceed the slowest
-# sigma window any swept config uses, or the slow leg silently truncates.
-TICK_HISTORY_SEC = 900.0
+# Imported, not redefined: replay must hand the vol nowcast the same span
+# of history the live engine does. A different window feeds the same
+# estimator different data and silently makes this a different bot.
+from btc15.core.engine_constants import TICK_HISTORY_SEC  # noqa: E402
 
 
 @dataclass

@@ -138,6 +138,7 @@ class SessionRecorder:
         self.kalshi_writer: Optional[_JSONLWriter] = None
         self.venue_writer: Optional[_JSONLWriter] = None
         self.decision_writer: Optional[_JSONLWriter] = None
+        self.brti_writer: Optional[_JSONLWriter] = None
         self.start_ts: float = 0.0
         self.config_hash: str = ""
         self.git_commit: Optional[str] = None
@@ -160,6 +161,14 @@ class SessionRecorder:
         )
         self.venue_writer = _JSONLWriter(self.root / "venue_ticks.jsonl")
         self.decision_writer = _JSONLWriter(self.root / "decisions.jsonl")
+        # The reconstructed BRTI series at the rate the ENGINE consumes it.
+        # venue_ticks.jsonl holds raw per-venue quotes and decisions.jsonl
+        # samples spot once per scan; neither reproduces the tick buffer the
+        # vol nowcast actually saw. Without this, replay reads sigma off a
+        # 1 Hz series while live read it off 4 Hz, and microstructure noise
+        # makes those two systematically different numbers — which showed up
+        # as 78% gate agreement between replay and live.
+        self.brti_writer = _JSONLWriter(self.root / "brti_ticks.jsonl")
 
         self.start_ts = time.time()
         self.config_hash = _config_hash(cfg)
@@ -211,6 +220,11 @@ class SessionRecorder:
         if self.enabled and self.decision_writer is not None:
             self.decision_writer.write(record)
 
+    def write_brti(self, ts: float, mid: float) -> None:
+        """One reconstructed BRTI print, at engine cadence (~4 Hz)."""
+        if self.enabled and self.brti_writer is not None:
+            self.brti_writer.write({"ts": round(ts, 3), "mid": round(mid, 2)})
+
     # ── Lifecycle ───────────────────────────────────────────────────────────
 
     def close(self) -> None:
@@ -222,6 +236,7 @@ class SessionRecorder:
             ("kalshi", self.kalshi_writer),
             ("venue", self.venue_writer),
             ("decisions", self.decision_writer),
+            ("brti", self.brti_writer),
         ):
             if w is not None:
                 lines[name] = w.lines_written

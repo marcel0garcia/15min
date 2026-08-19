@@ -115,6 +115,28 @@ def test_pre_v3_rows_are_skipped_not_guessed():
         assert discover_sessions(Path(td)) == []
 
 
+def test_twap_refuses_to_call_a_near_strike_settlement():
+    """Measured 2026-08-19: our 3-venue BRTI reconstruction matched Kalshi on
+    15 of 16 markets, and the one miss settled $1.94 from the strike. Inside
+    that band a synthesized outcome is a coin flip, and a coin flip used as
+    a label teaches the sweep noise with the authority of data."""
+    with tempfile.TemporaryDirectory() as td:
+        # No drift and tiny noise -> the final TWAP sits right on the strike.
+        sd = write_session(Path(td), n_scans=300, drift=0.0, wiggle=1.0)
+        s = load_session(sd)
+        near, _ = resolve_outcomes(s, {})
+        assert near == {}, "a settlement inside the margin must stay unresolved"
+        # Kalshi's own answer is still accepted there — it is authoritative.
+        off, src = resolve_outcomes(s, {"SYNTH-1": "yes"})
+        assert off["SYNTH-1"] == "yes" and src["SYNTH-1"] == "official"
+    with tempfile.TemporaryDirectory() as td:
+        # A clearly-resolved market is still called.
+        sd2 = write_session(Path(td), n_scans=300, drift=2.0, wiggle=1.0)
+        far, src2 = resolve_outcomes(load_session(sd2), {})
+        assert far.get("SYNTH-1") == "yes"
+        assert src2["SYNTH-1"] == "twap"
+
+
 def test_settlement_twap_refuses_a_thin_window():
     ticks = [(1000.0 + i, 100.0 + i) for i in range(200)]
     close = 1150.0

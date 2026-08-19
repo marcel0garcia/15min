@@ -57,12 +57,12 @@ SETTLEMENT_CHECK_INTERVAL = 5.0
 BRTI_HZ = 4.0
 VENUE_STALENESS_SEC = 5.0
 
-# How many price levels of each side to stamp into every decision row.
-# This is what makes the recordings self-sufficient for offline fill
-# simulation: with depth in decisions.jsonl, `sweep` never has to touch
-# kalshi_frames.jsonl, which is why raw-frame capture can be turned off
-# for long unattended runs (~0.5 GB/hour vs ~20 MB/hour).
-DECISION_BOOK_LEVELS = 5
+# Shared with btc15/research/replay.py — see btc15/core/engine_constants.py.
+# Replay MUST use the same history window and the same book depth, or it is
+# quietly measuring a different bot.
+from btc15.core.engine_constants import (  # noqa: E402
+    DECISION_BOOK_LEVELS, TICK_HISTORY_SEC,
+)
 
 
 class _DashboardLogHandler(logging.Handler):
@@ -340,6 +340,9 @@ class CoreEngine:
                 self.state["venue_status"] = venue_status
                 if mid is not None and healthy:
                     await self.price_feed.push_brti(mid, now)
+                    # Record the series the model consumes, at the rate it
+                    # consumes it — see SessionRecorder.write_brti.
+                    self._recorder.write_brti(now, mid)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -400,7 +403,11 @@ class CoreEngine:
 
         now_ts = time.time()
         now_utc = datetime.now(timezone.utc)
-        ticks = [(t.ts, t.price) for t in self.price_feed.recent_ticks(seconds=360.0) if t.price > 0]
+        ticks = [
+            (t.ts, t.price)
+            for t in self.price_feed.recent_ticks(seconds=TICK_HISTORY_SEC)
+            if t.price > 0
+        ]
         nowcast = blended_sigma(ticks, now_ts=now_ts, cfg=self.sigma_cfg)
         self.state["sigma_nowcast"] = round(nowcast.sigma, 4)
         self.state["sigma_raw"] = round(nowcast.sigma_raw, 4)
