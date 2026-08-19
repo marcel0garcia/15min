@@ -266,9 +266,12 @@ def test_merge_pools_spans_so_frequency_stays_honest():
         m = merge_results([r, r])
         assert m.n_trades == 2 * r.n_trades
         assert abs(m.span_sec - 2 * r.span_sec) < 1e-6
-        # Doubling both trades and span must leave the rate unchanged.
+        # Doubling markets and trades together must leave the rate unchanged.
         if r.trades_per_day > 0:
             assert abs(m.trades_per_day - r.trades_per_day) < 1e-6
+        # And the projection can never exceed one entry per market per day,
+        # times the exchange's hard ceiling of 96 markets.
+        assert m.trades_per_day <= 96 * m.n_markets
 
 
 # ── Sweep plumbing ───────────────────────────────────────────────────────────

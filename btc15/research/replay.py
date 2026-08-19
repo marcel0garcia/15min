@@ -88,14 +88,28 @@ class ReplayResult:
     def n_trades(self) -> int:
         return len(self.trades)
 
+    # KXBTC15M lists exactly one market at a time, 15 minutes each.
+    MARKETS_PER_DAY = 96
+
+    @property
+    def trades_per_market(self) -> float:
+        if self.n_markets <= 0:
+            return 0.0
+        return self.n_trades / self.n_markets
+
     @property
     def trades_per_day(self) -> float:
-        """Entries per 24h of wall-clock recorded. The frequency axis of the
-        edge/frequency trade-off — reported next to every result so the
-        operating point is a choice, not an accident."""
-        if self.span_sec <= 0:
-            return 0.0
-        return self.n_trades * 86400.0 / self.span_sec
+        """Projected entries per day, via entries-per-market x 96.
+
+        Deliberately NOT trades / wall-clock-span. Spans are summed when
+        sessions are merged, and a corpus assembled from overlapping or very
+        short segments then double-counts time: a 44-second session with one
+        trade projects to ~2000 trades/day, and the merged figure exceeded
+        the hard ceiling of 96 markets/day. Counting markets is immune to
+        both, because the market count is the thing that is actually
+        rate-limited by the exchange.
+        """
+        return self.trades_per_market * self.MARKETS_PER_DAY
 
     @property
     def win_rate(self) -> Optional[float]:
@@ -151,6 +165,7 @@ def sigma_config_from(core: CoreConfig) -> SigmaConfig:
         ceiling=core.sigma_ceiling,
         min_samples=core.sigma_min_samples,
         scale=core.sigma_scale,
+        sample_sec=core.sigma_sample_sec,
     )
 
 

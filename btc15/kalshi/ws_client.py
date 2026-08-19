@@ -541,7 +541,14 @@ class MarketDataCache:
                 # Debounce: one refresh per ticker per staleness window
                 if time.time() - last > self.staleness_sec:
                     self._refresh_inflight[ticker] = time.time()
-                    log.warning(f"[STALE CACHE] {ticker} age={age:.1f}s — triggering REST refresh")
+                    # debug, not warning: `ts` advances only when a delta
+                    # arrives, so a book that simply is not changing looks
+                    # identical to a book we have lost. On KXBTC15M the quiet
+                    # case is common and benign, and at WARNING this fired
+                    # every ~3s into the dashboard's event log. The refresh
+                    # itself is kept — it re-snapshots and so also repairs any
+                    # delta-application drift.
+                    log.debug(f"[STALE CACHE] {ticker} age={age:.1f}s — triggering REST refresh")
                     asyncio.create_task(self.rest_refresh(ticker))
 
         return bid, ask

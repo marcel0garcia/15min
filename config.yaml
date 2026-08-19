@@ -121,6 +121,15 @@ core:
   # (humbler probabilities), <1 sharpens it. The single knob that trades
   # conviction against calibration — set it from `score --calibration`.
   sigma_scale: 1.0
+  # Resample ticks to this spacing (sec) before estimating vol; 0 = as
+  # delivered. PRELIMINARY (one session, five evaluation points, 2026-08-19):
+  # sigma off the engine's 4 Hz BRTI stream read ~0.84x the same data at
+  # 1 Hz. If real, the estimate tracks our polling rate rather than the
+  # price process. The mechanism is NOT understood — a synthetic with three
+  # zero returns in four gives 0.99, because the estimator annualizes by
+  # observed inter-arrival time and self-corrects. Left at a no-op default;
+  # sweep it once the corpus has a few hours of brti_ticks.
+  sigma_sample_sec: 0.0
 
   # SLICE GRID — the (phase × band) boundaries R1 measures and R2 gates on.
   # Previously hard-coded in core/pricer.py, which made the whole R1/R2

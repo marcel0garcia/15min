@@ -128,6 +128,13 @@ class CoreConfig:
     # The one knob that trades conviction against calibration; set it from
     # `score --calibration`, not from intuition.
     sigma_scale: float = 1.0
+    # Resample the tick series to this spacing (seconds) before estimating
+    # realized vol; 0 = use ticks as delivered. Preliminary (one session,
+    # five points, 2026-08-19): sigma off the 4 Hz BRTI stream read ~0.84x
+    # the same data at 1 Hz. The mechanism is not understood — zero-padding
+    # alone does not do it — so this stays a sweepable knob at a no-op
+    # default rather than a behaviour change. See core/sigma.py.
+    sigma_sample_sec: float = 0.0
 
     # ── Slice grid ────────────────────────────────────────────────────────
     # Phase and band boundaries define the (phase x band) buckets that R1

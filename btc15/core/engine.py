@@ -118,6 +118,7 @@ class CoreEngine:
             ceiling=core.sigma_ceiling,
             min_samples=core.sigma_min_samples,
             scale=core.sigma_scale,
+            sample_sec=core.sigma_sample_sec,
         )
         self.scan_interval = core.scan_interval_sec
         self.ob_refresh_interval = core.ob_refresh_interval_sec

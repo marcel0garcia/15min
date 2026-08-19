@@ -56,6 +56,47 @@ class SigmaConfig:
     # calibration, and `score --calibration` is how you set it.
     scale: float = 1.0
 
+    # Spacing, in seconds, to resample the tick series to before estimating
+    # realized vol. 0 = use ticks exactly as delivered.
+    #
+    # Motivation, stated at the strength it was actually measured: on one
+    # live session (2026-08-19, five evaluation points), sigma computed from
+    # the engine's 4 Hz BRTI stream came out around 0.84x the value from the
+    # same data resampled to 1 Hz. If that holds up, the estimate depends on
+    # our polling rate rather than on the price process, and reading vol off
+    # a faster feed makes the model MORE confident — the wrong direction
+    # given the overconfidence already visible in `score --calibration`.
+    #
+    # The obvious explanation is wrong: a synthetic where price steps once a
+    # second and is sampled at 4 Hz (three zero returns in four) reproduces
+    # a ratio of 0.99, because close_to_close annualizes by the observed
+    # mean inter-arrival time and so self-corrects for zero-padding. So the
+    # mechanism behind 0.84 is NOT understood, and five points from one
+    # session is not a result.
+    #
+    # This is a knob rather than a change in default behaviour for exactly
+    # that reason: it costs nothing at 0.0, and it lets `sweep` settle the
+    # question on real data instead of on either of our stories.
+    sample_sec: float = 0.0
+
+
+def resample(
+    ticks: Sequence[tuple[float, float]], spacing_sec: float,
+) -> list[tuple[float, float]]:
+    """Keep the last tick in each `spacing_sec` bucket.
+
+    Last, not first or mean: the estimator wants the price prevailing at the
+    end of each interval, which is what a close-to-close return is defined
+    on. Averaging inside the bucket would smooth the very moves being
+    measured and bias vol down again.
+    """
+    if spacing_sec <= 0:
+        return list(ticks)
+    out: dict[int, tuple[float, float]] = {}
+    for ts, price in ticks:
+        out[int(ts / spacing_sec)] = (ts, price)
+    return [out[k] for k in sorted(out)]
+
 
 @dataclass
 class SigmaNowcast:
@@ -88,7 +129,11 @@ def blended_sigma(
             fast_weight=cfg.fast_weight if fast_weight is None else fast_weight,
             floor=cfg.floor, ceiling=cfg.ceiling,
             min_samples=cfg.min_samples, scale=cfg.scale,
+            sample_sec=cfg.sample_sec,
         )
+
+    if cfg.sample_sec > 0:
+        ticks = resample(ticks, cfg.sample_sec)
 
     fast: VolEstimate = close_to_close(
         ticks, lookback_sec=cfg.fast_sec, now_ts=now_ts,

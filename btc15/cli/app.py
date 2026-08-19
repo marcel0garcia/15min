@@ -936,6 +936,10 @@ def sweep(knobs, sessions, last, holdout, official_only, top, workers,
 @cli.command()
 @click.argument("session_id", required=False)
 @click.option("--config", "config_path", default=None)
+@click.option("--all", "score_all", is_flag=True, default=False,
+              help="Pool every session that has settled outcomes. The corpus "
+                   "is built from many short segments, so this is usually what "
+                   "you want — one segment is a handful of coin flips.")
 @click.option("--results-cache", default="data/market_results_cache.json",
               help="Settled-market results cache (ticker → yes/no)")
 @click.option("--dedup-seconds", default=15.0,
@@ -944,7 +948,7 @@ def sweep(knobs, sessions, last, holdout, official_only, top, workers,
               help="Print the enabled_slices list the data supports")
 @click.option("--calibration", is_flag=True, default=False,
               help="Also print predicted-vs-realized calibration deciles")
-def score(session_id: str, config_path: str, results_cache: str,
+def score(session_id: str, config_path: str, score_all: bool, results_cache: str,
           dedup_seconds: float, suggest: bool, calibration: bool):
     """Score the model AGAINST THE MARKET MID, sliced by phase × price band.
 
@@ -970,22 +974,24 @@ def score(session_id: str, config_path: str, results_cache: str,
         console.print(f"[bright_red]No recordings at {root}[/bright_red]")
         return
 
+    candidates = sorted(
+        (d for d in root.iterdir() if d.is_dir() and (d / "decisions.jsonl").exists()),
+        key=lambda d: d.stat().st_mtime,
+    )
     if session_id:
-        session_dir = root / session_id
+        session_dirs = [root / session_id]
+    elif score_all:
+        session_dirs = candidates
     else:
-        candidates = sorted(
-            (d for d in root.iterdir() if d.is_dir() and (d / "decisions.jsonl").exists()),
-            key=lambda d: d.stat().st_mtime,
-        )
         if not candidates:
             console.print("[yellow]No sessions with decisions.jsonl yet.[/yellow]")
             return
-        session_dir = candidates[-1]
+        session_dirs = [candidates[-1]]
 
-    decisions = session_dir / "decisions.jsonl"
-    if not decisions.exists():
-        console.print(f"[bright_red]No decisions.jsonl in {session_dir}[/bright_red]")
-        return
+    for d in session_dirs:
+        if not (d / "decisions.jsonl").exists():
+            console.print(f"[bright_red]No decisions.jsonl in {d}[/bright_red]")
+            return
 
     cache_path = Path(results_cache)
     if not cache_path.exists():
@@ -1002,16 +1008,28 @@ def score(session_id: str, config_path: str, results_cache: str,
         if isinstance(rec, dict) and rec.get("status") == "finalized" and rec.get("result")
     }
 
-    obs = load_observations(decisions, outcomes, dedup_seconds=dedup_seconds)
+    obs = []
+    used = []
+    for d in session_dirs:
+        got = load_observations(
+            d / "decisions.jsonl", outcomes, dedup_seconds=dedup_seconds)
+        if got:
+            used.append(d.name)
+        obs.extend(got)
     if not obs:
         console.print(
             "[yellow]No scoreable observations — decisions logged but no "
-            "matching settled outcomes yet.[/yellow]"
+            "matching settled outcomes yet.[/yellow]\n"
+            "[dim]A market only becomes scoreable after it settles AND its "
+            "outcome is fetched:  ./run.sh replay enrich <session>\n"
+            "Pool the whole corpus with:  ./run.sh score --all[/dim]"
         )
         return
 
+    label = (used[0] if len(used) == 1
+             else f"{len(used)} sessions" if used else "corpus")
     reports = score_slices(obs)
-    table = Table(title=f"Model vs Market — {session_dir.name}  (n={len(obs)})",
+    table = Table(title=f"Model vs Market — {label}  (n={len(obs)})",
                   box=None, header_style="bold dim")
     table.add_column("Slice", style="cyan")
     table.add_column("N", justify="right")
