@@ -195,6 +195,12 @@ class KalshiWebSocket:
                 log.error(f"WS handler error in '{target}': {e}", exc_info=True)
 
 
+# Below this, a price level is treated as empty. Fixed-point sizes do not
+# cancel to exactly 0.0 in float arithmetic, and the residue is enough to
+# keep a dead level as the best bid.
+SIZE_EPSILON = 1e-3
+
+
 class MarketDataCache:
     """
     Thread-safe cache of latest orderbook/ticker data from WebSocket.
@@ -279,7 +285,7 @@ class MarketDataCache:
                     size = float(size_fp)
                 except (TypeError, ValueError):
                     continue
-                if size > 0:
+                if size > SIZE_EPSILON:
                     ob["yes_bids"][price_cents] = size
             for price_dollars, size_fp in data.get("no_dollars_fp", []):
                 try:
@@ -287,7 +293,7 @@ class MarketDataCache:
                     size = float(size_fp)
                 except (TypeError, ValueError):
                     continue
-                if size > 0:
+                if size > SIZE_EPSILON:
                     ob["yes_asks"][100 - price_cents] = size
             ob["ts"] = time.time()
         if sid is not None and seq is not None:
@@ -349,7 +355,14 @@ class MarketDataCache:
                 book = ob["yes_asks"]
                 key = 100 - price_cents
             new_size = book.get(key, 0.0) + delta
-            if new_size <= 0:
+            # Epsilon, not <= 0. Sizes arrive as fixed-point floats and a
+            # level that is fully cancelled rarely sums to exactly zero:
+            # observed residues of ~8.8e-13 left phantom levels sitting at
+            # the top of the book, which is what produced the "crossed"
+            # books (bid 41 / ask 36) that rejected ~32% of all scans on
+            # 2026-08-19. A resting order below a thousandth of a contract
+            # does not exist.
+            if new_size <= SIZE_EPSILON:
                 book.pop(key, None)
             else:
                 book[key] = new_size
