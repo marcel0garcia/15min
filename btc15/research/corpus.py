@@ -286,10 +286,48 @@ def resolve_outcomes(
     return outcomes, source
 
 
+def session_start_ts(session_dir: Path) -> float:
+    """When the session actually began.
+
+    Ordering sessions by directory mtime is wrong, and wrong in a way that
+    is easy to miss: a directory's mtime advances when a file is created or
+    removed inside it, NOT when an existing file is appended to. A session
+    that runs for six hours writing into files it opened at startup keeps
+    the mtime it had in its first second, so a long old session can sort
+    after a short new one. That mis-ordering silently corrupted the sweep's
+    `--holdout` split, which is supposed to be chronological.
+
+    meta.json's start_ts is written by the recorder and is authoritative.
+    The first decision row is the fallback; mtime is the last resort.
+    """
+    meta = session_dir / "meta.json"
+    if meta.exists():
+        try:
+            ts = json.loads(meta.read_text()).get("start_ts")
+            if ts:
+                return float(ts)
+        except Exception:
+            pass
+    head = next(_iter_jsonl(session_dir / "decisions.jsonl"), None)
+    if head and head.get("ts"):
+        try:
+            return float(head["ts"])
+        except (TypeError, ValueError):
+            pass
+    try:
+        return session_dir.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def discover_sessions(
     root: Path, *, min_rows: int = 1, require_depth: bool = False,
 ) -> list[Path]:
-    """Session directories that hold re-priceable decision rows, oldest first."""
+    """Session directories that hold re-priceable decision rows, oldest first.
+
+    Chronological by session start — see session_start_ts for why that is
+    not the same as sorting by mtime.
+    """
     if not root.exists():
         return []
     out: list[tuple[float, Path]] = []
@@ -306,5 +344,5 @@ def discover_sessions(
             continue
         if sum(1 for _ in open(p)) < min_rows:
             continue
-        out.append((d.stat().st_mtime, d))
-    return [d for _, d in sorted(out)]
+        out.append((session_start_ts(d), d))
+    return [d for _, d in sorted(out, key=lambda kv: kv[0])]

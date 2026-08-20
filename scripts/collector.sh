@@ -74,14 +74,49 @@ while true; do
   elapsed=$(( $(date +%s) - start_ts ))
   log "segment $segment exited rc=$rc after ${elapsed}s"
 
-  # Capture official settlement results for the session just recorded. This
-  # is time-critical: Kalshi purges these markets, and once purged the only
-  # settlement left is our own BRTI TWAP reconstruction.
-  newest="$(ls -1t data/recordings 2>/dev/null | grep -v '^sessions.json$' | head -1)"
-  if [ -n "$newest" ]; then
-    log "enriching $newest"
-    "$PY" main.py replay enrich "$newest" >> "$LOG" 2>&1 || log "enrich failed for $newest"
-  fi
+  # Capture official settlement results. Time-critical: Kalshi purges settled
+  # 15-minute markets within weeks, and once purged the only settlement left
+  # is our own BRTI TWAP reconstruction.
+  #
+  # Enrich the last few sessions, not just the one that ended, for two
+  # reasons found the hard way on 2026-08-20:
+  #
+  #   1. `ls -t` on data/recordings sorts by DIRECTORY mtime, which does not
+  #      advance while a session merely appends to files it already created.
+  #      It named a 12-hour-old session as "newest" and a whole 6-hour
+  #      segment went unenriched (16 markets, 1 outcome captured).
+  #   2. A segment's last markets have not settled when it ends, and Kalshi
+  #      finalizes results with a lag. One pass at the wrong moment misses
+  #      them permanently.
+  #
+  # `replay enrich` skips tickers already finalized in the cache, so
+  # re-running it over recent sessions is cheap and idempotent. Session ids
+  # come from sessions.json (ordered by start_ts), which the recorder writes
+  # — an authoritative source rather than an inference from the filesystem.
+  recent="$("$PY" - <<'PYEOF' 2>/dev/null
+import json
+from pathlib import Path
+p = Path("data/recordings/sessions.json")
+try:
+    rows = json.loads(p.read_text())
+except Exception:
+    rows = []
+seen, out = set(), []
+for m in sorted(rows, key=lambda r: r.get("start_ts") or 0, reverse=True):
+    sid = m.get("session_id")
+    if sid and sid not in seen and (Path("data/recordings") / sid).is_dir():
+        seen.add(sid)
+        out.append(sid)
+    if len(out) >= 4:
+        break
+print("\n".join(out))
+PYEOF
+)"
+  for sid in $recent; do
+    log "enriching $sid"
+    "$PY" main.py replay enrich "$sid" >> "$LOG" 2>&1 || log "enrich failed for $sid"
+  done
+  newest="$(echo "$recent" | head -1)"
 
   after="$(ls -1 data/recordings 2>/dev/null | wc -l | tr -d ' ')"
   cat > "$STATUS" <<EOF

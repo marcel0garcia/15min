@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from btc15.config import CoreConfig
 from btc15.research.corpus import (
     discover_sessions, load_results_cache, load_session, resolve_outcomes,
-    settlement_twap,
+    session_start_ts, settlement_twap,
 )
 from btc15.research.replay import merge_results, replay_session, with_overrides
 from btc15.research.sweep import expand_grid, pareto_frontier, parse_knob, SweepRow
@@ -135,6 +135,40 @@ def test_twap_refuses_to_call_a_near_strike_settlement():
         far, src2 = resolve_outcomes(load_session(sd2), {})
         assert far.get("SYNTH-1") == "yes"
         assert src2["SYNTH-1"] == "twap"
+
+
+def test_sessions_are_ordered_by_start_not_mtime():
+    """The sweep's --holdout split is chronological, so session order has to
+    be real chronology.
+
+    Directory mtime is not: it advances when a file is created or removed
+    inside the directory, NOT when an existing file is appended to. A
+    six-hour session writing into files it opened in its first second keeps
+    that first second's mtime, so a long old session sorts after a short new
+    one. Observed 2026-08-20 — the corpus came back in the order
+    18:38, 18:26, 22:05, 18:43, 22:12, 10:12, 04:12, which made the
+    "time-ordered" holdout meaningless.
+    """
+    import os
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        for name, start in (("B_later", 2_000_000_000.0),
+                            ("A_earlier", 1_000_000_000.0)):
+            d = root / name
+            d.mkdir()
+            with open(d / "decisions.jsonl", "w") as f:
+                f.write(json.dumps({
+                    "ts": start, "ticker": f"{name}-1", "strike": 100.0,
+                    "spot": 100.0, "secs": 300.0,
+                }) + "\n")
+            (d / "meta.json").write_text(json.dumps({"start_ts": start}))
+        # Make the OLDER session's directory the most recently touched, which
+        # is exactly the inversion the real corpus produced.
+        os.utime(root / "A_earlier", (2_100_000_000, 2_100_000_000))
+        os.utime(root / "B_later", (1_100_000_000, 1_100_000_000))
+
+        names = [d.name for d in discover_sessions(root)]
+        assert names == ["A_earlier", "B_later"], names
 
 
 def test_settlement_twap_refuses_a_thin_window():

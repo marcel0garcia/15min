@@ -848,7 +848,13 @@ def sweep(knobs, sessions, last, holdout, official_only, top, workers,
         + "[/dim]"
     )
 
-    with console.status("replaying..."):
+    # console.status animates a spinner; when stdout is not a terminal every
+    # frame is written as a separate line and a long sweep produces tens of
+    # thousands of them. Only animate for a human.
+    import contextlib
+    spinner = (console.status("replaying...") if console.is_terminal
+               else contextlib.nullcontext())
+    with spinner:
         rows = run_sweep(
             cfg.core, dirs, configs,
             results_cache=Path("data/market_results_cache.json"),
