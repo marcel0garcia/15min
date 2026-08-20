@@ -397,6 +397,39 @@ def test_bootstrap_clusters_by_market_not_by_scan():
     )
 
 
+def test_cluster_bootstrap_matches_a_naive_reference():
+    """The bootstrap was optimized by pre-reducing each cluster to
+    (sum, count) — scoring a sweep had come to cost more than the replays
+    it was scoring. It must be the SAME estimator, not merely a similar
+    one, so pin it against the obvious implementation."""
+    import random as _random
+    from btc15.core.score import _cluster_bootstrap_ci
+
+    rng = _random.Random(11)
+    clusters = [
+        [rng.gauss(0.01, 0.05) for _ in range(rng.randint(1, 40))]
+        for _ in range(25)
+    ]
+
+    def naive(cs, iters=2000, alpha=0.05, seed=7):
+        r = _random.Random(seed)
+        k = len(cs)
+        means = []
+        for _ in range(iters):
+            total, count = 0.0, 0
+            for _ in range(k):
+                c = cs[r.randrange(k)]
+                total += sum(c)
+                count += len(c)
+            means.append(total / count if count else 0.0)
+        means.sort()
+        return (means[int((alpha / 2) * iters)],
+                means[min(iters - 1, int((1 - alpha / 2) * iters))])
+
+    approx(_cluster_bootstrap_ci(clusters)[0], naive(clusters)[0], 1e-12)
+    approx(_cluster_bootstrap_ci(clusters)[1], naive(clusters)[1], 1e-12)
+
+
 def test_max_open_positions():
     p = _policy(max_open_positions=1)
     p.record_open(Position(ticker="OTHER", side="yes", contracts=5, entry_cents=60,

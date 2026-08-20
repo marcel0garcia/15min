@@ -338,6 +338,34 @@ def replay_session(
     return res
 
 
+def thin_observations(
+    obs: list[Observation], dedup_seconds: float = 15.0,
+) -> list[Observation]:
+    """One observation per ticker per `dedup_seconds` bucket.
+
+    The engine scans at 1 Hz, so a 15-minute market contributes ~900 rows
+    that share one outcome and one price path. Averaging the Brier delta
+    over un-thinned rows weights each market by how long we happened to
+    watch it, which is a property of when the collector restarted — not of
+    the model. Measured on the 2026-08-20 corpus: the same configuration
+    scored +0.0075 un-thinned and +0.0000 thinned, and only the un-thinned
+    version produced a confidence interval that cleared zero.
+
+    `core/score.py` has always thinned. The sweep did not, so the two tools
+    disagreed about the same config. They agree now, and `score` is the one
+    that was right.
+    """
+    seen: set[tuple[str, int]] = set()
+    out: list[Observation] = []
+    for o in obs:
+        key = (o.ticker, int(o.secs // dedup_seconds))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(o)
+    return out
+
+
 def merge_results(results: list[ReplayResult], label: str = "merged") -> ReplayResult:
     """Pool several sessions into one result. Spans add, so trades_per_day
     stays meaningful across a corpus assembled from many short runs."""

@@ -788,10 +788,14 @@ def replay_analyze(session_id: str, config_path: str, results_cache: str):
               help="Settle only from Kalshi official results; no BRTI-TWAP fallback.")
 @click.option("--top", default=15, help="Rows to print.")
 @click.option("--workers", default=0, type=int, help="Parallel workers (0 = auto).")
+@click.option("--dedup-seconds", default=15.0,
+              help="Thin each ticker to one observation per N seconds before "
+                   "scoring, exactly as `score` does. Un-thinned, each market "
+                   "is weighted by how long we happened to watch it.")
 @click.option("--out", "out_path", default=None, help="Write the full report as JSON here.")
 @click.option("--config", "config_path", default=None)
 def sweep(knobs, sessions, last, holdout, official_only, top, workers,
-          out_path, config_path):
+          dedup_seconds, out_path, config_path):
     """Replay recorded sessions under many configurations and rank them.
 
     A config test costs seconds here instead of the days a live A/B would
@@ -861,6 +865,7 @@ def sweep(knobs, sessions, last, holdout, official_only, top, workers,
             allow_twap_fallback=not official_only,
             holdout_frac=holdout,
             workers=(workers or None),
+            dedup_seconds=dedup_seconds,
         )
 
     table = Table(title="Config sweep — ranked by Brier advantage over the market",

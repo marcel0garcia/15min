@@ -157,14 +157,22 @@ def _cluster_bootstrap_ci(
         return (0.0, 0.0)
     rng = random.Random(seed)
     k = len(clusters)
+    # Pre-reduce each cluster to (sum, count). A resample only ever needs
+    # those two numbers, so re-summing the members on every iteration is
+    # pure waste: at 78 clusters over 40k observations it turned each of
+    # 2000 iterations into a 40k-element sum, and scoring a sweep took
+    # longer than the replays it was scoring. Same arithmetic, same seed,
+    # same intervals — O(k) per iteration instead of O(n).
+    sums = [sum(c) for c in clusters]
+    lens = [len(c) for c in clusters]
     means = []
     for _ in range(iters):
         total = 0.0
         count = 0
         for _ in range(k):
-            c = clusters[rng.randrange(k)]
-            total += sum(c)
-            count += len(c)
+            j = rng.randrange(k)
+            total += sums[j]
+            count += lens[j]
         means.append(total / count if count else 0.0)
     means.sort()
     lo = means[int((alpha / 2) * iters)]

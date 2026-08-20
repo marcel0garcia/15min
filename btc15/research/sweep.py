@@ -41,7 +41,9 @@ from btc15.core.score import SliceReport, enabled_slice_suggestion, score_slices
 from btc15.research.corpus import (
     LoadedSession, load_results_cache, load_session, resolve_outcomes,
 )
-from btc15.research.replay import ReplayResult, merge_results, replay_session, with_overrides
+from btc15.research.replay import (
+    ReplayResult, merge_results, replay_session, thin_observations, with_overrides,
+)
 
 
 @dataclass
@@ -154,7 +156,8 @@ def _load_cached(session_dir: str, results_cache: str, allow_twap: bool):
 
 
 def _eval_config(args) -> dict:
-    base_core, overrides, session_dirs, results_cache, allow_twap, holdout_dirs = args
+    (base_core, overrides, session_dirs, results_cache, allow_twap,
+     holdout_dirs, dedup_seconds) = args
     core = with_overrides(base_core, overrides)
 
     def run_over(dirs) -> ReplayResult:
@@ -165,14 +168,18 @@ def _eval_config(args) -> dict:
         return merge_results(results)
 
     merged = run_over(session_dirs)
-    reports = score_slices(merged.observations) if merged.observations else []
+    # Thin before scoring, exactly as core/score.py does — see
+    # replay.thin_observations for why the un-thinned average is not a
+    # property of the model.
+    scored_obs = thin_observations(merged.observations, dedup_seconds)
+    reports = score_slices(scored_obs) if scored_obs else []
     overall: Optional[SliceReport] = reports[0] if reports else None
 
     row = SweepRow(
         overrides=overrides,
         n_markets=(overall.n_markets if overall else 0),
         n_settled=merged.n_settled_markets,
-        n_obs=len(merged.observations),
+        n_obs=len(scored_obs),
         n_trades=merged.n_trades,
         trades_per_day=merged.trades_per_day,
         pnl_usd=merged.realized_pnl_usd,
@@ -192,7 +199,8 @@ def _eval_config(args) -> dict:
 
     if holdout_dirs:
         ho = run_over(holdout_dirs)
-        ho_reports = score_slices(ho.observations) if ho.observations else []
+        ho_obs = thin_observations(ho.observations, dedup_seconds)
+        ho_reports = score_slices(ho_obs) if ho_obs else []
         row.holdout_delta = ho_reports[0].delta if ho_reports else None
         row.holdout_pnl_usd = ho.realized_pnl_usd
         row.holdout_trades = ho.n_trades
@@ -209,6 +217,7 @@ def run_sweep(
     allow_twap_fallback: bool = True,
     holdout_frac: float = 0.0,
     workers: Optional[int] = None,
+    dedup_seconds: float = 15.0,
     progress=None,
 ) -> list[SweepRow]:
     """Replay every config over the corpus. Returns rows, best delta first.
@@ -225,7 +234,8 @@ def run_sweep(
         train, holdout = dirs[:cut], dirs[cut:]
 
     tasks = [
-        (base_core, cfg, train, str(results_cache), allow_twap_fallback, holdout)
+        (base_core, cfg, train, str(results_cache), allow_twap_fallback,
+         holdout, dedup_seconds)
         for cfg in configs
     ]
     workers = workers or max(1, min(len(tasks), (os.cpu_count() or 2)))
